@@ -1,0 +1,6 @@
+{"type":"progress","data":{"type":"hook_progress"},"timestamp":"2026-03-13T01:27:04.760Z","sessionId":"test-session-1","gitBranch":"main","cwd":"/Users/me/code/test-project"}
+{"type":"user","message":{"role":"user","content":"build a cool thing"},"timestamp":"2026-03-13T01:28:03.806Z","sessionId":"test-session-1","gitBranch":"main","isSidechain":false,"cwd":"/Users/me/code/test-project"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Sure, let me help you build that."},{"type":"tool_use","id":"tool1","name":"Bash","input":{"command":"ls"}}]},"timestamp":"2026-03-13T01:28:10.000Z","sessionId":"test-session-1","isSidechain":false}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool1","content":"file1.rs\nfile2.rs"}]},"toolUseResult":{"success":true,"commandName":"Bash"},"timestamp":"2026-03-13T01:28:11.000Z","sessionId":"test-session-1","isSidechain":false}
+{"type":"user","message":{"role":"user","content":"looks good, ship it"},"timestamp":"2026-03-13T01:30:00.000Z","sessionId":"test-session-1","gitBranch":"main","isSidechain":false}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done! Everything is deployed."}]},"timestamp":"2026-03-13T01:30:30.000Z","sessionId":"test-session-1","isSidechain":false}

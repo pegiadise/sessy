@@ -1,0 +1,9 @@
+{"type":"progress","data":{"type":"hook_progress"},"timestamp":"2026-03-13T01:00:00.000Z","sessionId":"complex-1","gitBranch":"feat/auth","cwd":"/Users/me/code/myapp"}
+{"type":"user","message":{"role":"user","content":"implement auth middleware"},"timestamp":"2026-03-13T01:00:05.000Z","sessionId":"complex-1","gitBranch":"feat/auth","isSidechain":false,"cwd":"/Users/me/code/myapp"}
+{"type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"skill loaded: auth-helper"}]},"timestamp":"2026-03-13T01:00:06.000Z","sessionId":"complex-1","isSidechain":false}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll set up JWT auth."},{"type":"tool_use","id":"t1","name":"Edit","input":{}}]},"timestamp":"2026-03-13T01:00:10.000Z","sessionId":"complex-1","isSidechain":false}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"This is a sidechain message."}]},"timestamp":"2026-03-13T01:00:11.000Z","sessionId":"complex-1","isSidechain":true}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]},"toolUseResult":{"success":true,"commandName":"Edit"},"timestamp":"2026-03-13T01:00:12.000Z","sessionId":"complex-1","isSidechain":false}
+{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: messages below from local commands</local-command-caveat>"},"timestamp":"2026-03-13T01:00:13.000Z","sessionId":"complex-1","isSidechain":false}
+{"type":"user","message":{"role":"user","content":"add rate limiting too"},"timestamp":"2026-03-13T02:30:00.000Z","sessionId":"complex-1","gitBranch":"feat/auth","isSidechain":false}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Added rate limiting with a sliding window."}]},"timestamp":"2026-03-13T02:30:30.000Z","sessionId":"complex-1","isSidechain":false}
