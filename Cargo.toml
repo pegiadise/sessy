@@ -1,6 +1,6 @@
 [package]
 name = "sessy"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.86"
 description = "TUI session manager for Claude Code — browse, search, preview, and resume conversations"

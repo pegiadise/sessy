@@ -458,8 +458,21 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
 
             let full_text = format!("{}{}", prefix, text);
             let wrap_width = preview_area.width.saturating_sub(1) as usize;
+            let highlight_query = if is_match { &search_query_lower } else { "" };
+            let match_style = if is_current {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            };
             for chunk in wrap_text(&full_text, wrap_width) {
-                lines.push(Line::from(vec![marker.clone(), Span::styled(chunk, base_style)]));
+                let mut spans = vec![marker.clone()];
+                spans.extend(highlight_spans(&chunk, highlight_query, base_style, match_style));
+                lines.push(Line::from(spans));
             }
             lines.push(Line::from(""));
         }
@@ -637,4 +650,55 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
         result.push(remaining.to_string());
     }
     result
+}
+
+/// Split text into spans, highlighting occurrences of `query` (case-insensitive).
+fn highlight_spans(
+    text: &str,
+    query: &str,
+    base_style: Style,
+    match_style: Style,
+) -> Vec<Span<'static>> {
+    if query.is_empty() {
+        return vec![Span::styled(text.to_string(), base_style)];
+    }
+
+    let text_lower = text.to_lowercase();
+
+    // If lowercase changed byte length, skip highlighting (rare Unicode edge case)
+    if text_lower.len() != text.len() {
+        return vec![Span::styled(text.to_string(), base_style)];
+    }
+
+    let mut spans = Vec::new();
+    let mut last_end = 0;
+    let mut search_from = 0;
+
+    while let Some(pos) = text_lower[search_from..].find(query) {
+        let start = search_from + pos;
+        let end = start + query.len();
+
+        if start > last_end {
+            spans.push(Span::styled(
+                text[last_end..start].to_string(),
+                base_style,
+            ));
+        }
+        spans.push(Span::styled(
+            text[start..end].to_string(),
+            match_style,
+        ));
+        last_end = end;
+        search_from = end;
+    }
+
+    if last_end < text.len() {
+        spans.push(Span::styled(text[last_end..].to_string(), base_style));
+    }
+
+    if spans.is_empty() {
+        vec![Span::styled(text.to_string(), base_style)]
+    } else {
+        spans
+    }
 }
