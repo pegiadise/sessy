@@ -20,7 +20,7 @@ pub fn request_preview(app: &mut App) {
     let session_id = session.id.clone();
     let file_path = session.file_path.clone();
 
-    // Check cache
+    // Check FIFO cache
     if let Some(cached) = app.preview_cache.get(&session_id) {
         app.preview_lines = cached.clone();
         app.preview_session_id = session_id;
@@ -53,14 +53,8 @@ pub fn request_preview(app: &mut App) {
 /// Check for completed preview loads and update app state.
 pub fn check_preview_updates(app: &mut App) {
     if let Ok(result) = app.preview_rx.try_recv() {
-        // Cache (bounded to 10 entries, arbitrary eviction)
-        if app.preview_cache.len() >= 10 {
-            if let Some(key) = app.preview_cache.keys().next().cloned() {
-                app.preview_cache.remove(&key);
-            }
-        }
-        app.preview_cache
-            .insert(result.session_id.clone(), result.lines.clone());
+        // FIFO cache
+        app.cache_preview(result.session_id.clone(), result.lines.clone());
 
         if app.preview_session_id == result.session_id {
             app.preview_lines = result.lines;

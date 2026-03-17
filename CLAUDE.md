@@ -6,13 +6,15 @@ TUI session manager for Claude Code — browse, search, preview, and resume conv
 
 ```
 src/
-  main.rs      — CLI (clap), event loop, post-TUI actions (launch/yank/print/purge)
-  app.rs       — App state, focus management, sort modes, fuzzy search, delete logic
-  ui.rs        — Two-pane ratatui rendering: session list + conversation preview
-  index.rs     — Filesystem scanner, bincode cache (~/.cache/sessy/index.bin), incremental rebuild
-  parser.rs    — JSONL parser: head/tail reads, human message detection, conversation extraction
-  session.rs   — SessionMeta struct, formatting helpers (duration, file size, size category)
-  preview.rs   — Background thread preview loader with mpsc channel and bounded cache
+  main.rs       — CLI (clap), event loop, post-TUI actions (launch/yank/print/purge)
+  app.rs        — App state, focus/view modes, sort/filter/bookmark/search logic
+  ui.rs         — Two-pane ratatui rendering: session list + conversation preview + timeline
+  index.rs      — Filesystem scanner, bincode cache (~/.cache/sessy/index.bin), incremental rebuild
+  parser.rs     — JSONL parser: head/tail reads, human message detection, conversation extraction
+  session.rs    — SessionMeta struct, formatting helpers (duration, file size, size category)
+  preview.rs    — Background thread preview loader with mpsc channel and FIFO cache
+  bookmarks.rs  — Bookmark persistence (~/.cache/sessy/bookmarks.json)
+  export.rs     — Markdown export of session conversations
 ```
 
 ## Key Concepts
@@ -24,23 +26,16 @@ src/
 - **Human message detection**: `type=="user"` AND `message.content` is string AND no `toolUseResult` AND `isMeta` is not true
 - **Index cache**: bincode v1 serialized with version header (bump `INDEX_VERSION` when `SessionMeta` changes)
 - **Session name priority**: `/rename` value > `slug` field > empty
+- **View pipeline**: search → size filter → sort (bookmarked first, then by current sort mode)
+- **Preview cache**: FIFO-ordered HashMap, max 10 entries
 
 ## Building
 
 ```
 cargo build           # dev build
-cargo test            # 22 unit tests
+cargo test            # unit tests
 cargo build --release # optimized build
 ```
-
-## Testing
-
-Tests use fixture JSONL files in `tests/fixtures/`. Run with `cargo test`.
-
-Key test areas:
-- Parser: head/tail extraction, conversation filtering, sidechain/meta skip
-- Index: scan, serialization roundtrip, version mismatch rejection
-- Session: project name extraction, duration/size formatting
 
 ## Conventions
 
@@ -50,11 +45,13 @@ Key test areas:
 - Status bar keybinding style: Cyan bold key + Rgb(180,180,180) description on Rgb(40,40,40) bg
 - Size categories: quick <1MB (green), medium 1-10MB (yellow), deep 10-30MB (magenta), massive >30MB (red)
 - Filter out `gitBranch: "HEAD"` — it's noise from detached HEAD states
+- Timeline heatmap uses GitHub-style green color scale
+- Bookmarked sessions float to top of any sort order
 
 ## Publishing
 
 ```
-cargo publish --allow-dirty  # if uncommitted changes exist
+cargo publish  # from clean git state
 ```
 
 Package name is `sessy` on crates.io. Bump version in `Cargo.toml` before publishing.
