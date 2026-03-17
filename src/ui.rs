@@ -598,18 +598,25 @@ fn chrono_format(timestamp: i64) -> String {
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
-    let mut char_count = 0;
-    for (i, c) in s.char_indices() {
-        char_count += 1;
-        if char_count > max_chars {
-            if max_chars > 1 {
-                return format!("{}…", &s[..i]);
-            }
-            return "…".to_string();
-        }
-        let _ = c;
+    if max_chars == 0 {
+        return String::new();
     }
-    s.to_string()
+    let mut iter = s.char_indices();
+    // Find byte offset of the max_chars-th character
+    let fits = iter.nth(max_chars).is_none();
+    if fits {
+        return s.to_string();
+    }
+    // String is longer than max_chars; truncate to max_chars - 1 + ellipsis
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+    let end = s
+        .char_indices()
+        .nth(max_chars - 1)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    format!("{}…", &s[..end])
 }
 
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -618,15 +625,8 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     }
     let mut result = Vec::new();
     let mut remaining = text;
-    while remaining.chars().count() > width {
-        let byte_limit = remaining
-            .char_indices()
-            .nth(width)
-            .map(|(i, _)| i)
-            .unwrap_or(remaining.len());
-        let split_at = remaining[..byte_limit]
-            .rfind(' ')
-            .unwrap_or(byte_limit);
+    while let Some((byte_limit, _)) = remaining.char_indices().nth(width) {
+        let split_at = remaining[..byte_limit].rfind(' ').unwrap_or(0);
         let split_at = if split_at == 0 { byte_limit } else { split_at };
         result.push(remaining[..split_at].to_string());
         remaining = remaining[split_at..].trim_start();

@@ -356,14 +356,16 @@ impl App {
     // Cache management (FIFO eviction)
 
     pub fn cache_preview(&mut self, session_id: String, lines: Vec<(String, bool)>) {
-        if self.preview_cache.len() >= 10 && !self.preview_cache.contains_key(&session_id) {
+        if self.preview_cache.contains_key(&session_id) {
+            *self.preview_cache.get_mut(&session_id).unwrap() = lines;
+            return;
+        }
+        if self.preview_cache.len() >= 10 {
             if let Some(oldest) = self.preview_cache_order.pop_front() {
                 self.preview_cache.remove(&oldest);
             }
         }
-        if !self.preview_cache.contains_key(&session_id) {
-            self.preview_cache_order.push_back(session_id.clone());
-        }
+        self.preview_cache_order.push_back(session_id.clone());
         self.preview_cache.insert(session_id, lines);
     }
 

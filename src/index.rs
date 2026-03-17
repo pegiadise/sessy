@@ -196,16 +196,14 @@ pub fn save_index(index: &SessionIndex) {
 
 pub fn parse_recent_filter(s: &str) -> Option<u64> {
     let s = s.trim();
-    if s.len() < 2 {
-        return None;
-    }
-    let (num_str, unit) = s.split_at(s.len() - 1);
+    let unit = s.chars().last()?;
+    let num_str = &s[..s.len() - unit.len_utf8()];
     let num: u64 = num_str.parse().ok()?;
     match unit {
-        "h" => Some(num * 3600),
-        "d" => Some(num * 86400),
-        "w" => Some(num * 7 * 86400),
-        "m" => Some(num * 30 * 86400),
+        'h' => Some(num * 3600),
+        'd' => Some(num * 86400),
+        'w' => Some(num * 7 * 86400),
+        'm' => Some(num * 30 * 86400),
         _ => None,
     }
 }

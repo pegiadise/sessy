@@ -147,9 +147,9 @@ fn run_purge(idx: &mut index::SessionIndex) -> io::Result<()> {
                 if companion.is_dir() {
                     std::fs::remove_dir_all(&companion).ok();
                 }
+                idx.sessions.remove(i);
                 deleted += 1;
             }
-            idx.sessions.remove(i);
         }
         index::save_index(idx);
         println!("Purged {} sessions.", deleted);
