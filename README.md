@@ -38,14 +38,15 @@ Scripting: `claude --resume $(sessy --print)`
 | Key | Action |
 |-----|--------|
 | `j` / `k` or `Up` / `Down` | Navigate sessions (wraps around) |
+| `PgUp` / `PgDn` | Jump a full page |
 | `/` | Search (fuzzy match across project, branch, title, name) |
 | `s` | Cycle sort: date → size → duration |
 | `1` `2` `3` `4` | Filter by size: quick / medium / deep / massive (`0` clears) |
 | `b` | Bookmark/unpin session (pinned sort to top) |
 | `e` | Export session as markdown |
 | `t` | Toggle timeline heatmap view |
-| `Enter` | Launch `claude --resume` in the session's original directory |
-| `y` | Launch with `--dangerously-skip-permissions` (yolo mode) |
+| `Enter` | Launch with `--dangerously-skip-permissions` (yolo mode) |
+| `l` | Launch `claude --resume` (safe mode) |
 | `c` | Copy `claude --resume <id>` to clipboard |
 | `p` | Print session ID to stdout and exit |
 | `d` | Delete session (with confirmation) |

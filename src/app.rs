@@ -75,6 +75,7 @@ pub struct App {
     pub preview_search_current: usize,
     pub view_mode: ViewMode,
     pub status_message: Option<(String, Instant)>,
+    pub terminal_height: u16,
 }
 
 impl App {
@@ -106,6 +107,7 @@ impl App {
             preview_search_current: 0,
             view_mode: ViewMode::Normal,
             status_message: None,
+            terminal_height: 40,
         }
     }
 
@@ -139,12 +141,36 @@ impl App {
         self.preview_scroll = 0;
     }
 
+    pub fn page_up(&mut self, page_size: usize) {
+        if self.filtered_indices.is_empty() {
+            return;
+        }
+        self.selected = self.selected.saturating_sub(page_size);
+        self.preview_scroll = 0;
+    }
+
+    pub fn page_down(&mut self, page_size: usize) {
+        if self.filtered_indices.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + page_size).min(self.filtered_indices.len() - 1);
+        self.preview_scroll = 0;
+    }
+
     pub fn scroll_preview_up(&mut self) {
         self.preview_scroll = self.preview_scroll.saturating_sub(3);
     }
 
     pub fn scroll_preview_down(&mut self) {
         self.preview_scroll = self.preview_scroll.saturating_add(3);
+    }
+
+    pub fn scroll_preview_page_up(&mut self, page_size: u16) {
+        self.preview_scroll = self.preview_scroll.saturating_sub(page_size);
+    }
+
+    pub fn scroll_preview_page_down(&mut self, page_size: u16) {
+        self.preview_scroll = self.preview_scroll.saturating_add(page_size);
     }
 
     /// Rebuild filtered_indices from scratch: search → size filter → sort.

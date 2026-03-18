@@ -217,6 +217,7 @@ fn run_event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io:
 
     loop {
         terminal.draw(|frame| ui::draw(frame, app))?;
+        // terminal_height is updated inside draw()
 
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
@@ -299,6 +300,8 @@ fn handle_preview_key(app: &mut App, code: KeyCode) {
         KeyCode::Esc | KeyCode::Tab => app.handle_esc(),
         KeyCode::Up | KeyCode::Char('k') => app.scroll_preview_up(),
         KeyCode::Down | KeyCode::Char('j') => app.scroll_preview_down(),
+        KeyCode::PageUp => app.scroll_preview_page_up(app.terminal_height / 2),
+        KeyCode::PageDown => app.scroll_preview_page_down(app.terminal_height / 2),
         KeyCode::Char('/') => app.start_preview_search(),
         KeyCode::Char('n') => app.next_preview_match(),
         KeyCode::Char('N') => app.prev_preview_match(),
@@ -341,15 +344,25 @@ fn handle_list_key(app: &mut App, code: KeyCode) {
             app.move_down();
             preview::request_preview(app);
         }
+        KeyCode::PageUp => {
+            let page = (app.terminal_height as usize / 4).max(1);
+            app.page_up(page);
+            preview::request_preview(app);
+        }
+        KeyCode::PageDown => {
+            let page = (app.terminal_height as usize / 4).max(1);
+            app.page_down(page);
+            preview::request_preview(app);
+        }
         KeyCode::Enter => {
             if app.print_mode {
                 app.action = AppAction::Print(app.selected);
             } else {
-                app.action = AppAction::Launch(app.selected);
+                app.action = AppAction::LaunchDangerously(app.selected);
             }
         }
-        KeyCode::Char('y') => {
-            app.action = AppAction::LaunchDangerously(app.selected);
+        KeyCode::Char('l') => {
+            app.action = AppAction::Launch(app.selected);
         }
         KeyCode::Char('c') => {
             app.action = AppAction::Yank(app.selected);

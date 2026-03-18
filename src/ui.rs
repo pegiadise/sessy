@@ -6,8 +6,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    app.terminal_height = area.height;
 
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -40,10 +41,19 @@ fn draw_search_bar(frame: &mut Frame, app: &App, area: Rect) {
         app.search_query.clone()
     };
 
+    let search_title = if !app.search_query.is_empty() {
+        format!(
+            " Search ({}/{}) ",
+            app.filtered_indices.len(),
+            app.sessions.len()
+        )
+    } else {
+        " Search ".to_string()
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(style)
-        .title(Span::styled(" Search ", style));
+        .title(Span::styled(search_title, style));
 
     let paragraph = Paragraph::new(search_text).block(block);
     frame.render_widget(paragraph, area);
@@ -152,16 +162,34 @@ fn draw_session_list(frame: &mut Frame, app: &App, area: Rect) {
         let ts = chrono_format(session.timestamp);
         let max_width = inner.width as usize;
 
-        // Line 1: prefix · timestamp · project · branch · name
-        let mut header = format!("{} {}  {}  {}", prefix, ts, session.project, session.branch);
-        if !session.name.is_empty() {
-            header.push_str("  ");
-            header.push_str(&session.name);
+        // Line 1: prefix · timestamp · project · branch · name (each styled separately)
+        let ts_style = if is_selected {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let project_style = highlight;
+        let branch_style = if is_selected {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        let name_style = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+
+        let mut line1_spans: Vec<Span> = vec![
+            Span::styled(format!("{} ", prefix), highlight),
+            Span::styled(format!("{}  ", ts), ts_style),
+            Span::styled(session.project.clone(), project_style),
+        ];
+        if !session.branch.is_empty() {
+            line1_spans.push(Span::styled(format!("  {}", session.branch), branch_style));
         }
-        lines.push(Line::from(Span::styled(
-            truncate(&header, max_width),
-            highlight,
-        )));
+        if !session.name.is_empty() {
+            line1_spans.push(Span::styled(format!("  {}", session.name), name_style));
+        }
+        lines.push(Line::from(line1_spans));
 
         // Line 2: duration · size [category] · title
         let category = size_category(session.file_size);
@@ -380,14 +408,27 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
 
+    let session_label = app
+        .selected_session()
+        .and_then(|s| {
+            if !s.name.is_empty() {
+                Some(s.name.as_str())
+            } else {
+                None
+            }
+        })
+        .unwrap_or("");
     let title = if app.preview_loading {
-        " Preview (loading...) ".to_string()
+        format!(" Preview — {} (loading...) ", session_label)
     } else if !app.preview_search_matches.is_empty() {
         format!(
-            " Preview ({}/{} matches) ",
+            " Preview — {} ({}/{} matches) ",
+            session_label,
             app.preview_search_current + 1,
             app.preview_search_matches.len()
         )
+    } else if !session_label.is_empty() {
+        format!(" Preview — {} ", session_label)
     } else {
         " Preview ".to_string()
     };
@@ -588,9 +629,9 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("t ", key),
         Span::styled("timeline  ", desc),
         Span::styled("Enter ", key),
-        Span::styled("launch  ", desc),
-        Span::styled("y ", key),
         Span::styled("yolo  ", desc),
+        Span::styled("l ", key),
+        Span::styled("launch  ", desc),
         Span::styled("c ", key),
         Span::styled("copy  ", desc),
         Span::styled("d ", key),
