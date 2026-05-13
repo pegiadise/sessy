@@ -1,7 +1,24 @@
+use regex::Regex;
 use serde_json::Value;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::OnceLock;
+
+fn ticket_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"\b[A-Z][A-Z0-9]{1,9}-\d{1,7}\b|(?:^|[^A-Za-z0-9_])#\d{1,7}\b").unwrap()
+    })
+}
+
+pub fn extract_tickets_into(text: &str, out: &mut std::collections::HashSet<String>) {
+    for m in ticket_regex().find_iter(text) {
+        let s = m.as_str();
+        let trimmed = if let Some(pos) = s.find('#') { &s[pos..] } else { s };
+        out.insert(trimmed.to_string());
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Role {
@@ -314,5 +331,43 @@ mod tests {
         let texts: Vec<&str> = messages.iter().map(|m| m.text.as_str()).collect();
         assert!(!texts.contains(&"skill loaded: auth-helper"));
         assert!(!texts.iter().any(|t| t.contains("local-command-caveat")));
+    }
+
+    #[test]
+    fn test_extract_tickets_positive() {
+        let mut out = std::collections::HashSet::new();
+        extract_tickets_into("see PROJ-123 and ABC-78 please", &mut out);
+        assert!(out.contains("PROJ-123"));
+        assert!(out.contains("ABC-78"));
+    }
+
+    #[test]
+    fn test_extract_tickets_hash_form() {
+        let mut out = std::collections::HashSet::new();
+        extract_tickets_into("fixes #456 and refs #7", &mut out);
+        assert!(out.contains("#456"));
+        assert!(out.contains("#7"));
+    }
+
+    #[test]
+    fn test_extract_tickets_negative() {
+        let mut out = std::collections::HashSet::new();
+        extract_tickets_into("lowercase-99 and A-99 and proj-123", &mut out);
+        assert!(out.is_empty(), "got: {:?}", out);
+    }
+
+    #[test]
+    fn test_extract_tickets_dedupes() {
+        let mut out = std::collections::HashSet::new();
+        extract_tickets_into("PROJ-1 PROJ-1 PROJ-1", &mut out);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn test_extract_tickets_word_boundaries() {
+        let mut out = std::collections::HashSet::new();
+        extract_tickets_into("xPROJ-1y and (PROJ-2)", &mut out);
+        assert!(!out.contains("PROJ-1"));
+        assert!(out.contains("PROJ-2"));
     }
 }
