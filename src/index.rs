@@ -202,7 +202,8 @@ pub fn build_index(cached: Option<SessionIndex>, force_rebuild: bool) -> Session
     let chunks: Vec<&[u8]> = scanned.iter().map(|(_, b)| b.as_slice()).collect();
     let offsets = match write_text_cache(&text_cache_path(), &chunks) {
         Ok(o) => o,
-        Err(_) => {
+        Err(e) => {
+            eprintln!("sessy: failed to write text cache: {}", e);
             // If we can't write text.bin, return empty so the next launch retries.
             return SessionIndex {
                 version: INDEX_VERSION,

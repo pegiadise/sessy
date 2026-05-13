@@ -1,7 +1,7 @@
 use regex::Regex;
 use serde_json::Value;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -77,107 +77,6 @@ fn human_message_text(entry: &Value) -> Option<String> {
         })
 }
 
-pub fn extract_head_meta(path: &Path) -> Option<HeadMeta> {
-    let file = File::open(path).ok()?;
-    let reader = BufReader::new(file);
-    let mut branch = String::new();
-    let mut slug = String::new();
-    let mut first_timestamp = String::new();
-    let mut cwd = String::new();
-
-    for line in reader.lines() {
-        let line = line.ok()?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let entry: Value = serde_json::from_str(&line).ok()?;
-
-        if branch.is_empty() {
-            if let Some(b) = entry.get("gitBranch").and_then(|b| b.as_str()) {
-                branch = b.to_string();
-            }
-        }
-        if slug.is_empty() {
-            if let Some(s) = entry.get("slug").and_then(|s| s.as_str()) {
-                slug = s.to_string();
-            }
-        }
-        if first_timestamp.is_empty() {
-            if let Some(ts) = entry.get("timestamp").and_then(|t| t.as_str()) {
-                first_timestamp = ts.to_string();
-            }
-        }
-        if cwd.is_empty() {
-            if let Some(c) = entry.get("cwd").and_then(|c| c.as_str()) {
-                cwd = c.to_string();
-            }
-        }
-
-        if is_human_message(&entry) {
-            let title = human_message_text(&entry).unwrap_or_default();
-            return Some(HeadMeta {
-                title,
-                branch,
-                slug,
-                first_timestamp,
-                cwd,
-            });
-        }
-    }
-    None
-}
-
-pub fn extract_tail_meta(path: &Path) -> Option<TailMeta> {
-    let mut file = File::open(path).ok()?;
-    let file_size = file.metadata().ok()?.len();
-    let seek_pos = file_size.saturating_sub(8192);
-    file.seek(SeekFrom::Start(seek_pos)).ok()?;
-
-    let mut buf = String::new();
-    file.read_to_string(&mut buf).ok()?;
-
-    let mut last_human_message = String::new();
-    let mut last_timestamp = String::new();
-    let mut rename = String::new();
-
-    for line in buf.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<Value>(line) {
-            if let Some(ts) = entry.get("timestamp").and_then(|t| t.as_str()) {
-                last_timestamp = ts.to_string();
-            }
-            if is_human_message(&entry) {
-                if let Some(text) = human_message_text(&entry) {
-                    last_human_message = text;
-                }
-            }
-            // Check for /rename command
-            if entry.get("subtype").and_then(|s| s.as_str()) == Some("local_command") {
-                if let Some(content) = entry.get("content").and_then(|c| c.as_str()) {
-                    if content.contains("<command-name>/rename</command-name>") {
-                        if let Some(start) = content.find("<command-args>") {
-                            if let Some(end) = content.find("</command-args>") {
-                                rename = content[start + 14..end].to_string();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if last_human_message.is_empty() && last_timestamp.is_empty() {
-        return None;
-    }
-    Some(TailMeta {
-        last_human_message,
-        last_timestamp,
-        rename,
-    })
-}
 
 pub struct ScanResult {
     pub head: HeadMeta,
@@ -393,43 +292,6 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
             .join(name)
-    }
-
-    #[test]
-    fn test_extract_head_meta_simple() {
-        let meta = extract_head_meta(&fixture_path("simple_session.jsonl"));
-        let meta = meta.expect("should parse successfully");
-        assert_eq!(meta.title, "build a cool thing");
-        assert_eq!(meta.branch, "main");
-    }
-
-    #[test]
-    fn test_extract_head_meta_empty() {
-        let meta = extract_head_meta(&fixture_path("empty_session.jsonl"));
-        assert!(meta.is_none(), "empty session should return None");
-    }
-
-    #[test]
-    fn test_extract_head_meta_complex_skips_meta() {
-        let meta = extract_head_meta(&fixture_path("complex_session.jsonl"));
-        let meta = meta.expect("should parse successfully");
-        assert_eq!(meta.title, "implement auth middleware");
-        assert_eq!(meta.branch, "feat/auth");
-    }
-
-    #[test]
-    fn test_extract_tail_meta() {
-        let meta = extract_tail_meta(&fixture_path("simple_session.jsonl"));
-        let meta = meta.expect("should parse successfully");
-        assert_eq!(meta.last_human_message, "looks good, ship it");
-        assert!(meta.last_timestamp.contains("2026-03-13T01:30:30"));
-    }
-
-    #[test]
-    fn test_extract_tail_meta_complex() {
-        let meta = extract_tail_meta(&fixture_path("complex_session.jsonl"));
-        let meta = meta.expect("should parse successfully");
-        assert_eq!(meta.last_human_message, "add rate limiting too");
     }
 
     #[test]
