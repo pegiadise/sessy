@@ -36,11 +36,14 @@ pub fn request_preview(app: &mut App) {
 
     thread::spawn(move || {
         let messages = extract_conversation(&file_path);
-        let lines: Vec<(String, bool)> = messages
+        let lines: Vec<(String, String, bool)> = messages
             .into_iter()
-            .map(|m| (m.text, m.role == Role::User))
+            .map(|m| {
+                let lower = m.text.to_lowercase();
+                (m.text, lower, m.role == Role::User)
+            })
             .collect();
-        let message_count = lines.iter().filter(|(_, is_user)| *is_user).count() as u32;
+        let message_count = lines.iter().filter(|(_, _, is_user)| *is_user).count() as u32;
 
         let _ = tx.send(crate::app::PreviewResult {
             session_id,

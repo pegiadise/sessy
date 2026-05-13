@@ -473,7 +473,7 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
             app.preview_search_matches.iter().copied().collect();
 
         let mut lines: Vec<Line> = Vec::new();
-        for (msg_idx, (text, is_user)) in app.preview_lines.iter().enumerate() {
+        for (msg_idx, (text, _text_lc, is_user)) in app.preview_lines.iter().enumerate() {
             let is_match = has_search && match_set.contains(&msg_idx);
             let is_current = current_match_idx == Some(msg_idx);
 

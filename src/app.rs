@@ -47,7 +47,7 @@ pub enum AppAction {
 
 pub struct PreviewResult {
     pub session_id: String,
-    pub lines: Vec<(String, bool)>,
+    pub lines: Vec<(String, String, bool)>,
     pub message_count: u32,
 }
 
@@ -60,12 +60,12 @@ pub struct App {
     pub focus: Focus,
     pub action: AppAction,
     pub print_mode: bool,
-    pub preview_lines: Vec<(String, bool)>,
+    pub preview_lines: Vec<(String, String, bool)>,
     pub preview_loading: bool,
     pub preview_session_id: String,
     pub preview_tx: mpsc::Sender<PreviewResult>,
     pub preview_rx: mpsc::Receiver<PreviewResult>,
-    pub preview_cache: std::collections::HashMap<String, Vec<(String, bool)>>,
+    pub preview_cache: std::collections::HashMap<String, Vec<(String, String, bool)>>,
     pub preview_cache_order: VecDeque<String>,
     pub confirm_delete: bool,
     pub sort_mode: SortMode,
@@ -399,21 +399,26 @@ impl App {
     }
 
     pub fn update_preview_search(&mut self) {
-        let query = self.preview_search_query.to_lowercase();
-        if query.is_empty() {
+        let query_lc = self.preview_search_query.to_lowercase();
+        if query_lc.is_empty() {
             self.preview_search_matches.clear();
             self.preview_search_current = 0;
             return;
         }
+        let finder = memchr::memmem::Finder::new(query_lc.as_bytes());
         self.preview_search_matches = self
             .preview_lines
             .iter()
             .enumerate()
-            .filter(|(_, (text, _))| text.to_lowercase().contains(&query))
-            .map(|(i, _)| i)
+            .filter_map(|(i, (_orig, lower, _is_user))| {
+                if finder.find(lower.as_bytes()).is_some() {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
             .collect();
         self.preview_search_current = 0;
-        // Scroll to first match
         self.scroll_to_current_match();
     }
 
@@ -471,7 +476,7 @@ impl App {
 
     // Cache management (FIFO eviction)
 
-    pub fn cache_preview(&mut self, session_id: String, lines: Vec<(String, bool)>) {
+    pub fn cache_preview(&mut self, session_id: String, lines: Vec<(String, String, bool)>) {
         if self.preview_cache.contains_key(&session_id) {
             *self.preview_cache.get_mut(&session_id).unwrap() = lines;
             return;
