@@ -602,7 +602,11 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         .fg(Color::Rgb(180, 180, 180))
         .bg(Color::Rgb(40, 40, 40));
 
-    let sort_label = format!("sort:{}  ", app.sort_mode.label());
+    let sort_label = if app.search_query.is_empty() {
+        format!("sort:{}  ", app.sort_mode.label())
+    } else {
+        "sort:relevance  ".to_string()
+    };
     let filter_label = if let Some(f) = app.size_filter {
         format!("[{}]  ", f)
     } else {
