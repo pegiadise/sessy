@@ -66,7 +66,7 @@ fn draw_search_bar(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_content(frame: &mut Frame, app: &mut App, area: Rect) {
     let panes = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
@@ -401,7 +401,7 @@ fn month_abbrev(month: u32) -> &'static str {
     }
 }
 
-fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     let border_style = if matches!(app.focus, Focus::Preview | Focus::PreviewSearch) {
         Style::default().fg(Color::Cyan)
     } else {
@@ -439,6 +439,11 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
         .title(title);
 
     let inner = block.inner(area);
+    let new_width = inner.width;
+    if app.preview_inner_width != new_width {
+        app.preview_inner_width = new_width;
+        app.recompute_preview_offsets();
+    }
     frame.render_widget(block, area);
 
     // Reserve space for preview search bar if active

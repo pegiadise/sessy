@@ -23,6 +23,7 @@ pub fn request_preview(app: &mut App) {
     // Check FIFO cache
     if let Some(cached) = app.preview_cache.get(&session_id) {
         app.preview_lines = cached.clone();
+        app.recompute_preview_offsets();
         app.preview_session_id = session_id;
         app.preview_loading = false;
         return;
@@ -61,6 +62,7 @@ pub fn check_preview_updates(app: &mut App) {
 
         if app.preview_session_id == result.session_id {
             app.preview_lines = result.lines;
+            app.recompute_preview_offsets();
             app.preview_loading = false;
         }
 
