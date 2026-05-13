@@ -698,6 +698,15 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     result
 }
 
+/// Returns true for Unicode combining diacritical marks (U+0300–U+036F).
+/// These can appear as extra code points when lowercasing characters such as
+/// Turkish İ (U+0130) → i + U+0307. Skipping them keeps the lowercased text
+/// byte-for-byte matchable against a plain query like "istanbul".
+#[inline]
+fn is_combining_diacritic(c: char) -> bool {
+    ('\u{0300}'..='\u{036F}').contains(&c)
+}
+
 /// Split text into spans, highlighting occurrences of `query` (case-insensitive).
 fn highlight_spans(
     text: &str,
@@ -709,33 +718,48 @@ fn highlight_spans(
         return vec![Span::styled(text.to_string(), base_style)];
     }
 
-    let text_lower = text.to_lowercase();
-
-    // If lowercase changed byte length, skip highlighting (rare Unicode edge case)
-    if text_lower.len() != text.len() {
-        return vec![Span::styled(text.to_string(), base_style)];
+    // Build a lowercased copy of `text` alongside a mapping from every byte
+    // position in `text_lower` back to the corresponding byte position in
+    // `text`.  Combining diacritical marks introduced by `to_lowercase()` (e.g.
+    // İ → i + U+0307) are skipped so that a plain query like "istanbul" still
+    // finds a match.
+    let mut text_lower = String::with_capacity(text.len());
+    let mut lower_to_orig: Vec<usize> = Vec::with_capacity(text.len() + 1);
+    for (orig_idx, ch) in text.char_indices() {
+        for lc in ch.to_lowercase() {
+            if is_combining_diacritic(lc) {
+                continue;
+            }
+            let mut buf = [0u8; 4];
+            let s = lc.encode_utf8(&mut buf);
+            let len = s.len();
+            for _ in 0..len {
+                lower_to_orig.push(orig_idx);
+            }
+            text_lower.push(lc);
+        }
     }
+    lower_to_orig.push(text.len());
 
     let mut spans = Vec::new();
     let mut last_end = 0;
     let mut search_from = 0;
 
     while let Some(pos) = text_lower[search_from..].find(query) {
-        let start = search_from + pos;
-        let end = start + query.len();
+        let start_lower = search_from + pos;
+        let end_lower = start_lower + query.len();
+        let start_orig = lower_to_orig[start_lower];
+        let end_orig = lower_to_orig[end_lower];
 
-        if start > last_end {
-            spans.push(Span::styled(
-                text[last_end..start].to_string(),
-                base_style,
-            ));
+        if start_orig > last_end {
+            spans.push(Span::styled(text[last_end..start_orig].to_string(), base_style));
         }
-        spans.push(Span::styled(
-            text[start..end].to_string(),
-            match_style,
-        ));
-        last_end = end;
-        search_from = end;
+        spans.push(Span::styled(text[start_orig..end_orig].to_string(), match_style));
+        last_end = end_orig;
+        search_from = end_lower;
+        if search_from >= text_lower.len() {
+            break;
+        }
     }
 
     if last_end < text.len() {
@@ -746,5 +770,22 @@ fn highlight_spans(
         vec![Span::styled(text.to_string(), base_style)]
     } else {
         spans
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_highlight_unicode_length_change() {
+        // Turkish dotted-I (\u{0130}) lowercases to "i\u{0307}" (two code points),
+        // which makes text_lower.len() differ from text.len().
+        let text = "İstanbul project";
+        let base = Style::default();
+        let mat = Style::default();
+        let spans = highlight_spans(text, "istanbul", base, mat);
+        // Should produce at least 2 spans (matched + remainder), not bail out.
+        assert!(spans.len() >= 2, "got spans: {}", spans.len());
     }
 }
