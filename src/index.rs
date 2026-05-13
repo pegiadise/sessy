@@ -1,12 +1,12 @@
-use crate::parser::{extract_head_meta, extract_tail_meta};
 use crate::session::SessionMeta;
+use crate::text_cache::{text_cache_path, write_text_cache, TextCache};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-pub const INDEX_VERSION: u32 = 2;
+pub const INDEX_VERSION: u32 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionIndex {
@@ -41,7 +41,7 @@ pub fn deserialize_index(bytes: &[u8]) -> Option<SessionIndex> {
     Some(index)
 }
 
-pub fn scan_session_file(path: &Path) -> Option<SessionMeta> {
+pub fn scan_session_file(path: &Path) -> Option<(SessionMeta, Vec<u8>)> {
     let metadata = fs::metadata(path).ok()?;
     let file_size = metadata.len();
     let file_mtime = metadata
@@ -52,63 +52,64 @@ pub fn scan_session_file(path: &Path) -> Option<SessionMeta> {
         .as_secs() as i64;
     let id = path.file_stem()?.to_str()?.to_string();
 
-    let head = extract_head_meta(path)?;
+    let scan = crate::parser::scan_session(path)?;
 
     let home_dir = dirs::home_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
-    let project = crate::session::extract_project_name(&head.cwd, &home_dir);
+    let project = crate::session::extract_project_name(&scan.head.cwd, &home_dir);
 
-    let tail = extract_tail_meta(path);
-    let (last_message, duration_secs, rename) = if let Some(tail) = tail {
-        let duration = compute_duration(&head.first_timestamp, &tail.last_timestamp);
-        (tail.last_human_message, duration, tail.rename)
+    let (last_message, duration_secs, rename) = if let Some(tail) = &scan.tail {
+        let duration = compute_duration(&scan.head.first_timestamp, &tail.last_timestamp);
+        (tail.last_human_message.clone(), duration, tail.rename.clone())
     } else {
         (String::new(), 0, String::new())
     };
 
-    // Session name: /rename > slug > empty
     let name = if !rename.is_empty() {
         rename
-    } else if !head.slug.is_empty() {
-        head.slug
+    } else if !scan.head.slug.is_empty() {
+        scan.head.slug.clone()
     } else {
         String::new()
     };
 
-    // Filter out "HEAD" — it's noise from detached HEAD or non-git dirs
-    let branch = if head.branch == "HEAD" {
+    let branch = if scan.head.branch == "HEAD" {
         String::new()
     } else {
-        head.branch
+        scan.head.branch.clone()
     };
 
     let name_lc = name.to_lowercase();
-    let title_lc = head.title.to_lowercase();
+    let title_lc = scan.head.title.to_lowercase();
     let project_lc = project.to_lowercase();
     let branch_lc = branch.to_lowercase();
-    Some(SessionMeta {
+
+    let text_bytes = scan.human_text_lc.into_bytes();
+
+    let meta = SessionMeta {
         id,
         project,
         branch,
         name,
-        title: head.title,
+        title: scan.head.title,
         last_message,
         duration_secs,
         timestamp: file_mtime,
         file_size,
         file_mtime,
         file_path: path.to_path_buf(),
-        cwd: head.cwd,
+        cwd: scan.head.cwd,
         message_count: None,
-        tickets: Vec::new(),
-        text_offset: 0,
-        text_len: 0,
+        tickets: scan.tickets,
+        text_offset: 0, // filled in finalize step
+        text_len: text_bytes.len() as u32,
         name_lc,
         title_lc,
         project_lc,
         branch_lc,
-    })
+    };
+    Some((meta, text_bytes))
 }
 
 fn compute_duration(first: &str, last: &str) -> u64 {
@@ -132,6 +133,9 @@ pub fn build_index(cached: Option<SessionIndex>, force_rebuild: bool) -> Session
             sessions: vec![],
         };
     }
+
+    // Open the previous text.bin so we can reuse bytes for unchanged sessions.
+    let prev_text = TextCache::open(&text_cache_path());
 
     let cache_map: std::collections::HashMap<PathBuf, &SessionMeta> = if force_rebuild {
         std::collections::HashMap::new()
@@ -162,7 +166,8 @@ pub fn build_index(cached: Option<SessionIndex>, force_rebuild: bool) -> Session
         }
     }
 
-    let sessions: Vec<SessionMeta> = file_entries
+    // For each file: either reuse cached meta + old text bytes, or rescan.
+    let scanned: Vec<(SessionMeta, Vec<u8>)> = file_entries
         .par_iter()
         .filter_map(|path| {
             if let Some(cached_entry) = cache_map.get(path) {
@@ -180,10 +185,39 @@ pub fn build_index(cached: Option<SessionIndex>, force_rebuild: bool) -> Session
                 if cached_entry.file_mtime == current_mtime
                     && cached_entry.file_size == current_size
                 {
-                    return Some((*cached_entry).clone());
+                    let bytes = prev_text
+                        .slice(cached_entry.text_offset, cached_entry.text_len)
+                        .to_vec();
+                    let mut meta = (*cached_entry).clone();
+                    // offsets will be reassigned in the finalize step
+                    meta.text_offset = 0;
+                    return Some((meta, bytes));
                 }
             }
             scan_session_file(path)
+        })
+        .collect();
+
+    // Serial finalize: write text.bin and patch offsets onto each SessionMeta.
+    let chunks: Vec<&[u8]> = scanned.iter().map(|(_, b)| b.as_slice()).collect();
+    let offsets = match write_text_cache(&text_cache_path(), &chunks) {
+        Ok(o) => o,
+        Err(_) => {
+            // If we can't write text.bin, return empty so the next launch retries.
+            return SessionIndex {
+                version: INDEX_VERSION,
+                sessions: vec![],
+            };
+        }
+    };
+
+    let sessions: Vec<SessionMeta> = scanned
+        .into_iter()
+        .zip(offsets.into_iter())
+        .map(|((mut meta, _), (offset, len))| {
+            meta.text_offset = offset;
+            meta.text_len = len;
+            meta
         })
         .collect();
 
@@ -196,7 +230,18 @@ pub fn build_index(cached: Option<SessionIndex>, force_rebuild: bool) -> Session
 pub fn load_cached_index() -> Option<SessionIndex> {
     let path = index_cache_path();
     let bytes = fs::read(&path).ok()?;
-    deserialize_index(&bytes)
+    let index = deserialize_index(&bytes)?;
+    let text_cache = TextCache::open(&text_cache_path());
+    let max_end: u64 = index
+        .sessions
+        .iter()
+        .map(|s| s.text_offset + s.text_len as u64)
+        .max()
+        .unwrap_or(0);
+    if (text_cache.len() as u64) < max_end {
+        return None;
+    }
+    Some(index)
 }
 
 pub fn save_index(index: &SessionIndex) {
@@ -232,18 +277,22 @@ mod tests {
 
     #[test]
     fn test_scan_session_file_simple() {
-        let meta = scan_session_file(&fixture_path("simple_session.jsonl"));
-        let meta = meta.expect("should produce SessionMeta");
+        let result = scan_session_file(&fixture_path("simple_session.jsonl"));
+        let (meta, text) = result.expect("should produce SessionMeta + text");
         assert_eq!(meta.title, "build a cool thing");
         assert_eq!(meta.last_message, "looks good, ship it");
         assert_eq!(meta.branch, "main");
         assert!(meta.duration_secs > 0);
+        assert_eq!(meta.title_lc, "build a cool thing");
+        assert_eq!(meta.branch_lc, "main");
+        assert!(!text.is_empty());
+        assert!(text.iter().all(|b| !(*b as char).is_uppercase()));
     }
 
     #[test]
     fn test_scan_session_file_empty_returns_none() {
-        let meta = scan_session_file(&fixture_path("empty_session.jsonl"));
-        assert!(meta.is_none(), "empty session should be filtered out");
+        let result = scan_session_file(&fixture_path("empty_session.jsonl"));
+        assert!(result.is_none(), "empty session should be filtered out");
     }
 
     #[test]
