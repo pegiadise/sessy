@@ -1,4 +1,5 @@
 use crate::session::SessionMeta;
+use crate::text_cache::TextCache;
 use std::collections::{HashSet, VecDeque};
 use std::sync::mpsc;
 use std::time::Instant;
@@ -70,6 +71,7 @@ pub struct App {
     pub sort_mode: SortMode,
     pub size_filter: Option<&'static str>,
     pub bookmarks: HashSet<String>,
+    pub text_cache: TextCache,
     pub preview_search_query: String,
     pub preview_search_matches: Vec<usize>,
     pub preview_search_current: usize,
@@ -79,7 +81,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(sessions: Vec<SessionMeta>, print_mode: bool, bookmarks: HashSet<String>) -> Self {
+    pub fn new(
+        sessions: Vec<SessionMeta>,
+        print_mode: bool,
+        bookmarks: HashSet<String>,
+        text_cache: TextCache,
+    ) -> Self {
         let filtered_indices: Vec<usize> = (0..sessions.len()).collect();
         let (preview_tx, preview_rx) = mpsc::channel();
         Self {
@@ -102,6 +109,7 @@ impl App {
             sort_mode: SortMode::Date,
             size_filter: None,
             bookmarks,
+            text_cache,
             preview_search_query: String::new(),
             preview_search_matches: Vec::new(),
             preview_search_current: 0,
@@ -185,28 +193,99 @@ impl App {
     fn apply_search_inner(&mut self) {
         if self.search_query.is_empty() {
             self.filtered_indices = (0..self.sessions.len()).collect();
-        } else {
-            use fuzzy_matcher::skim::SkimMatcherV2;
-            use fuzzy_matcher::FuzzyMatcher;
-            let matcher = SkimMatcherV2::default();
-            let query = &self.search_query;
-            let mut scored: Vec<(usize, i64)> = self
-                .sessions
-                .iter()
-                .enumerate()
-                .filter_map(|(i, s)| {
-                    let searchable = format!(
-                        "{} {} {} {} {}",
-                        s.project, s.branch, s.title, s.last_message, s.name
-                    );
-                    matcher
-                        .fuzzy_match(&searchable, query)
-                        .map(|score| (i, score))
-                })
-                .collect();
-            scored.sort_by(|a, b| b.1.cmp(&a.1));
-            self.filtered_indices = scored.into_iter().map(|(i, _)| i).collect();
+            return;
         }
+
+        use memchr::memmem::Finder;
+        use rayon::prelude::*;
+
+        let query_lc = self.search_query.to_lowercase();
+        let query_upper = self.search_query.to_ascii_uppercase();
+        let is_ticket_form = is_ticket_query(&query_upper);
+        let tokens: Vec<&str> = query_lc.split_whitespace().collect();
+        if tokens.is_empty() {
+            self.filtered_indices = (0..self.sessions.len()).collect();
+            return;
+        }
+        let finders: Vec<Finder> = tokens.iter().map(|t| Finder::new(t.as_bytes())).collect();
+
+        let text_cache = &self.text_cache;
+
+        let ticket_matched: Vec<bool> = self
+            .sessions
+            .iter()
+            .map(|s| is_ticket_form && s.tickets.binary_search(&query_upper).is_ok())
+            .collect();
+
+        let mut scored: Vec<(usize, i64)> = self
+            .sessions
+            .par_iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                let mut score: i64 = 0;
+                let ticket_hit = ticket_matched[i];
+                if ticket_hit {
+                    score += 1000;
+                }
+                for (token, finder) in tokens.iter().zip(finders.iter()) {
+                    let hit = if ticket_hit {
+                        // Ticket exact match satisfies this token; still add
+                        // field scores if the token also hits other fields.
+                        if finder.find(s.name_lc.as_bytes()).is_some()
+                            || finder.find(s.title_lc.as_bytes()).is_some()
+                        {
+                            score += 500;
+                            if starts_at_word_boundary(s.name_lc.as_bytes(), token.as_bytes())
+                                || starts_at_word_boundary(s.title_lc.as_bytes(), token.as_bytes())
+                            {
+                                score += 50;
+                            }
+                        } else if finder.find(s.project_lc.as_bytes()).is_some() {
+                            score += 400;
+                        } else if finder.find(s.branch_lc.as_bytes()).is_some() {
+                            score += 300;
+                        }
+                        true
+                    } else if finder.find(s.name_lc.as_bytes()).is_some()
+                        || finder.find(s.title_lc.as_bytes()).is_some()
+                    {
+                        score += 500;
+                        if starts_at_word_boundary(s.name_lc.as_bytes(), token.as_bytes())
+                            || starts_at_word_boundary(s.title_lc.as_bytes(), token.as_bytes())
+                        {
+                            score += 50;
+                        }
+                        true
+                    } else if finder.find(s.project_lc.as_bytes()).is_some() {
+                        score += 400;
+                        true
+                    } else if finder.find(s.branch_lc.as_bytes()).is_some() {
+                        score += 300;
+                        true
+                    } else {
+                        let slice = text_cache.slice(s.text_offset, s.text_len);
+                        if finder.find(slice).is_some() {
+                            score += 100;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if !hit {
+                        return None;
+                    }
+                }
+                Some((i, score))
+            })
+            .collect();
+
+        // score desc, timestamp desc tiebreak
+        scored.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| self.sessions[b.0].timestamp.cmp(&self.sessions[a.0].timestamp))
+        });
+
+        self.filtered_indices = scored.into_iter().map(|(i, _)| i).collect();
     }
 
     fn apply_size_filter(&mut self) {
@@ -220,8 +299,19 @@ impl App {
     pub fn apply_sort(&mut self) {
         let sessions = &self.sessions;
         let bookmarks = &self.bookmarks;
+        let search_active = !self.search_query.is_empty();
 
-        // Primary: bookmarked first. Secondary: current sort mode.
+        // When search is active, preserve the relevance ordering (score desc,
+        // date tiebreak) computed by apply_search_inner. Only float bookmarks.
+        if search_active {
+            self.filtered_indices.sort_by(|&a, &b| {
+                let a_pinned = bookmarks.contains(&sessions[a].id);
+                let b_pinned = bookmarks.contains(&sessions[b].id);
+                b_pinned.cmp(&a_pinned)
+            });
+            return;
+        }
+
         self.filtered_indices.sort_by(|&a, &b| {
             let a_pinned = bookmarks.contains(&sessions[a].id);
             let b_pinned = bookmarks.contains(&sessions[b].id);
@@ -443,5 +533,150 @@ impl App {
                 self.action = AppAction::Quit;
             }
         }
+    }
+}
+
+fn is_ticket_query(q_upper: &str) -> bool {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"^[A-Z][A-Z0-9]{1,9}-\d{1,7}$|^#\d{1,7}$").unwrap()
+    });
+    re.is_match(q_upper)
+}
+
+fn starts_at_word_boundary(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    for idx in memchr::memmem::find_iter(haystack, needle) {
+        if idx == 0 || !haystack[idx - 1].is_ascii_alphanumeric() {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+    use crate::text_cache::TextCache;
+    use std::path::PathBuf;
+
+    fn make_session(
+        id: &str,
+        name: &str,
+        title: &str,
+        project: &str,
+        branch: &str,
+        tickets: Vec<&str>,
+    ) -> SessionMeta {
+        SessionMeta {
+            id: id.into(),
+            project: project.into(),
+            branch: branch.into(),
+            name: name.into(),
+            title: title.into(),
+            last_message: String::new(),
+            duration_secs: 0,
+            timestamp: 0,
+            file_size: 0,
+            file_mtime: 0,
+            file_path: PathBuf::from(format!("/tmp/{}.jsonl", id)),
+            cwd: String::new(),
+            message_count: None,
+            tickets: tickets.into_iter().map(String::from).collect(),
+            text_offset: 0,
+            text_len: 0,
+            name_lc: name.to_lowercase(),
+            title_lc: title.to_lowercase(),
+            project_lc: project.to_lowercase(),
+            branch_lc: branch.to_lowercase(),
+        }
+    }
+
+    fn empty_cache() -> TextCache {
+        TextCache::open(std::path::Path::new("/does/not/exist"))
+    }
+
+    #[test]
+    fn test_empty_query_restores_all() {
+        let sessions = vec![
+            make_session("a", "", "", "p1", "main", vec![]),
+            make_session("b", "", "", "p2", "main", vec![]),
+        ];
+        let mut app = App::new(sessions, false, HashSet::new(), empty_cache());
+        app.search_query.clear();
+        app.apply_search();
+        assert_eq!(app.filtered_indices.len(), 2);
+    }
+
+    #[test]
+    fn test_ticket_exact_beats_name() {
+        let sessions = vec![
+            make_session("a", "PROJ-123", "", "p", "main", vec![]),
+            make_session("b", "", "", "p", "main", vec!["PROJ-123"]),
+        ];
+        let mut app = App::new(sessions, false, HashSet::new(), empty_cache());
+        app.search_query = "PROJ-123".into();
+        app.apply_search();
+        assert_eq!(app.filtered_indices.len(), 2);
+        // session "b" (ticket hit) ranks above "a" (name hit)
+        assert_eq!(app.sessions[app.filtered_indices[0]].id, "b");
+    }
+
+    #[test]
+    fn test_name_beats_project() {
+        let sessions = vec![
+            make_session("a", "kerveros", "", "other", "main", vec![]),
+            make_session("b", "", "", "kerveros", "main", vec![]),
+        ];
+        let mut app = App::new(sessions, false, HashSet::new(), empty_cache());
+        app.search_query = "kerveros".into();
+        app.apply_search();
+        assert_eq!(app.sessions[app.filtered_indices[0]].id, "a");
+    }
+
+    #[test]
+    fn test_and_across_tokens_field_or() {
+        let sessions = vec![
+            make_session("a", "kerveros encrypt", "", "p", "main", vec![]),
+            make_session("b", "kerveros", "", "p", "main", vec![]),
+            make_session("c", "kerveros", "", "encrypt-stuff", "main", vec![]),
+        ];
+        let mut app = App::new(sessions, false, HashSet::new(), empty_cache());
+        app.search_query = "kerveros encrypt".into();
+        app.apply_search();
+        let ids: Vec<&str> = app
+            .filtered_indices
+            .iter()
+            .map(|&i| app.sessions[i].id.as_str())
+            .collect();
+        assert!(ids.contains(&"a"), "got {:?}", ids);
+        assert!(ids.contains(&"c"), "got {:?}", ids);
+        assert!(!ids.contains(&"b"), "session b should not match: {:?}", ids);
+    }
+
+    #[test]
+    fn test_no_match_returns_empty() {
+        let sessions = vec![make_session("a", "kerveros", "", "p", "main", vec![])];
+        let mut app = App::new(sessions, false, HashSet::new(), empty_cache());
+        app.search_query = "zzzzznevermatch".into();
+        app.apply_search();
+        assert!(app.filtered_indices.is_empty());
+    }
+
+    #[test]
+    fn test_bookmarks_float_to_top_under_relevance() {
+        let sessions = vec![
+            make_session("a", "kerveros", "", "p", "main", vec![]),
+            make_session("b", "kerveros", "", "p", "main", vec![]),
+        ];
+        let mut bookmarks = HashSet::new();
+        bookmarks.insert("b".to_string());
+        let mut app = App::new(sessions, false, bookmarks, empty_cache());
+        app.search_query = "kerveros".into();
+        app.apply_search();
+        assert_eq!(app.sessions[app.filtered_indices[0]].id, "b");
     }
 }

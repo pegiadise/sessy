@@ -99,7 +99,9 @@ fn main() -> io::Result<()> {
     let bookmarks = bookmarks::load_bookmarks();
 
     // Run TUI
-    let mut app = App::new(idx.sessions, cli.print, bookmarks);
+    // TODO(Task 13): wire real TextCache from text_cache_path()
+    let tc = text_cache::TextCache::open(std::path::Path::new("/does/not/exist"));
+    let mut app = App::new(idx.sessions, cli.print, bookmarks, tc);
     app.apply_sort(); // apply bookmark floating on initial load
 
     let mut terminal = ratatui::init();
