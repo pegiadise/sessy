@@ -5,6 +5,7 @@ mod index;
 mod parser;
 mod preview;
 mod session;
+mod text_cache;
 mod ui;
 
 use app::{App, AppAction, Focus, ViewMode};
