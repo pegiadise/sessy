@@ -1,7 +1,7 @@
 use sessy::{app, bookmarks, index, preview, session, text_cache, ui};
 use app::{App, AppAction, Focus, ViewMode};
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::io;
 use std::time::Duration;
 
@@ -233,8 +233,8 @@ fn run_event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io:
                 }
 
                 match app.focus {
-                    Focus::Search => handle_search_key(app, key.code),
-                    Focus::PreviewSearch => handle_preview_search_key(app, key.code),
+                    Focus::Search => handle_search_key(app, key),
+                    Focus::PreviewSearch => handle_preview_search_key(app, key),
                     Focus::Preview => handle_preview_key(app, key.code),
                     Focus::List => handle_list_key(app, key.code),
                 }
@@ -251,40 +251,103 @@ fn run_event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io:
     Ok(())
 }
 
-fn handle_search_key(app: &mut App, code: KeyCode) {
-    match code {
-        KeyCode::Esc => app.handle_esc(),
+fn handle_search_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let cmd = key.modifiers.contains(KeyModifiers::SUPER);
+
+    let mut mutated = false;
+    match key.code {
+        KeyCode::Esc => {
+            app.handle_esc();
+            return;
+        }
         KeyCode::Enter => {
             app.focus = Focus::List;
+            return;
+        }
+        KeyCode::Backspace if alt => {
+            delete_word_backwards(&mut app.search_query);
+            mutated = true;
+        }
+        KeyCode::Backspace if cmd => {
+            app.search_query.clear();
+            mutated = true;
         }
         KeyCode::Backspace => {
             app.search_query.pop();
-            app.apply_search();
-            preview::request_preview(app);
+            mutated = true;
         }
-        KeyCode::Char(c) => {
+        KeyCode::Char('w') if ctrl => {
+            delete_word_backwards(&mut app.search_query);
+            mutated = true;
+        }
+        KeyCode::Char('u') if ctrl => {
+            app.search_query.clear();
+            mutated = true;
+        }
+        KeyCode::Char(c) if !ctrl && !alt && !cmd => {
             app.search_query.push(c);
-            app.apply_search();
-            preview::request_preview(app);
+            mutated = true;
         }
         _ => {}
     }
+    if mutated {
+        app.apply_search();
+        preview::request_preview(app);
+    }
 }
 
-fn handle_preview_search_key(app: &mut App, code: KeyCode) {
-    match code {
+fn handle_preview_search_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let cmd = key.modifiers.contains(KeyModifiers::SUPER);
+
+    let mut mutated = false;
+    match key.code {
         KeyCode::Esc | KeyCode::Enter => {
             app.exit_preview_search();
+            return;
+        }
+        KeyCode::Backspace if alt => {
+            delete_word_backwards(&mut app.preview_search_query);
+            mutated = true;
+        }
+        KeyCode::Backspace if cmd => {
+            app.preview_search_query.clear();
+            mutated = true;
         }
         KeyCode::Backspace => {
             app.preview_search_query.pop();
-            app.update_preview_search();
+            mutated = true;
         }
-        KeyCode::Char(c) => {
+        KeyCode::Char('w') if ctrl => {
+            delete_word_backwards(&mut app.preview_search_query);
+            mutated = true;
+        }
+        KeyCode::Char('u') if ctrl => {
+            app.preview_search_query.clear();
+            mutated = true;
+        }
+        KeyCode::Char(c) if !ctrl && !alt && !cmd => {
             app.preview_search_query.push(c);
-            app.update_preview_search();
+            mutated = true;
         }
         _ => {}
+    }
+    if mutated {
+        app.update_preview_search();
+    }
+}
+
+/// Readline-style: strip trailing whitespace, then drop the previous word.
+/// `"hello world "` → `"hello"`, `"hello"` → `""`.
+fn delete_word_backwards(s: &mut String) {
+    while s.chars().next_back().is_some_and(|c| c.is_whitespace()) {
+        s.pop();
+    }
+    while s.chars().next_back().is_some_and(|c| !c.is_whitespace()) {
+        s.pop();
     }
 }
 
@@ -402,5 +465,54 @@ fn handle_list_key(app: &mut App, code: KeyCode) {
             preview::request_preview(app);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delete_word_strips_trailing_space_then_word() {
+        // Readline behavior: skip trailing whitespace, then delete the
+        // word, leaving the space *before* it intact.
+        let mut s = String::from("hello world ");
+        delete_word_backwards(&mut s);
+        assert_eq!(s, "hello ");
+    }
+
+    #[test]
+    fn delete_word_no_trailing_space() {
+        let mut s = String::from("hello world");
+        delete_word_backwards(&mut s);
+        assert_eq!(s, "hello ");
+    }
+
+    #[test]
+    fn delete_word_only_one_word() {
+        let mut s = String::from("hello");
+        delete_word_backwards(&mut s);
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn delete_word_empty_string_is_noop() {
+        let mut s = String::new();
+        delete_word_backwards(&mut s);
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn delete_word_only_whitespace() {
+        let mut s = String::from("   ");
+        delete_word_backwards(&mut s);
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn delete_word_handles_unicode() {
+        let mut s = String::from("καλημέρα κόσμε");
+        delete_word_backwards(&mut s);
+        assert_eq!(s, "καλημέρα ");
     }
 }
