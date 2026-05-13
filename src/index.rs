@@ -214,7 +214,7 @@ pub fn build_index(cached: Option<SessionIndex>, force_rebuild: bool) -> Session
 
     let sessions: Vec<SessionMeta> = scanned
         .into_iter()
-        .zip(offsets.into_iter())
+        .zip(offsets)
         .map(|((mut meta, _), (offset, len))| {
             meta.text_offset = offset;
             meta.text_len = len;

@@ -38,6 +38,10 @@ impl TextCache {
         self.mmap.as_ref().map(|m| m.len()).unwrap_or(0)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn slice(&self, offset: u64, len: u32) -> &[u8] {
         let mmap = match &self.mmap {
             Some(m) => m,
