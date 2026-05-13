@@ -83,6 +83,10 @@ pub fn scan_session_file(path: &Path) -> Option<SessionMeta> {
         head.branch
     };
 
+    let name_lc = name.to_lowercase();
+    let title_lc = head.title.to_lowercase();
+    let project_lc = project.to_lowercase();
+    let branch_lc = branch.to_lowercase();
     Some(SessionMeta {
         id,
         project,
@@ -97,6 +101,13 @@ pub fn scan_session_file(path: &Path) -> Option<SessionMeta> {
         file_path: path.to_path_buf(),
         cwd: head.cwd,
         message_count: None,
+        tickets: Vec::new(),
+        text_offset: 0,
+        text_len: 0,
+        name_lc,
+        title_lc,
+        project_lc,
+        branch_lc,
     })
 }
 
@@ -251,6 +262,13 @@ mod tests {
             file_path: PathBuf::from("/tmp/test.jsonl"),
             cwd: "/Users/me/code/test".to_string(),
             message_count: None,
+            tickets: vec![],
+            text_offset: 0,
+            text_len: 0,
+            name_lc: String::new(),
+            title_lc: "hello world".to_string(),
+            project_lc: "test".to_string(),
+            branch_lc: "main".to_string(),
         }];
         let index = SessionIndex {
             version: INDEX_VERSION,

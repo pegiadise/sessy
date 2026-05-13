@@ -16,6 +16,13 @@ pub struct SessionMeta {
     pub file_path: PathBuf,
     pub cwd: String,
     pub message_count: Option<u32>,
+    pub tickets: Vec<String>,
+    pub text_offset: u64,
+    pub text_len: u32,
+    pub name_lc: String,
+    pub title_lc: String,
+    pub project_lc: String,
+    pub branch_lc: String,
 }
 
 /// Extract a human-readable project name from a `cwd` path.
@@ -119,5 +126,34 @@ mod tests {
     #[test]
     fn test_format_duration_exact_hour() {
         assert_eq!(format_duration(3600), "1h0m");
+    }
+
+    #[test]
+    fn test_session_meta_has_search_fields() {
+        let m = SessionMeta {
+            id: "x".into(),
+            project: "P".into(),
+            branch: "main".into(),
+            name: String::new(),
+            title: "Title".into(),
+            last_message: String::new(),
+            duration_secs: 0,
+            timestamp: 0,
+            file_size: 0,
+            file_mtime: 0,
+            file_path: std::path::PathBuf::from("/tmp/x"),
+            cwd: String::new(),
+            message_count: None,
+            tickets: vec!["PROJ-1".into()],
+            text_offset: 100,
+            text_len: 50,
+            name_lc: String::new(),
+            title_lc: "title".into(),
+            project_lc: "p".into(),
+            branch_lc: "main".into(),
+        };
+        assert_eq!(m.tickets[0], "PROJ-1");
+        assert_eq!(m.text_offset, 100);
+        assert_eq!(m.title_lc, "title");
     }
 }
