@@ -1,6 +1,6 @@
 [package]
 name = "sessy"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.86"
 description = "TUI session manager for Claude Code — browse, search, preview, and resume conversations"
@@ -21,6 +21,9 @@ copypasta = "0.10"
 fuzzy-matcher = "0.3"
 dirs = "6"
 chrono = "0.4"
+memchr = "2"
+memmap2 = "0.9"
+regex = "1"
 
 [dev-dependencies]
 tempfile = "3"

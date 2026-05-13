@@ -1675,7 +1675,7 @@ dependencies = [
 
 [[package]]
 name = "sessy"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bincode",
  "chrono",
@@ -1684,8 +1684,11 @@ dependencies = [
  "crossterm",
  "dirs",
  "fuzzy-matcher",
+ "memchr",
+ "memmap2",
  "ratatui",
  "rayon",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
