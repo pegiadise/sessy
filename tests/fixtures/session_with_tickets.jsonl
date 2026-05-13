@@ -1,0 +1,3 @@
+{"type":"user","timestamp":"2026-05-13T10:00:00Z","cwd":"/Users/me/code/agile-turtles/sessy","gitBranch":"main","slug":"ticket-session","message":{"content":"working on PROJ-123 today"}}
+{"type":"assistant","timestamp":"2026-05-13T10:00:10Z","message":{"content":[{"type":"text","text":"ABC-78 is also relevant, #456"}]}}
+{"type":"user","timestamp":"2026-05-13T10:01:00Z","message":{"content":"final question on PROJ-123"}}

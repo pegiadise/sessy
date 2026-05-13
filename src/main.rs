@@ -1,13 +1,4 @@
-mod app;
-mod bookmarks;
-mod export;
-mod index;
-mod parser;
-mod preview;
-mod session;
-mod text_cache;
-mod ui;
-
+use sessy::{app, bookmarks, index, preview, session, text_cache, ui};
 use app::{App, AppAction, Focus, ViewMode};
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};

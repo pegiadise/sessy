@@ -390,4 +390,18 @@ mod tests {
         let result = scan_session(&fixture_path("empty_session.jsonl"));
         assert!(result.is_none());
     }
+
+    #[test]
+    fn test_scan_session_extracts_tickets() {
+        let result = scan_session(&fixture_path("session_with_tickets.jsonl"));
+        let result = result.expect("should scan");
+        assert!(result.tickets.contains(&"PROJ-123".to_string()), "got {:?}", result.tickets);
+        assert!(result.tickets.contains(&"ABC-78".to_string()), "got {:?}", result.tickets);
+        assert!(result.tickets.contains(&"#456".to_string()), "got {:?}", result.tickets);
+        // sorted + deduped
+        let mut sorted = result.tickets.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted, result.tickets);
+    }
 }

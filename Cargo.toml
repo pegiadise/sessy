@@ -9,6 +9,14 @@ repository = "https://github.com/pegiadise/sessy"
 keywords = ["claude", "tui", "session", "cli"]
 categories = ["command-line-utilities"]
 
+[lib]
+name = "sessy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sessy"
+path = "src/main.rs"
+
 [dependencies]
 ratatui = "0.30"
 crossterm = "0.29"
