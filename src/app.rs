@@ -300,6 +300,11 @@ impl App {
         }
     }
 
+    /// Invariant when search is active: callers must ensure `filtered_indices`
+    /// is already in score-descending order (i.e., `apply_search_inner` has run
+    /// since the last query change). The bookmark-pin pass uses a stable sort,
+    /// so it preserves relevance order — but only because that order is the
+    /// pre-existing one. Re-sorting after a non-search mutation would scramble it.
     pub fn apply_sort(&mut self) {
         let sessions = &self.sessions;
         let bookmarks = &self.bookmarks;
@@ -447,24 +452,6 @@ impl App {
         self.scroll_to_current_match();
     }
 
-    fn wrapped_line_count(text: &str, width: usize) -> u16 {
-        if width == 0 {
-            return 1;
-        }
-        let mut count = 0_u16;
-        let mut remaining = text;
-        while let Some((byte_limit, _)) = remaining.char_indices().nth(width) {
-            let split_at = remaining[..byte_limit].rfind(' ').unwrap_or(0);
-            let split_at = if split_at == 0 { byte_limit } else { split_at };
-            count = count.saturating_add(1);
-            remaining = remaining[split_at..].trim_start();
-        }
-        if !remaining.is_empty() {
-            count = count.saturating_add(1);
-        }
-        if count == 0 { 1 } else { count }
-    }
-
     pub fn recompute_preview_offsets(&mut self) {
         let width = self.preview_inner_width.saturating_sub(1) as usize;
         self.preview_line_offsets.clear();
@@ -474,7 +461,7 @@ impl App {
             self.preview_line_offsets.push(cursor);
             let prefix = if *is_user { "USER: " } else { "ASST: " };
             let full = format!("{}{}", prefix, text);
-            let lines = Self::wrapped_line_count(&full, width);
+            let lines = crate::ui::wrap_text(&full, width).len().max(1) as u16;
             cursor = cursor.saturating_add(lines).saturating_add(1); // +1 blank separator
         }
     }
@@ -494,7 +481,7 @@ impl App {
     }
 
     fn intra_match_chunk_offset(&self, line_idx: usize) -> u16 {
-        let (text, _lower, is_user) = match self.preview_lines.get(line_idx) {
+        let (_text, lower, is_user) = match self.preview_lines.get(line_idx) {
             Some(t) => t,
             None => return 0,
         };
@@ -502,16 +489,18 @@ impl App {
         if query_lc.is_empty() {
             return 0;
         }
-        let prefix = if *is_user { "USER: " } else { "ASST: " };
-        let full = format!("{}{}", prefix, text);
         let width = self.preview_inner_width.saturating_sub(1) as usize;
         if width == 0 {
             return 0;
         }
+        // Wrap the pre-lowercased message (with the same "USER: "/"ASST: " prefix
+        // length as the render pass) so memmem scans bytes directly.
+        let prefix = if *is_user { "user: " } else { "asst: " };
+        let full_lc = format!("{}{}", prefix, lower);
         let finder = memchr::memmem::Finder::new(query_lc.as_bytes());
-        let chunks = wrap_for_offsets(&full, width);
+        let chunks = crate::ui::wrap_text(&full_lc, width);
         for (idx, chunk) in chunks.iter().enumerate() {
-            if finder.find(chunk.to_lowercase().as_bytes()).is_some() {
+            if finder.find(chunk.as_bytes()).is_some() {
                 return idx as u16;
             }
         }
@@ -614,24 +603,6 @@ impl App {
             }
         }
     }
-}
-
-fn wrap_for_offsets(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![text.to_string()];
-    }
-    let mut result = Vec::new();
-    let mut remaining = text;
-    while let Some((byte_limit, _)) = remaining.char_indices().nth(width) {
-        let split_at = remaining[..byte_limit].rfind(' ').unwrap_or(0);
-        let split_at = if split_at == 0 { byte_limit } else { split_at };
-        result.push(remaining[..split_at].to_string());
-        remaining = remaining[split_at..].trim_start();
-    }
-    if !remaining.is_empty() {
-        result.push(remaining.to_string());
-    }
-    result
 }
 
 fn is_ticket_query(q_upper: &str) -> bool {

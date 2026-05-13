@@ -684,7 +684,7 @@ fn truncate(s: &str, max_chars: usize) -> String {
     format!("{}…", &s[..end])
 }
 
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
+pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
     }
