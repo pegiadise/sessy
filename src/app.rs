@@ -559,6 +559,7 @@ impl App {
 
     pub fn delete_selected(&mut self) {
         if let Some(&real_idx) = self.filtered_indices.get(self.selected) {
+            let id = self.sessions[real_idx].id.clone();
             let path = self.sessions[real_idx].file_path.clone();
             if std::fs::remove_file(&path).is_ok() {
                 let companion_dir = path.with_extension("");
@@ -578,9 +579,16 @@ impl App {
                 self.preview_lines.clear();
                 self.preview_session_id.clear();
                 self.preview_loading = false;
+                self.cleanup_bookmark_for_deleted(&id);
             }
         }
         self.confirm_delete = false;
+    }
+
+    pub fn cleanup_bookmark_for_deleted(&mut self, id: &str) {
+        if self.bookmarks.remove(id) {
+            crate::bookmarks::save_bookmarks(&self.bookmarks);
+        }
     }
 
     pub fn handle_esc(&mut self) {
@@ -768,5 +776,16 @@ mod search_tests {
         app.search_query = "kerveros".into();
         app.apply_search();
         assert_eq!(app.sessions[app.filtered_indices[0]].id, "b");
+    }
+
+    #[test]
+    fn test_delete_removes_bookmark() {
+        let sessions = vec![make_session("a", "", "t", "p", "main", vec![])];
+        let mut bookmarks = HashSet::new();
+        bookmarks.insert("a".to_string());
+        let mut app = App::new(sessions, false, bookmarks, empty_cache());
+        app.selected = 0;
+        app.cleanup_bookmark_for_deleted("a");
+        assert!(!app.bookmarks.contains("a"));
     }
 }
