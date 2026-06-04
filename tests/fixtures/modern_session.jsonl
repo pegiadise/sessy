@@ -1,0 +1,8 @@
+{"type":"progress","data":{"type":"hook_progress"},"timestamp":"2026-05-01T10:00:00.000Z","sessionId":"modern-1","gitBranch":"feat/auth","cwd":"/Users/me/code/demo","version":"2.1.0"}
+{"type":"user","message":{"role":"user","content":"add login endpoint"},"timestamp":"2026-05-01T10:00:05.000Z","sessionId":"modern-1","gitBranch":"feat/auth","isSidechain":false,"cwd":"/Users/me/code/demo"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll add the JWT login route."},{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"src/auth.rs"}}]},"timestamp":"2026-05-01T10:00:10.000Z","sessionId":"modern-1","isSidechain":false,"attributionSkill":"brainstorming"}
+{"type":"ai-title","aiTitle":"Add JWT login endpoint","sessionId":"modern-1"}
+{"type":"permission-mode","permissionMode":"plan","sessionId":"modern-1"}
+{"type":"user","message":{"role":"user","content":"subagent task prompt"},"isSidechain":true,"timestamp":"2026-05-01T10:00:11.000Z","sessionId":"modern-1"}
+{"type":"file-history-snapshot","snapshot":{"messageId":"m1","trackedFileBackups":{"src/auth.rs":{"backupFileName":"a@v1","version":1,"backupTime":"2026-05-01T10:00:12.000Z"},"src/lib.rs":{"backupFileName":"b@v1","version":1,"backupTime":"2026-05-01T10:00:13.000Z"}},"timestamp":"2026-05-01T10:00:13.000Z"},"sessionId":"modern-1","attributionSkill":"test-driven-development"}
+{"type":"user","message":{"role":"user","content":"ship it"},"timestamp":"2026-05-01T10:05:00.000Z","sessionId":"modern-1","gitBranch":"feat/auth","isSidechain":false}

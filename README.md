@@ -38,13 +38,18 @@ Scripting: `claude --resume $(sessy --print)`
 | Key | Action |
 |-----|--------|
 | `j` / `k` or `Up` / `Down` | Navigate sessions (wraps around) |
+| `g` / `G` or `Home` / `End` | Jump to top / bottom |
 | `PgUp` / `PgDn` | Jump a full page |
-| `/` | Search (fuzzy match across project, branch, title, name) |
-| `s` | Cycle sort: date → size → duration |
+| `/` | Search (project, title, branch, name, changed files, tickets, message text) |
+| `s` | Cycle sort: date → size → duration → messages |
 | `1` `2` `3` `4` | Filter by size: quick / medium / deep / massive (`0` clears) |
+| `a` | Toggle scope: current directory ↔ all projects |
 | `b` | Bookmark/unpin session (pinned sort to top) |
 | `e` | Export session as markdown |
 | `t` | Toggle timeline heatmap view |
+| `f` | Show files changed in the selected session |
+| `T` | Toggle tool-use activity in the preview |
+| `?` | Keybinding help overlay |
 | `Enter` | Launch with `--dangerously-skip-permissions` (yolo mode) |
 | `l` | Launch `claude --resume` (safe mode) |
 | `c` | Copy `claude --resume <id>` to clipboard |
@@ -60,14 +65,16 @@ Scripting: `claude --resume $(sessy --print)`
 Each session shows three lines:
 
 ```
-▸★ Jun 10 14:32  my-app  feat/auth  wiggly-forging-newell
-   1h45m  4.2 MB [medium]  "add login endpoint with JWT"
+▸★ Jun 10 14:32  my-app  feat/auth  Add JWT login endpoint
+   1h45m  4.2 MB [medium] · 42 msgs  "add login endpoint with JWT"
    └ left off: "looks good, ship it"
 ```
 
 - **Line 1**: Selection/bookmark indicator, timestamp, project, branch, session name
-- **Line 2**: Duration, file size with color-coded category, first message
+- **Line 2**: Duration, file size with color-coded category, message count, first message
 - **Line 3**: Last human message — where you left off
+
+The session name prefers Claude Code's AI-generated title, falling back to a `/rename` value or the session slug.
 
 ### Size Categories
 
@@ -84,24 +91,38 @@ Press `t` to see a GitHub-style contribution heatmap of your Claude Code activit
 
 ## Preview Pane
 
-Scrollable conversation showing `USER:` and `ASST:` messages. Tool use, system events, and sidechain entries are filtered out. Loaded in background with a 10-entry FIFO cache.
+Scrollable conversation showing `USER:` and `ASST:` messages. System events and sidechain entries are filtered out. Loaded in background with a 10-entry FIFO cache. The pane title shows a scroll position percentage, plus badges for the session's permission mode (`plan` / `accept` / `yolo`) and any skills it used.
 
-Press `/` while in the preview pane to search within the conversation. Matching messages are highlighted. Use `n`/`N` to jump between matches.
+- Press `T` to fold tool-use activity into the preview (`TOOL:` lines summarising each Edit/Bash/etc. call).
+- Press `f` to list the files the session changed.
+- Press `/` while in the preview pane to search within the conversation. Matching messages are highlighted; use `n`/`N` to jump between matches.
 
 ## Export
 
 Press `e` to export the selected session as a markdown file in the current directory. Includes metadata header (project, branch, duration, size) followed by the full conversation.
 
+## Config
+
+Optional config at `~/.config/sessy/config.toml`. All keys are optional:
+
+```toml
+scope = "current"          # "current" (launch dir) or "all" (every project)
+sort = "date"              # date | size | duration | messages
+show_tool_activity = false # start with tool-use lines shown in the preview
+```
+
+A missing or malformed file falls back to these defaults. The `--all` flag overrides `scope`.
+
 ## Performance
 
-- **Cold start** (first run, ~2,400 files): ~2 seconds
 - **Warm start** (cached index): < 100 ms
-- Incremental index updates — only re-scans changed files
+- **Cold start** (first run): a couple of seconds for a few thousand files
+- Incremental index updates — only changed files are re-scanned; unchanged sessions reuse their cached text
 - Parallel scanning with rayon
 
 ## How It Works
 
-Reads JSONL session files from `~/.claude/projects/`. Builds a cached index (`~/.cache/sessy/index.bin`) with head/tail reads — first ~10 lines for title/branch, last 8KB for the "left off" message. No full-file parsing until you preview.
+Reads JSONL session files from `~/.claude/projects/`. A single-pass scanner extracts per-session metadata — title, branch, slug, cwd, AI title, permission mode, skills, changed files, tickets, message count, the "left off" message, and the full human-message text used for search — into a cached index (`~/.cache/sessy/index.bin`), with the searchable text stored in an mmap'd companion (`~/.cache/sessy/text.bin`). Full conversations are only parsed when you open a preview.
 
 Bookmarks are persisted at `~/.cache/sessy/bookmarks.json`.
 

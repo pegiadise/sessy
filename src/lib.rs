@@ -1,5 +1,6 @@
 pub mod app;
 pub mod bookmarks;
+pub mod config;
 pub mod export;
 pub mod index;
 pub mod parser;

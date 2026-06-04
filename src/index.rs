@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-pub const INDEX_VERSION: u32 = 3;
+pub const INDEX_VERSION: u32 = 4;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionIndex {
@@ -66,8 +66,12 @@ pub fn scan_session_file(path: &Path) -> Option<(SessionMeta, Vec<u8>)> {
         (String::new(), 0, String::new())
     };
 
+    // Headline priority: an explicit /rename wins, then Claude's AI title,
+    // then the random word-slug, then nothing.
     let name = if !rename.is_empty() {
         rename
+    } else if !scan.ai_title.is_empty() {
+        scan.ai_title.clone()
     } else if !scan.head.slug.is_empty() {
         scan.head.slug.clone()
     } else {
@@ -84,6 +88,7 @@ pub fn scan_session_file(path: &Path) -> Option<(SessionMeta, Vec<u8>)> {
     let title_lc = scan.head.title.to_lowercase();
     let project_lc = project.to_lowercase();
     let branch_lc = branch.to_lowercase();
+    let changed_files_lc = scan.changed_files.join("\n").to_lowercase();
 
     let text_bytes = scan.human_text_lc.into_bytes();
 
@@ -100,7 +105,7 @@ pub fn scan_session_file(path: &Path) -> Option<(SessionMeta, Vec<u8>)> {
         file_mtime,
         file_path: path.to_path_buf(),
         cwd: scan.head.cwd,
-        message_count: None,
+        message_count: scan.message_count,
         tickets: scan.tickets,
         text_offset: 0, // filled in finalize step
         text_len: text_bytes.len() as u32,
@@ -108,6 +113,11 @@ pub fn scan_session_file(path: &Path) -> Option<(SessionMeta, Vec<u8>)> {
         title_lc,
         project_lc,
         branch_lc,
+        permission_mode: scan.permission_mode,
+        cc_version: scan.cc_version,
+        skills: scan.skills,
+        changed_files: scan.changed_files,
+        changed_files_lc,
     };
     Some((meta, text_bytes))
 }
@@ -297,6 +307,23 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_session_file_uses_ai_title() {
+        let (meta, _text) = scan_session_file(&fixture_path("modern_session.jsonl"))
+            .expect("should produce SessionMeta + text");
+        // No /rename and no slug → aiTitle becomes the headline name.
+        assert_eq!(meta.name, "Add JWT login endpoint");
+        assert_eq!(meta.message_count, 2);
+        assert_eq!(meta.permission_mode, "plan");
+        assert_eq!(meta.cc_version, "2.1.0");
+        assert!(
+            meta.changed_files_lc.contains("src/auth.rs"),
+            "changed_files_lc: {:?}",
+            meta.changed_files_lc
+        );
+        assert!(meta.skills.contains(&"brainstorming".to_string()));
+    }
+
+    #[test]
     fn test_index_serialization_roundtrip() {
         let sessions = vec![SessionMeta {
             id: "abc-123".to_string(),
@@ -311,7 +338,7 @@ mod tests {
             file_mtime: 1710300000,
             file_path: PathBuf::from("/tmp/test.jsonl"),
             cwd: "/Users/me/code/test".to_string(),
-            message_count: None,
+            message_count: 0,
             tickets: vec![],
             text_offset: 0,
             text_len: 0,
@@ -319,6 +346,11 @@ mod tests {
             title_lc: "hello world".to_string(),
             project_lc: "test".to_string(),
             branch_lc: "main".to_string(),
+            permission_mode: String::new(),
+            cc_version: String::new(),
+            skills: vec![],
+            changed_files: vec![],
+            changed_files_lc: String::new(),
         }];
         let index = SessionIndex {
             version: INDEX_VERSION,

@@ -1,3 +1,4 @@
+use crate::parser::Speaker;
 use crate::session::SessionMeta;
 use crate::text_cache::TextCache;
 use std::collections::{HashSet, VecDeque};
@@ -17,6 +18,7 @@ pub enum SortMode {
     Date,
     Size,
     Duration,
+    Messages,
 }
 
 impl SortMode {
@@ -25,6 +27,7 @@ impl SortMode {
             SortMode::Date => "date",
             SortMode::Size => "size",
             SortMode::Duration => "duration",
+            SortMode::Messages => "messages",
         }
     }
 }
@@ -33,6 +36,23 @@ impl SortMode {
 pub enum ViewMode {
     Normal,
     Timeline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Scope {
+    /// Only sessions whose path is under the launch directory's project.
+    Current,
+    /// Every project's sessions.
+    All,
+}
+
+impl Scope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Scope::Current => "cwd",
+            Scope::All => "all",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -47,7 +67,7 @@ pub enum AppAction {
 
 pub struct PreviewResult {
     pub session_id: String,
-    pub lines: Vec<(String, String, bool)>,
+    pub lines: Vec<(String, String, Speaker)>,
     pub message_count: u32,
 }
 
@@ -60,12 +80,12 @@ pub struct App {
     pub focus: Focus,
     pub action: AppAction,
     pub print_mode: bool,
-    pub preview_lines: Vec<(String, String, bool)>,
+    pub preview_lines: Vec<(String, String, Speaker)>,
     pub preview_loading: bool,
     pub preview_session_id: String,
     pub preview_tx: mpsc::Sender<PreviewResult>,
     pub preview_rx: mpsc::Receiver<PreviewResult>,
-    pub preview_cache: std::collections::HashMap<String, Vec<(String, String, bool)>>,
+    pub preview_cache: std::collections::HashMap<String, Vec<(String, String, Speaker)>>,
     pub preview_cache_order: VecDeque<String>,
     pub confirm_delete: bool,
     pub sort_mode: SortMode,
@@ -80,6 +100,20 @@ pub struct App {
     pub terminal_height: u16,
     pub preview_inner_width: u16,
     pub preview_line_offsets: Vec<u16>,
+    pub scope: Scope,
+    /// Encoded launch-directory prefix (e.g. `-Users-me-code-foo`) used by
+    /// `Scope::Current`. `None` disables scope filtering entirely.
+    pub cwd_encoded: Option<String>,
+    /// Total wrapped rows of the current preview (set by `recompute_preview_offsets`).
+    pub preview_total_rows: u16,
+    /// Height of the preview viewport (set by the renderer each frame).
+    pub preview_viewport_height: u16,
+    /// Whether the preview includes tool-use lines.
+    pub show_tools: bool,
+    /// Whether the preview pane shows the changed-files list instead of the conversation.
+    pub show_files: bool,
+    /// Whether the keybinding help overlay is open.
+    pub show_help: bool,
 }
 
 impl App {
@@ -120,7 +154,31 @@ impl App {
             terminal_height: 40,
             preview_inner_width: 0,
             preview_line_offsets: Vec::new(),
+            scope: Scope::Current,
+            cwd_encoded: None,
+            preview_total_rows: 0,
+            preview_viewport_height: 0,
+            show_tools: false,
+            show_files: false,
+            show_help: false,
         }
+    }
+
+    pub fn toggle_tools(&mut self) {
+        self.show_tools = !self.show_tools;
+        // Cached previews were built under the previous setting; drop them so
+        // the current (and future) sessions re-extract with/without tool lines.
+        self.preview_cache.clear();
+        self.preview_cache_order.clear();
+        self.preview_lines.clear();
+        self.preview_session_id.clear();
+        self.preview_loading = false;
+        self.preview_scroll = 0;
+    }
+
+    pub fn toggle_files(&mut self) {
+        self.show_files = !self.show_files;
+        self.preview_scroll = 0;
     }
 
     pub fn selected_session(&self) -> Option<&SessionMeta> {
@@ -153,6 +211,18 @@ impl App {
         self.preview_scroll = 0;
     }
 
+    pub fn move_to_top(&mut self) {
+        self.selected = 0;
+        self.preview_scroll = 0;
+    }
+
+    pub fn move_to_bottom(&mut self) {
+        if !self.filtered_indices.is_empty() {
+            self.selected = self.filtered_indices.len() - 1;
+        }
+        self.preview_scroll = 0;
+    }
+
     pub fn page_up(&mut self, page_size: usize) {
         if self.filtered_indices.is_empty() {
             return;
@@ -174,7 +244,10 @@ impl App {
     }
 
     pub fn scroll_preview_down(&mut self) {
-        self.preview_scroll = self.preview_scroll.saturating_add(3);
+        self.preview_scroll = self
+            .preview_scroll
+            .saturating_add(3)
+            .min(self.max_preview_scroll());
     }
 
     pub fn scroll_preview_page_up(&mut self, page_size: u16) {
@@ -182,16 +255,55 @@ impl App {
     }
 
     pub fn scroll_preview_page_down(&mut self, page_size: u16) {
-        self.preview_scroll = self.preview_scroll.saturating_add(page_size);
+        self.preview_scroll = self
+            .preview_scroll
+            .saturating_add(page_size)
+            .min(self.max_preview_scroll());
     }
 
-    /// Rebuild filtered_indices from scratch: search → size filter → sort.
+    /// Largest scroll offset that still keeps content on screen. Zero when the
+    /// content is shorter than the viewport. In the files view the content is
+    /// the changed-files list, not the conversation rows.
+    pub fn max_preview_scroll(&self) -> u16 {
+        let total = if self.show_files {
+            self.selected_session()
+                .map(|s| s.changed_files.len() as u16)
+                .unwrap_or(0)
+        } else {
+            self.preview_total_rows
+        };
+        total.saturating_sub(self.preview_viewport_height)
+    }
+
+    /// Rebuild filtered_indices from scratch: search → scope → size filter → sort.
     pub fn rebuild_view(&mut self) {
         self.apply_search_inner();
+        self.apply_scope_filter();
         self.apply_size_filter();
         self.apply_sort();
         self.selected = 0;
         self.preview_scroll = 0;
+    }
+
+    /// Retain only sessions under the launch directory when scope is `Current`.
+    fn apply_scope_filter(&mut self) {
+        if self.scope == Scope::All {
+            return;
+        }
+        if let Some(enc) = &self.cwd_encoded {
+            let needle = format!("/{}/", enc);
+            let sessions = &self.sessions;
+            self.filtered_indices
+                .retain(|&i| sessions[i].file_path.to_string_lossy().contains(&needle));
+        }
+    }
+
+    pub fn toggle_scope(&mut self) {
+        self.scope = match self.scope {
+            Scope::Current => Scope::All,
+            Scope::All => Scope::Current,
+        };
+        self.rebuild_view();
     }
 
     fn apply_search_inner(&mut self) {
@@ -266,6 +378,9 @@ impl App {
                     } else if finder.find(s.branch_lc.as_bytes()).is_some() {
                         score += 300;
                         true
+                    } else if finder.find(s.changed_files_lc.as_bytes()).is_some() {
+                        score += 200;
+                        true
                     } else {
                         let slice = text_cache.slice(s.text_offset, s.text_len);
                         if finder.find(slice).is_some() {
@@ -330,6 +445,7 @@ impl App {
                     SortMode::Date => sessions[b].timestamp.cmp(&sessions[a].timestamp),
                     SortMode::Size => sessions[b].file_size.cmp(&sessions[a].file_size),
                     SortMode::Duration => sessions[b].duration_secs.cmp(&sessions[a].duration_secs),
+                    SortMode::Messages => sessions[b].message_count.cmp(&sessions[a].message_count),
                 })
         });
     }
@@ -343,7 +459,8 @@ impl App {
         self.sort_mode = match self.sort_mode {
             SortMode::Date => SortMode::Size,
             SortMode::Size => SortMode::Duration,
-            SortMode::Duration => SortMode::Date,
+            SortMode::Duration => SortMode::Messages,
+            SortMode::Messages => SortMode::Date,
         };
         self.apply_sort();
         self.selected = 0;
@@ -401,6 +518,8 @@ impl App {
     // Preview search
 
     pub fn start_preview_search(&mut self) {
+        // Search always operates on the conversation, so leave the files view.
+        self.show_files = false;
         self.focus = Focus::PreviewSearch;
         self.preview_search_query.clear();
         self.preview_search_matches.clear();
@@ -419,7 +538,7 @@ impl App {
             .preview_lines
             .iter()
             .enumerate()
-            .filter_map(|(i, (_orig, lower, _is_user))| {
+            .filter_map(|(i, (_orig, lower, _speaker))| {
                 if finder.find(lower.as_bytes()).is_some() {
                     Some(i)
                 } else {
@@ -457,13 +576,14 @@ impl App {
         self.preview_line_offsets.clear();
         self.preview_line_offsets.reserve(self.preview_lines.len());
         let mut cursor: u16 = 0;
-        for (text, _lower, is_user) in self.preview_lines.iter() {
+        for (text, _lower, speaker) in self.preview_lines.iter() {
             self.preview_line_offsets.push(cursor);
-            let prefix = if *is_user { "USER: " } else { "ASST: " };
+            let prefix = speaker.prefix();
             let full = format!("{}{}", prefix, text);
             let lines = crate::ui::wrap_text(&full, width).len().max(1) as u16;
             cursor = cursor.saturating_add(lines).saturating_add(1); // +1 blank separator
         }
+        self.preview_total_rows = cursor;
     }
 
     fn scroll_to_current_match(&mut self) {
@@ -481,7 +601,7 @@ impl App {
     }
 
     fn intra_match_chunk_offset(&self, line_idx: usize) -> u16 {
-        let (_text, lower, is_user) = match self.preview_lines.get(line_idx) {
+        let (_text, lower, speaker) = match self.preview_lines.get(line_idx) {
             Some(t) => t,
             None => return 0,
         };
@@ -493,9 +613,9 @@ impl App {
         if width == 0 {
             return 0;
         }
-        // Wrap the pre-lowercased message (with the same "USER: "/"ASST: " prefix
-        // length as the render pass) so memmem scans bytes directly.
-        let prefix = if *is_user { "user: " } else { "asst: " };
+        // Wrap the pre-lowercased message (with the same prefix length as the
+        // render pass) so memmem scans bytes directly.
+        let prefix = speaker.prefix_lc();
         let full_lc = format!("{}{}", prefix, lower);
         let finder = memchr::memmem::Finder::new(query_lc.as_bytes());
         let chunks = crate::ui::wrap_text(&full_lc, width);
@@ -532,7 +652,7 @@ impl App {
 
     // Cache management (FIFO eviction)
 
-    pub fn cache_preview(&mut self, session_id: String, lines: Vec<(String, String, bool)>) {
+    pub fn cache_preview(&mut self, session_id: String, lines: Vec<(String, String, Speaker)>) {
         if self.preview_cache.contains_key(&session_id) {
             *self.preview_cache.get_mut(&session_id).unwrap() = lines;
             return;
@@ -653,7 +773,7 @@ mod search_tests {
             file_mtime: 0,
             file_path: PathBuf::from(format!("/tmp/{}.jsonl", id)),
             cwd: String::new(),
-            message_count: None,
+            message_count: 0,
             tickets: tickets.into_iter().map(String::from).collect(),
             text_offset: 0,
             text_len: 0,
@@ -661,6 +781,11 @@ mod search_tests {
             title_lc: title.to_lowercase(),
             project_lc: project.to_lowercase(),
             branch_lc: branch.to_lowercase(),
+            permission_mode: String::new(),
+            cc_version: String::new(),
+            skills: vec![],
+            changed_files: vec![],
+            changed_files_lc: String::new(),
         }
     }
 
@@ -747,6 +872,102 @@ mod search_tests {
         app.search_query = "kerveros".into();
         app.apply_search();
         assert_eq!(app.sessions[app.filtered_indices[0]].id, "b");
+    }
+
+    #[test]
+    fn test_max_preview_scroll_uses_file_count_in_files_view() {
+        let mut s = make_session("a", "x", "", "p", "main", vec![]);
+        s.changed_files = vec![
+            "f1".into(),
+            "f2".into(),
+            "f3".into(),
+            "f4".into(),
+            "f5".into(),
+        ];
+        let mut app = App::new(vec![s], false, HashSet::new(), empty_cache());
+        app.show_files = true;
+        app.preview_viewport_height = 2;
+        // 5 files, 2 visible → 3 max scroll (independent of conversation rows)
+        assert_eq!(app.max_preview_scroll(), 3);
+    }
+
+    #[test]
+    fn test_start_preview_search_exits_files_view() {
+        let mut app = App::new(
+            vec![make_session("a", "x", "", "p", "main", vec![])],
+            false,
+            HashSet::new(),
+            empty_cache(),
+        );
+        app.show_files = true;
+        app.start_preview_search();
+        assert!(!app.show_files, "starting a search must leave the files view");
+    }
+
+    #[test]
+    fn test_preview_scroll_clamped_to_content() {
+        let sessions = vec![make_session("a", "x", "", "p", "main", vec![])];
+        let mut app = App::new(sessions, false, HashSet::new(), empty_cache());
+        // Content (10 rows) is shorter than the viewport (20) → no scrolling.
+        app.preview_total_rows = 10;
+        app.preview_viewport_height = 20;
+        for _ in 0..50 {
+            app.scroll_preview_down();
+        }
+        assert_eq!(app.preview_scroll, 0);
+    }
+
+    #[test]
+    fn test_move_to_top_and_bottom() {
+        let sessions = vec![
+            make_session("a", "", "", "p", "main", vec![]),
+            make_session("b", "", "", "p", "main", vec![]),
+            make_session("c", "", "", "p", "main", vec![]),
+        ];
+        let mut app = App::new(sessions, false, HashSet::new(), empty_cache());
+        app.move_to_bottom();
+        assert_eq!(app.selected, 2);
+        app.move_to_top();
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn test_scope_filter_current_limits_to_cwd() {
+        let mut a = make_session("a", "x", "", "p", "main", vec![]);
+        a.file_path = PathBuf::from("/Users/me/.claude/projects/-Users-me-code-foo/a.jsonl");
+        let mut b = make_session("b", "y", "", "p", "main", vec![]);
+        b.file_path = PathBuf::from("/Users/me/.claude/projects/-Users-me-code-bar/b.jsonl");
+        let mut app = App::new(vec![a, b], false, HashSet::new(), empty_cache());
+        app.cwd_encoded = Some("-Users-me-code-foo".to_string());
+        app.scope = Scope::Current;
+        app.rebuild_view();
+        assert_eq!(app.filtered_indices.len(), 1);
+        assert_eq!(app.sessions[app.filtered_indices[0]].id, "a");
+        // toggling to All shows both
+        app.toggle_scope();
+        assert_eq!(app.filtered_indices.len(), 2);
+    }
+
+    #[test]
+    fn test_sort_by_messages_orders_desc() {
+        let mut a = make_session("a", "x", "", "p", "main", vec![]);
+        a.message_count = 3;
+        let mut b = make_session("b", "y", "", "p", "main", vec![]);
+        b.message_count = 9;
+        let mut app = App::new(vec![a, b], false, HashSet::new(), empty_cache());
+        app.sort_mode = SortMode::Messages;
+        app.apply_sort();
+        assert_eq!(app.sessions[app.filtered_indices[0]].id, "b");
+    }
+
+    #[test]
+    fn test_search_matches_changed_file() {
+        let mut s = make_session("a", "", "", "p", "main", vec![]);
+        s.changed_files_lc = "src/auth.rs".into();
+        let mut app = App::new(vec![s], false, HashSet::new(), empty_cache());
+        app.search_query = "auth.rs".into();
+        app.apply_search();
+        assert_eq!(app.filtered_indices.len(), 1);
     }
 
     #[test]

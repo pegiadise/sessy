@@ -1,5 +1,5 @@
 use crate::app::App;
-use crate::parser::{extract_conversation, Role};
+use crate::parser::{extract_conversation_ext, Speaker};
 use std::thread;
 
 /// Request a preview for the currently selected session.
@@ -19,6 +19,7 @@ pub fn request_preview(app: &mut App) {
 
     let session_id = session.id.clone();
     let file_path = session.file_path.clone();
+    let include_tools = app.show_tools;
 
     // Check FIFO cache
     if let Some(cached) = app.preview_cache.get(&session_id) {
@@ -36,15 +37,18 @@ pub fn request_preview(app: &mut App) {
     let tx = app.preview_tx.clone();
 
     thread::spawn(move || {
-        let messages = extract_conversation(&file_path);
-        let lines: Vec<(String, String, bool)> = messages
+        let messages = extract_conversation_ext(&file_path, include_tools);
+        let lines: Vec<(String, String, Speaker)> = messages
             .into_iter()
-            .map(|m| {
-                let lower = m.text.to_lowercase();
-                (m.text, lower, m.role == Role::User)
+            .map(|(speaker, text)| {
+                let lower = text.to_lowercase();
+                (text, lower, speaker)
             })
             .collect();
-        let message_count = lines.iter().filter(|(_, _, is_user)| *is_user).count() as u32;
+        let message_count = lines
+            .iter()
+            .filter(|(_, _, sp)| *sp == Speaker::User)
+            .count() as u32;
 
         let _ = tx.send(crate::app::PreviewResult {
             session_id,
@@ -71,7 +75,7 @@ pub fn check_preview_updates(app: &mut App) {
             .iter_mut()
             .find(|s| s.id == result.session_id)
         {
-            session.message_count = Some(result.message_count);
+            session.message_count = result.message_count;
         }
     }
 }

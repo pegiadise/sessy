@@ -15,7 +15,7 @@ pub struct SessionMeta {
     pub file_mtime: i64,
     pub file_path: PathBuf,
     pub cwd: String,
-    pub message_count: Option<u32>,
+    pub message_count: u32,
     pub tickets: Vec<String>,
     pub text_offset: u64,
     pub text_len: u32,
@@ -23,6 +23,16 @@ pub struct SessionMeta {
     pub title_lc: String,
     pub project_lc: String,
     pub branch_lc: String,
+    /// Last permission mode seen ("plan", "acceptEdits", "bypassPermissions", "default", or "").
+    pub permission_mode: String,
+    /// Claude Code version that produced the session.
+    pub cc_version: String,
+    /// Skills attributed during the session, sorted + deduped.
+    pub skills: Vec<String>,
+    /// Files Claude edited (union of tracked backups), sorted.
+    pub changed_files: Vec<String>,
+    /// `changed_files` newline-joined + lowercased, for substring search.
+    pub changed_files_lc: String,
 }
 
 /// Extract a human-readable project name from a `cwd` path.
@@ -143,7 +153,7 @@ mod tests {
             file_mtime: 0,
             file_path: std::path::PathBuf::from("/tmp/x"),
             cwd: String::new(),
-            message_count: None,
+            message_count: 0,
             tickets: vec!["PROJ-1".into()],
             text_offset: 100,
             text_len: 50,
@@ -151,6 +161,11 @@ mod tests {
             title_lc: "title".into(),
             project_lc: "p".into(),
             branch_lc: "main".into(),
+            permission_mode: String::new(),
+            cc_version: String::new(),
+            skills: vec![],
+            changed_files: vec![],
+            changed_files_lc: String::new(),
         };
         assert_eq!(m.tickets[0], "PROJ-1");
         assert_eq!(m.text_offset, 100);

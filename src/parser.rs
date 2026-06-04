@@ -26,6 +26,35 @@ pub enum Role {
     Assistant,
 }
 
+/// Who produced a preview line. `Tool` lines are only emitted when tool
+/// activity is requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Speaker {
+    User,
+    Assistant,
+    Tool,
+}
+
+impl Speaker {
+    /// Render prefix shown before the message text.
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Speaker::User => "USER: ",
+            Speaker::Assistant => "ASST: ",
+            Speaker::Tool => "TOOL: ",
+        }
+    }
+
+    /// Lowercased prefix, used when wrapping pre-lowercased text for search.
+    pub fn prefix_lc(self) -> &'static str {
+        match self {
+            Speaker::User => "user: ",
+            Speaker::Assistant => "asst: ",
+            Speaker::Tool => "tool: ",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ConversationMessage {
     pub role: Role,
@@ -83,6 +112,18 @@ pub struct ScanResult {
     pub tail: Option<TailMeta>,
     pub human_text_lc: String,
     pub tickets: Vec<String>,
+    /// Claude-generated session title (`type: "ai-title"`), if present.
+    pub ai_title: String,
+    /// Last `permissionMode` seen (e.g. "plan", "acceptEdits", "bypassPermissions").
+    pub permission_mode: String,
+    /// Claude Code `version` field (first non-empty seen).
+    pub cc_version: String,
+    /// Distinct `attributionSkill` values, sorted.
+    pub skills: Vec<String>,
+    /// Sorted union of `trackedFileBackups` paths across file-history snapshots.
+    pub changed_files: Vec<String>,
+    /// Count of non-empty human messages.
+    pub message_count: u32,
 }
 
 pub fn scan_session(path: &Path) -> Option<ScanResult> {
@@ -102,6 +143,12 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
     let mut rename = String::new();
     let mut human_text_lc = String::new();
     let mut tickets_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut ai_title = String::new();
+    let mut permission_mode = String::new();
+    let mut cc_version = String::new();
+    let mut skills_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut changed_files_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut message_count: u32 = 0;
 
     for line in reader.lines() {
         let line = match line {
@@ -118,6 +165,42 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
             Ok(v) => v,
             Err(_) => continue,
         };
+
+        // Modern-format metadata, harvested in the same single pass.
+        match entry.get("type").and_then(|t| t.as_str()) {
+            Some("ai-title") => {
+                if let Some(t) = entry.get("aiTitle").and_then(|t| t.as_str()) {
+                    ai_title = t.to_string();
+                }
+            }
+            Some("permission-mode") => {
+                if let Some(m) = entry.get("permissionMode").and_then(|m| m.as_str()) {
+                    permission_mode = m.to_string();
+                }
+            }
+            Some("file-history-snapshot") => {
+                if let Some(backups) = entry
+                    .get("snapshot")
+                    .and_then(|s| s.get("trackedFileBackups"))
+                    .and_then(|b| b.as_object())
+                {
+                    for path in backups.keys() {
+                        changed_files_set.insert(path.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+        if cc_version.is_empty() {
+            if let Some(v) = entry.get("version").and_then(|v| v.as_str()) {
+                cc_version = v.to_string();
+            }
+        }
+        if let Some(skill) = entry.get("attributionSkill").and_then(|s| s.as_str()) {
+            if !skill.is_empty() {
+                skills_set.insert(skill.to_string());
+            }
+        }
 
         if working_head.branch.is_empty() {
             if let Some(b) = entry.get("gitBranch").and_then(|b| b.as_str()) {
@@ -152,6 +235,11 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
             {
                 let trimmed = full.trim();
                 if !trimmed.is_empty() {
+                    // Count only non-sidechain turns, to match the conversation
+                    // preview (which skips sidechains) and the `· N msgs` label.
+                    if entry.get("isSidechain").and_then(|s| s.as_bool()) != Some(true) {
+                        message_count += 1;
+                    }
                     if head.is_none() {
                         let title = human_message_text(&entry).unwrap_or_default();
                         head = Some(HeadMeta {
@@ -197,16 +285,43 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
 
     let mut tickets: Vec<String> = tickets_set.into_iter().collect();
     tickets.sort();
+    let mut skills: Vec<String> = skills_set.into_iter().collect();
+    skills.sort();
+    let mut changed_files: Vec<String> = changed_files_set.into_iter().collect();
+    changed_files.sort();
 
     Some(ScanResult {
         head,
         tail,
         human_text_lc,
         tickets,
+        ai_title,
+        permission_mode,
+        cc_version,
+        skills,
+        changed_files,
+        message_count,
     })
 }
 
+/// User + assistant text messages, with tool use filtered out. Used by export.
 pub fn extract_conversation(path: &Path) -> Vec<ConversationMessage> {
+    extract_conversation_ext(path, false)
+        .into_iter()
+        .map(|(speaker, text)| ConversationMessage {
+            role: match speaker {
+                Speaker::User => Role::User,
+                _ => Role::Assistant,
+            },
+            text,
+        })
+        .collect()
+}
+
+/// Extract the conversation as `(speaker, text)` pairs. When `include_tools` is
+/// true, assistant `tool_use` blocks are surfaced as `Speaker::Tool` lines with
+/// a compact summary (e.g. "Edit src/auth.rs", "Bash cargo test").
+pub fn extract_conversation_ext(path: &Path, include_tools: bool) -> Vec<(Speaker, String)> {
     let file = match File::open(path) {
         Ok(f) => f,
         Err(_) => return vec![],
@@ -227,18 +342,11 @@ pub fn extract_conversation(path: &Path) -> Vec<ConversationMessage> {
             Err(_) => continue,
         };
 
-        if entry
-            .get("isSidechain")
-            .and_then(|s| s.as_bool())
-            == Some(true)
-        {
+        if entry.get("isSidechain").and_then(|s| s.as_bool()) == Some(true) {
             continue;
         }
 
-        let entry_type = entry
-            .get("type")
-            .and_then(|t| t.as_str())
-            .unwrap_or("");
+        let entry_type = entry.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
         match entry_type {
             "user" if is_human_message(&entry) => {
@@ -249,10 +357,7 @@ pub fn extract_conversation(path: &Path) -> Vec<ConversationMessage> {
                 {
                     let trimmed = text.trim();
                     if !trimmed.is_empty() {
-                        messages.push(ConversationMessage {
-                            role: Role::User,
-                            text: trimmed.to_string(),
-                        });
+                        messages.push((Speaker::User, trimmed.to_string()));
                     }
                 }
             }
@@ -263,16 +368,20 @@ pub fn extract_conversation(path: &Path) -> Vec<ConversationMessage> {
                     .and_then(|c| c.as_array())
                 {
                     for block in content {
-                        if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                let trimmed = text.trim();
-                                if !trimmed.is_empty() {
-                                    messages.push(ConversationMessage {
-                                        role: Role::Assistant,
-                                        text: trimmed.to_string(),
-                                    });
+                        match block.get("type").and_then(|t| t.as_str()) {
+                            Some("text") => {
+                                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                    let trimmed = text.trim();
+                                    if !trimmed.is_empty() {
+                                        messages.push((Speaker::Assistant, trimmed.to_string()));
+                                    }
                                 }
                             }
+                            Some("tool_use") if include_tools => {
+                                let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                                messages.push((Speaker::Tool, summarize_tool_use(name, block.get("input"))));
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -281,6 +390,26 @@ pub fn extract_conversation(path: &Path) -> Vec<ConversationMessage> {
         }
     }
     messages
+}
+
+/// Build a one-line summary of a tool call: the tool name plus its most telling
+/// argument (file path, command, pattern, …), truncated.
+fn summarize_tool_use(name: &str, input: Option<&Value>) -> String {
+    let detail = input
+        .and_then(|inp| {
+            ["file_path", "path", "command", "pattern", "query", "url", "description"]
+                .iter()
+                .find_map(|k| inp.get(*k).and_then(|v| v.as_str()))
+        })
+        .unwrap_or("")
+        .trim()
+        .replace('\n', " ");
+    if detail.is_empty() {
+        name.to_string()
+    } else {
+        let detail: String = detail.chars().take(120).collect();
+        format!("{} {}", name, detail)
+    }
 }
 
 #[cfg(test)]
@@ -306,6 +435,20 @@ mod tests {
         assert_eq!(messages[2].text, "looks good, ship it");
         assert_eq!(messages[3].role, Role::Assistant);
         assert_eq!(messages[3].text, "Done! Everything is deployed.");
+    }
+
+    #[test]
+    fn test_extract_with_tools_includes_tool_lines() {
+        let with = extract_conversation_ext(&fixture_path("complex_session.jsonl"), true);
+        let without = extract_conversation_ext(&fixture_path("complex_session.jsonl"), false);
+        assert!(
+            with.iter().any(|(sp, _)| *sp == Speaker::Tool),
+            "include_tools=true should surface a Tool line"
+        );
+        assert!(
+            !without.iter().any(|(sp, _)| *sp == Speaker::Tool),
+            "include_tools=false must not surface Tool lines"
+        );
     }
 
     #[test]
@@ -403,5 +546,30 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted, result.tickets);
+    }
+
+    #[test]
+    fn test_scan_modern_extracts_metadata() {
+        let result = scan_session(&fixture_path("modern_session.jsonl")).expect("should scan");
+        assert_eq!(result.ai_title, "Add JWT login endpoint");
+        assert_eq!(result.permission_mode, "plan");
+        assert_eq!(result.cc_version, "2.1.0");
+        assert!(
+            result.skills.contains(&"brainstorming".to_string()),
+            "skills: {:?}",
+            result.skills
+        );
+        assert!(
+            result.skills.contains(&"test-driven-development".to_string()),
+            "skills: {:?}",
+            result.skills
+        );
+        // sorted union of trackedFileBackups keys
+        assert_eq!(
+            result.changed_files,
+            vec!["src/auth.rs".to_string(), "src/lib.rs".to_string()]
+        );
+        // two human messages: "add login endpoint" and "ship it"
+        assert_eq!(result.message_count, 2);
     }
 }

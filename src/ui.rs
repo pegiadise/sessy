@@ -1,9 +1,10 @@
-use crate::app::{App, Focus, ViewMode};
+use crate::app::{App, Focus, Scope, ViewMode};
+use crate::parser::Speaker;
 use crate::session::{format_duration, format_file_size, size_category};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -15,13 +16,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(5),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .split(area);
 
     draw_search_bar(frame, app, main_chunks[0]);
     draw_content(frame, app, main_chunks[1]);
     draw_status_bar(frame, app, main_chunks[2]);
+
+    if app.show_help {
+        draw_help(frame, area);
+    }
 }
 
 fn draw_search_bar(frame: &mut Frame, app: &App, area: Rect) {
@@ -86,16 +91,19 @@ fn draw_session_list(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
 
+    let scope_tag = app.scope.label();
     let mut title = format!(
-        " Sessions ({}/{}) ",
+        " Sessions ({}/{}) [{}] ",
         app.filtered_indices.len(),
-        app.sessions.len()
+        app.sessions.len(),
+        scope_tag
     );
     if let Some(filter) = app.size_filter {
         title = format!(
-            " Sessions ({}/{}) [{}] ",
+            " Sessions ({}/{}) [{}|{}] ",
             app.filtered_indices.len(),
             app.sessions.len(),
+            scope_tag,
             filter
         );
     }
@@ -109,8 +117,12 @@ fn draw_session_list(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(block, area);
 
     if app.filtered_indices.is_empty() {
-        let empty = Paragraph::new("No sessions found.")
-            .style(Style::default().fg(Color::DarkGray));
+        let msg = if app.scope == Scope::Current && app.cwd_encoded.is_some() {
+            "No sessions in this directory.\n\nPress  a  to show all projects, or  /  to search."
+        } else {
+            "No sessions found."
+        };
+        let empty = Paragraph::new(msg).style(Style::default().fg(Color::DarkGray));
         frame.render_widget(empty, inner);
         return;
     }
@@ -203,8 +215,16 @@ fn draw_session_list(frame: &mut Frame, app: &App, area: Rect) {
         let dur_str = format!("  {}  ", format_duration(session.duration_secs));
         let size_str = format!("{} ", format_file_size(session.file_size));
         let cat_str = format!("[{}]", category);
-        let prefix_len =
-            dur_str.chars().count() + size_str.chars().count() + cat_str.chars().count() + 2;
+        let msgs_str = if session.message_count > 0 {
+            format!(" · {} msgs", session.message_count)
+        } else {
+            String::new()
+        };
+        let prefix_len = dur_str.chars().count()
+            + size_str.chars().count()
+            + cat_str.chars().count()
+            + msgs_str.chars().count()
+            + 2;
         let title_budget = max_width.saturating_sub(prefix_len);
         let title_str = if title_budget > 3 {
             format!(
@@ -223,6 +243,7 @@ fn draw_session_list(frame: &mut Frame, app: &App, area: Rect) {
                     .fg(category_color)
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::styled(msgs_str, dim),
             Span::styled(title_str, dim),
         ]));
 
@@ -267,9 +288,19 @@ fn draw_timeline(frame: &mut Frame, app: &App, area: Rect) {
     let this_monday = today - chrono::Duration::days(days_since_monday as i64);
     let start_date = this_monday - chrono::Duration::weeks(num_weeks as i64 - 1);
 
-    // Count sessions per date
+    // Count sessions per date, honoring the current scope so the heatmap
+    // matches the list (cwd-only unless scope is All).
+    let scope_needle = match (app.scope, &app.cwd_encoded) {
+        (Scope::Current, Some(enc)) => Some(format!("/{}/", enc)),
+        _ => None,
+    };
     let mut counts: std::collections::HashMap<NaiveDate, u32> = std::collections::HashMap::new();
     for s in &app.sessions {
+        if let Some(needle) = &scope_needle {
+            if !s.file_path.to_string_lossy().contains(needle.as_str()) {
+                continue;
+            }
+        }
         if let chrono::LocalResult::Single(dt) = Local.timestamp_opt(s.timestamp, 0) {
             let date = dt.date_naive();
             if date >= start_date && date <= today {
@@ -408,6 +439,22 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
 
+    // Track viewport height (inner minus the optional search row) so the app
+    // can clamp over-scroll and report a position percentage.
+    let inner_height = area.height.saturating_sub(2);
+    let viewport = if app.focus == Focus::PreviewSearch {
+        inner_height.saturating_sub(1)
+    } else {
+        inner_height
+    };
+    app.preview_viewport_height = viewport;
+    let max_scroll = app.max_preview_scroll();
+    let scroll_pct = if app.preview_total_rows > viewport && max_scroll > 0 {
+        Some((app.preview_scroll.min(max_scroll) as f32 / max_scroll as f32 * 100.0).round() as u16)
+    } else {
+        None
+    };
+
     let session_label = app
         .selected_session()
         .and_then(|s| {
@@ -418,7 +465,14 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
             }
         })
         .unwrap_or("");
-    let title = if app.preview_loading {
+    let meta_badges = app.selected_session().map(session_badges).unwrap_or_default();
+    let title = if app.show_files {
+        let n = app
+            .selected_session()
+            .map(|s| s.changed_files.len())
+            .unwrap_or(0);
+        format!(" Files changed — {} ({}) ", session_label, n)
+    } else if app.preview_loading {
         format!(" Preview — {} (loading...) ", session_label)
     } else if !app.preview_search_matches.is_empty() {
         format!(
@@ -427,8 +481,10 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
             app.preview_search_current + 1,
             app.preview_search_matches.len()
         )
+    } else if let Some(pct) = scroll_pct {
+        format!(" Preview — {}{} ({}%) ", session_label, meta_badges, pct)
     } else if !session_label.is_empty() {
-        format!(" Preview — {} ", session_label)
+        format!(" Preview — {}{} ", session_label, meta_badges)
     } else {
         " Preview ".to_string()
     };
@@ -457,7 +513,27 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         (inner, None)
     };
 
-    if app.preview_lines.is_empty() {
+    if app.show_files {
+        let dim = Style::default().fg(Color::DarkGray);
+        let lines: Vec<Line> = match app.selected_session() {
+            None => vec![Line::from(Span::styled("No session selected.", dim))],
+            Some(s) if s.changed_files.is_empty() => {
+                vec![Line::from(Span::styled("No tracked file changes.", dim))]
+            }
+            Some(s) => s
+                .changed_files
+                .iter()
+                .skip(app.preview_scroll as usize)
+                .map(|f| {
+                    Line::from(Span::styled(
+                        format!("  {}", f),
+                        Style::default().fg(Color::White),
+                    ))
+                })
+                .collect(),
+        };
+        frame.render_widget(Paragraph::new(lines), preview_area);
+    } else if app.preview_lines.is_empty() {
         let msg = if app.filtered_indices.is_empty() {
             "No session selected."
         } else if app.preview_loading {
@@ -478,19 +554,22 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
             app.preview_search_matches.iter().copied().collect();
 
         let mut lines: Vec<Line> = Vec::new();
-        for (msg_idx, (text, _text_lc, is_user)) in app.preview_lines.iter().enumerate() {
+        for (msg_idx, (text, _text_lc, speaker)) in app.preview_lines.iter().enumerate() {
             let is_match = has_search && match_set.contains(&msg_idx);
             let is_current = current_match_idx == Some(msg_idx);
 
-            let (prefix, base_style) = if *is_user {
-                (
+            let (prefix, base_style) = match speaker {
+                Speaker::User => (
                     "USER: ",
                     Style::default()
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                ("ASST: ", Style::default().fg(Color::White))
+                ),
+                Speaker::Assistant => ("ASST: ", Style::default().fg(Color::White)),
+                Speaker::Tool => (
+                    "TOOL: ",
+                    Style::default().fg(Color::Rgb(110, 160, 190)),
+                ),
             };
 
             // Match indicator: ▸ for current match, │ for other matches
@@ -620,6 +699,8 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("search  ", desc),
         Span::styled("s ", key),
         Span::styled(sort_label, desc),
+        Span::styled("a ", key),
+        Span::styled(format!("{}  ", app.scope.label()), desc),
     ];
 
     if !filter_label.is_empty() {
@@ -637,6 +718,10 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("export  ", desc),
         Span::styled("t ", key),
         Span::styled("timeline  ", desc),
+        Span::styled("f ", key),
+        Span::styled("files  ", desc),
+        Span::styled("T ", key),
+        Span::styled("tools  ", desc),
         Span::styled("Enter ", key),
         Span::styled("yolo  ", desc),
         Span::styled("l ", key),
@@ -645,13 +730,101 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("copy  ", desc),
         Span::styled("d ", key),
         Span::styled("delete  ", desc),
+        Span::styled("? ", key),
+        Span::styled("help  ", desc),
         Span::styled("q ", key),
         Span::styled("quit ", desc),
     ]);
 
     let line = Line::from(spans);
-    let paragraph = Paragraph::new(line).style(Style::default().bg(Color::Rgb(40, 40, 40)));
+    let paragraph = Paragraph::new(line)
+        .wrap(Wrap { trim: false })
+        .style(Style::default().bg(Color::Rgb(40, 40, 40)));
     frame.render_widget(paragraph, area);
+}
+
+/// Compact metadata suffix for the preview title: permission mode + skills.
+/// Returns "" when there's nothing to show, otherwise a " · plan · tdd" string.
+fn session_badges(s: &crate::session::SessionMeta) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mode = match s.permission_mode.as_str() {
+        "bypassPermissions" => "yolo",
+        "acceptEdits" => "accept",
+        "plan" => "plan",
+        _ => "",
+    };
+    if !mode.is_empty() {
+        parts.push(mode.to_string());
+    }
+    if !s.skills.is_empty() {
+        let shown: Vec<&str> = s.skills.iter().take(3).map(|x| x.as_str()).collect();
+        let mut sk = shown.join(",");
+        let extra = s.skills.len().saturating_sub(3);
+        if extra > 0 {
+            sk.push_str(&format!("+{}", extra));
+        }
+        parts.push(sk);
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", parts.join(" · "))
+    }
+}
+
+/// Centered overlay listing every keybinding. Drawn on top of everything when open.
+fn draw_help(frame: &mut Frame, area: Rect) {
+    let rows: &[(&str, &str)] = &[
+        ("j / k  ↑ / ↓", "move selection (wraps)"),
+        ("g / G  Home / End", "jump to top / bottom"),
+        ("PgUp / PgDn", "page up / down"),
+        ("/", "search (project, title, branch, file, text)"),
+        ("s", "cycle sort: date → size → duration → messages"),
+        ("1-4 / 0", "filter by size / clear filter"),
+        ("a", "toggle scope: current dir ↔ all projects"),
+        ("b", "bookmark / pin to top"),
+        ("e", "export session as markdown"),
+        ("t", "timeline heatmap"),
+        ("Tab", "focus preview pane"),
+        ("f", "show files changed in this session"),
+        ("T", "toggle tool activity in preview"),
+        ("Enter", "resume (yolo: --dangerously-skip-permissions)"),
+        ("l", "resume (safe mode)"),
+        ("c", "copy `claude --resume <id>`"),
+        ("p", "print session id and exit"),
+        ("d", "delete session (confirm)"),
+        ("? / Esc", "close help / quit"),
+    ];
+
+    let w = 56u16.min(area.width.saturating_sub(2));
+    let h = (rows.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Keybindings ")
+        .style(Style::default().bg(Color::Rgb(20, 20, 20)));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let key_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(Color::Rgb(200, 200, 200));
+    let lines: Vec<Line> = rows
+        .iter()
+        .map(|(k, d)| {
+            Line::from(vec![
+                Span::styled(format!(" {:<18}", k), key_style),
+                Span::styled((*d).to_string(), desc_style),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn chrono_format(timestamp: i64) -> String {

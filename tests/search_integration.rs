@@ -22,7 +22,7 @@ fn make_session(id: &str, name: &str, project: &str, tickets: Vec<&str>) -> Sess
         file_mtime: 0,
         file_path: fixture("simple_session.jsonl"),
         cwd: String::new(),
-        message_count: None,
+        message_count: 0,
         tickets: tickets.into_iter().map(String::from).collect(),
         text_offset: 0,
         text_len: 0,
@@ -30,6 +30,11 @@ fn make_session(id: &str, name: &str, project: &str, tickets: Vec<&str>) -> Sess
         title_lc: name.to_lowercase(),
         project_lc: project.to_lowercase(),
         branch_lc: "main".into(),
+        permission_mode: String::new(),
+        cc_version: String::new(),
+        skills: vec![],
+        changed_files: vec![],
+        changed_files_lc: String::new(),
     }
 }
 

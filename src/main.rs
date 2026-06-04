@@ -1,5 +1,5 @@
-use sessy::{app, bookmarks, index, preview, session, text_cache, ui};
-use app::{App, AppAction, Focus, ViewMode};
+use sessy::{app, bookmarks, config, index, preview, session, text_cache, ui};
+use app::{App, AppAction, Focus, Scope, ViewMode};
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::io;
@@ -54,19 +54,13 @@ fn main() -> io::Result<()> {
         return run_purge(&mut idx);
     }
 
-    // Default: filter to current directory's sessions
-    if !cli.all {
-        let cwd = std::env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let encoded = format!("-{}", cwd.trim_start_matches('/').replace('/', "-"));
-        idx.sessions.retain(|s| {
-            s.file_path
-                .to_string_lossy()
-                .contains(&format!("/{}/", encoded))
-        });
-    }
+    // Compute the encoded launch-directory prefix so the in-TUI scope toggle
+    // (`a`) can switch between current-directory and all-projects live.
+    let cwd = std::env::current_dir()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let cwd_encoded = format!("-{}", cwd.trim_start_matches('/').replace('/', "-"));
 
     // Apply filters
     if let Some(ref project_filter) = cli.project {
@@ -90,9 +84,18 @@ fn main() -> io::Result<()> {
     let bookmarks = bookmarks::load_bookmarks();
 
     // Run TUI
+    let cfg = config::load();
     let tc = text_cache::TextCache::open(&text_cache::text_cache_path());
     let mut app = App::new(idx.sessions, cli.print, bookmarks, tc);
-    app.apply_sort(); // apply bookmark floating on initial load
+    app.cwd_encoded = Some(cwd_encoded);
+    app.scope = if cli.all || cfg.scope_is_all() {
+        Scope::All
+    } else {
+        Scope::Current
+    };
+    app.sort_mode = cfg.sort_mode();
+    app.show_tools = cfg.show_tool_activity;
+    app.rebuild_view(); // apply scope filter + bookmark floating on initial load
 
     let mut terminal = ratatui::init();
     let result = run_event_loop(&mut terminal, &mut app);
@@ -361,6 +364,11 @@ fn handle_preview_key(app: &mut App, code: KeyCode) {
         KeyCode::Char('/') => app.start_preview_search(),
         KeyCode::Char('n') => app.next_preview_match(),
         KeyCode::Char('N') => app.prev_preview_match(),
+        KeyCode::Char('T') => {
+            app.toggle_tools();
+            preview::request_preview(app);
+        }
+        KeyCode::Char('f') => app.toggle_files(),
         KeyCode::Char('q') => {
             app.action = AppAction::Quit;
         }
@@ -369,6 +377,12 @@ fn handle_preview_key(app: &mut App, code: KeyCode) {
 }
 
 fn handle_list_key(app: &mut App, code: KeyCode) {
+    // The help overlay captures the next keypress to dismiss itself.
+    if app.show_help {
+        app.show_help = false;
+        return;
+    }
+
     // In timeline view, only allow t/Esc/q
     if app.view_mode == ViewMode::Timeline {
         match code {
@@ -389,6 +403,13 @@ fn handle_list_key(app: &mut App, code: KeyCode) {
         KeyCode::Char('/') => {
             app.focus = Focus::Search;
         }
+        KeyCode::Char('a') => {
+            app.toggle_scope();
+            preview::request_preview(app);
+        }
+        KeyCode::Char('?') => {
+            app.show_help = true;
+        }
         KeyCode::Tab => {
             app.focus = Focus::Preview;
         }
@@ -408,6 +429,14 @@ fn handle_list_key(app: &mut App, code: KeyCode) {
         KeyCode::PageDown => {
             let page = (app.terminal_height as usize / 4).max(1);
             app.page_down(page);
+            preview::request_preview(app);
+        }
+        KeyCode::Char('g') | KeyCode::Home => {
+            app.move_to_top();
+            preview::request_preview(app);
+        }
+        KeyCode::Char('G') | KeyCode::End => {
+            app.move_to_bottom();
             preview::request_preview(app);
         }
         KeyCode::Enter => {
@@ -438,6 +467,13 @@ fn handle_list_key(app: &mut App, code: KeyCode) {
         }
         KeyCode::Char('t') => {
             app.toggle_timeline();
+        }
+        KeyCode::Char('T') => {
+            app.toggle_tools();
+            preview::request_preview(app);
+        }
+        KeyCode::Char('f') => {
+            app.toggle_files();
         }
         KeyCode::Char('d') => {
             if !app.filtered_indices.is_empty() {
