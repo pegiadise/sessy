@@ -129,3 +129,7 @@ Bookmarks are persisted at `~/.cache/sessy/bookmarks.json`.
 ## License
 
 MIT
+
+---
+
+Built by [agile turtles](https://agileturtles.gr) — see [more tools](https://agileturtles.gr/en/products).

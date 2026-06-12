@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.86"
 description = "TUI session manager for Claude Code — browse, search, preview, and resume conversations"
 license = "MIT"
+homepage = "https://agileturtles.gr/en/products/sessy"
 repository = "https://github.com/pegiadise/sessy"
 keywords = ["claude", "tui", "session", "cli"]
 categories = ["command-line-utilities"]
