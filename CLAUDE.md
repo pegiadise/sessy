@@ -2,6 +2,12 @@
 
 TUI session manager for Claude Code — browse, search, preview, and resume conversations.
 
+FOSS Rust CLI, published on crates.io (`cargo install sessy`). Doubles as a studio lead-gen footprint: the crate `homepage`/`repository` metadata and README backlink point to agileturtles.gr (see `Cargo.toml`).
+
+- **Crate / binary**: `sessy` — current published version **0.5.1** (matches `Cargo.toml`; verify there before assuming).
+- **Repo**: github.com/pegiadise/sessy (also a git checkout here).
+- License MIT, Rust 2024 edition, MSRV 1.86.
+
 ## Architecture
 
 ```
@@ -31,13 +37,17 @@ src/
 - **Preview cache**: FIFO-ordered HashMap, max 10 entries. Toggling tool activity (`T`) clears it so lines re-extract
 - **Preview line role**: `parser::Speaker` (User/Assistant/Tool); Tool lines only appear when tool activity is on
 
-## Building
+## Build / test / run
 
 ```
-cargo build           # dev build
-cargo test            # unit tests
-cargo build --release # optimized build
+cargo build              # dev build
+cargo test               # unit tests + tests/search_integration.rs (fixtures in tests/fixtures/)
+cargo build --release    # optimized build (lto + strip, see [profile.release])
+cargo clippy             # lint (repo is kept clippy-clean)
+cargo run -- --all       # run the TUI against all projects
 ```
+
+CLI flags (see `src/main.rs` / README): default browses sessions for cwd; `--all` (every project), `--project X` (substring filter), `--recent 7d` (1h/7d/2w/1m), `--print` (emit selected session ID to stdout for `claude --resume $(sessy --print)`), `--purge` (delete sessions < 15 KB older than 2 days).
 
 ## Conventions
 
@@ -50,10 +60,13 @@ cargo build --release # optimized build
 - Timeline heatmap uses GitHub-style green color scale
 - Bookmarked sessions float to top of any sort order
 
-## Publishing
+## Release / publish
 
-```
-cargo publish  # from clean git state
-```
+Releases are tagged `vX.Y.Z` (latest `v0.5.1`). Flow:
 
-Package name is `sessy` on crates.io. Bump version in `Cargo.toml` before publishing.
+1. Bump `version` in `Cargo.toml`.
+2. Commit (conventional commit, ticket at end) and tag: `git tag vX.Y.Z`.
+3. `cargo publish` from clean git state. crates.io token lives in `~/.cargo/credentials.toml`.
+4. Push commits + tags to `main` (github.com/pegiadise/sessy).
+
+Package name is `sessy` on crates.io.
