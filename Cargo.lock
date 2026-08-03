@@ -1675,7 +1675,7 @@ dependencies = [
 
 [[package]]
 name = "sessy"
-version = "0.5.1"
+version = "1.0.1"
 dependencies = [
  "bincode",
  "chrono",

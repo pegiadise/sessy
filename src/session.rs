@@ -104,7 +104,7 @@ mod tests {
     #[test]
     fn test_project_name_from_cwd_deep() {
         let home = "/Users/me";
-        assert_eq!(extract_project_name("/Users/me/code/pitcher/web", home), "pitcher/web");
+        assert_eq!(extract_project_name("/Users/me/code/acme/web", home), "acme/web");
     }
 
     #[test]

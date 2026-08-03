@@ -397,8 +397,8 @@ mod tests {
     fn test_encode_project_path_dots_underscores_unicode() {
         // Claude Code replaces every non-alphanumeric char, not just `/`.
         assert_eq!(
-            encode_project_path("/Users/me/code/pitcher/web/.worktrees/pit-6370"),
-            "-Users-me-code-pitcher-web--worktrees-pit-6370"
+            encode_project_path("/Users/me/code/acme/web/.worktrees/abc-6370"),
+            "-Users-me-code-acme-web--worktrees-abc-6370"
         );
         assert_eq!(encode_project_path("/srv/my_app.v2"), "-srv-my-app-v2");
         assert_eq!(encode_project_path("/home/ρώτα με"), "-home--------");
