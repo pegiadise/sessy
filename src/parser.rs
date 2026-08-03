@@ -83,7 +83,38 @@ fn is_human_message(entry: &Value) -> bool {
             .get("message")
             .and_then(|m| m.get("content"))
             .and_then(|c| c.as_str())
-            .is_some()
+            .is_some_and(|c| !is_command_noise(c))
+}
+
+/// Machine-generated content stored as `type:"user"` turns — slash-command
+/// invocations, local command output, background-task notifications. These
+/// must not drive titles, "left off", message counts, search text, or
+/// preview lines.
+fn is_command_noise(text: &str) -> bool {
+    let t = text.trim_start();
+    t.starts_with("<command-name>")
+        || t.starts_with("<command-message>")
+        || t.starts_with("<local-command-stdout>")
+        || t.starts_with("<local-command-caveat>")
+        || t.starts_with("<task-notification>")
+        || t.starts_with("<system-reminder>")
+}
+
+/// Fallback headline for sessions containing only command noise: the slash
+/// command that was run, or a generic label.
+fn command_noise_title(content: &str) -> String {
+    const OPEN: &str = "<command-name>";
+    const CLOSE: &str = "</command-name>";
+    if let Some(start) = content.find(OPEN) {
+        let rest = &content[start + OPEN.len()..];
+        if let Some(end) = rest.find(CLOSE) {
+            let name = rest[..end].trim();
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    "(command output)".to_string()
 }
 
 fn human_message_text(entry: &Value) -> Option<String> {
@@ -106,6 +137,17 @@ fn human_message_text(entry: &Value) -> Option<String> {
         })
 }
 
+
+/// Pull the text between `<command-args>` and the *following* `</command-args>`.
+/// Returns `None` when either tag is missing or the closing tag only appears
+/// before the opening one (malformed/truncated content must not panic).
+fn extract_command_args(content: &str) -> Option<&str> {
+    const OPEN: &str = "<command-args>";
+    const CLOSE: &str = "</command-args>";
+    let start = content.find(OPEN)? + OPEN.len();
+    let end_rel = content[start..].find(CLOSE)?;
+    Some(&content[start..start + end_rel])
+}
 
 pub struct ScanResult {
     pub head: HeadMeta,
@@ -141,6 +183,7 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
     let mut last_human_message = String::new();
     let mut last_timestamp = String::new();
     let mut rename = String::new();
+    let mut fallback_title = String::new();
     let mut human_text_lc = String::new();
     let mut tickets_set: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut ai_title = String::new();
@@ -227,6 +270,22 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
             last_timestamp = ts.to_string();
         }
 
+        // Remember the first command-noise turn so command-only sessions
+        // (someone opened Claude and ran /exit) still get a listable title.
+        if fallback_title.is_empty()
+            && entry.get("type").and_then(|t| t.as_str()) == Some("user")
+        {
+            if let Some(c) = entry
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+            {
+                if is_command_noise(c) {
+                    fallback_title = command_noise_title(c);
+                }
+            }
+        }
+
         if is_human_message(&entry) {
             if let Some(full) = entry
                 .get("message")
@@ -262,17 +321,25 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
         if entry.get("subtype").and_then(|s| s.as_str()) == Some("local_command") {
             if let Some(content) = entry.get("content").and_then(|c| c.as_str()) {
                 if content.contains("<command-name>/rename</command-name>") {
-                    if let Some(start) = content.find("<command-args>") {
-                        if let Some(end) = content.find("</command-args>") {
-                            rename = content[start + 14..end].to_string();
-                        }
+                    if let Some(args) = extract_command_args(content) {
+                        rename = args.to_string();
                     }
                 }
             }
         }
     }
 
-    let head = head?;
+    let head = match head {
+        Some(h) => h,
+        None if !fallback_title.is_empty() => HeadMeta {
+            title: fallback_title,
+            branch: working_head.branch.clone(),
+            slug: working_head.slug.clone(),
+            first_timestamp: working_head.first_timestamp.clone(),
+            cwd: working_head.cwd.clone(),
+        },
+        None => return None,
+    };
     let tail = if last_human_message.is_empty() && last_timestamp.is_empty() && rename.is_empty() {
         None
     } else {
@@ -546,6 +613,139 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted, result.tickets);
+    }
+
+    #[test]
+    fn test_extract_command_args_well_formed() {
+        assert_eq!(
+            extract_command_args("<command-args>new name</command-args>"),
+            Some("new name")
+        );
+    }
+
+    #[test]
+    fn test_extract_command_args_close_before_open_no_panic() {
+        // A closing tag before the opening tag used to slice with start > end.
+        let content = "<command-name>/rename</command-name></command-args>junk<command-args>";
+        assert_eq!(extract_command_args(content), None);
+    }
+
+    #[test]
+    fn test_extract_command_args_missing_close() {
+        assert_eq!(extract_command_args("<command-args>truncated"), None);
+    }
+
+    #[test]
+    fn test_scan_session_malformed_rename_line_no_panic() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bad.jsonl");
+        let mut f = std::fs::File::create(&path).expect("create");
+        // Valid human message so the scan yields a result…
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"content":"hello"}},"timestamp":"2026-01-01T00:00:00Z"}}"#
+        )
+        .unwrap();
+        // …then a local_command whose </command-args> precedes <command-args>.
+        writeln!(
+            f,
+            r#"{{"type":"user","subtype":"local_command","content":"<command-name>/rename</command-name></command-args>junk<command-args>","toolUseResult":{{}}}}"#
+        )
+        .unwrap();
+        let result = scan_session(&path).expect("should still scan");
+        assert_eq!(result.head.title, "hello");
+        let tail = result.tail.expect("tail");
+        assert_eq!(tail.rename, "", "malformed rename must be ignored");
+    }
+
+    #[test]
+    fn test_scan_session_non_utf8_and_truncated_lines_no_panic() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("garbage.jsonl");
+        let mut f = std::fs::File::create(&path).expect("create");
+        // Invalid UTF-8 bytes, truncated JSON, unknown types with odd shapes.
+        f.write_all(&[0xff, 0xfe, 0x80, b'\n']).unwrap();
+        f.write_all(b"{\"type\":\"user\",\"message\":{\"content\":\"tr\n").unwrap();
+        f.write_all(b"{\"type\":\"future-thing\",\"message\":42}\n").unwrap();
+        f.write_all(b"{\"type\":\"user\",\"message\":{\"content\":[\"array form\"]}}\n").unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"content":"survivor"}},"timestamp":"2026-01-01T00:00:00Z"}}"#
+        )
+        .unwrap();
+        let result = scan_session(&path).expect("should scan despite garbage");
+        assert_eq!(result.head.title, "survivor");
+        assert_eq!(result.message_count, 1);
+    }
+
+    #[test]
+    fn test_command_noise_skipped_for_title_and_count() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("noisy.jsonl");
+        let mut f = std::fs::File::create(&path).expect("create");
+        // Slash command + its output arrive before the real first message.
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"content":"<command-name>/model</command-name><command-args></command-args>"}},"timestamp":"2026-01-01T00:00:00Z"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"content":"<local-command-stdout>Set model to opus</local-command-stdout>"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"content":"fix the login bug"}},"timestamp":"2026-01-01T00:01:00Z"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"content":"<task-notification><task-id>x1</task-id>done</task-notification>"}},"timestamp":"2026-01-01T00:02:00Z"}}"#
+        )
+        .unwrap();
+        let result = scan_session(&path).expect("should scan");
+        assert_eq!(result.head.title, "fix the login bug");
+        assert_eq!(result.message_count, 1, "noise turns must not count");
+        let tail = result.tail.expect("tail");
+        assert_eq!(
+            tail.last_human_message, "fix the login bug",
+            "task notification must not become the left-off line"
+        );
+        assert!(
+            !result.human_text_lc.contains("command-name"),
+            "noise must not enter the search text"
+        );
+    }
+
+    #[test]
+    fn test_command_only_session_gets_fallback_title() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cmd_only.jsonl");
+        let mut f = std::fs::File::create(&path).expect("create");
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"content":"<command-name>/exit</command-name>"}},"timestamp":"2026-01-01T00:00:00Z"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"content":"<local-command-stdout>Bye!</local-command-stdout>"}}}}"#
+        )
+        .unwrap();
+        let result = scan_session(&path).expect("command-only session must stay listable");
+        assert_eq!(result.head.title, "/exit");
+        assert_eq!(result.message_count, 0);
+    }
+
+    #[test]
+    fn test_extract_conversation_missing_file_returns_empty() {
+        let messages = extract_conversation(Path::new("/does/not/exist.jsonl"));
+        assert!(messages.is_empty());
     }
 
     #[test]

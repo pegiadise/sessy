@@ -29,6 +29,7 @@ sessy --project X  # Filter to project name (substring match)
 sessy --recent 7d  # Only show last 7 days (supports: 1h, 7d, 2w, 1m)
 sessy --print      # Select and print session ID to stdout
 sessy --purge      # Delete all sessions < 15 KB and older than 2 days
+                   # (combines with --project / --recent to narrow the scope)
 ```
 
 Scripting: `claude --resume $(sessy --print)`
@@ -74,7 +75,7 @@ Each session shows three lines:
 - **Line 2**: Duration, file size with color-coded category, message count, first message
 - **Line 3**: Last human message — where you left off
 
-The session name prefers Claude Code's AI-generated title, falling back to a `/rename` value or the session slug.
+The session name prefers an explicit `/rename` value, falling back to Claude Code's AI-generated title or the session slug.
 
 ### Size Categories
 
@@ -95,7 +96,7 @@ Scrollable conversation showing `USER:` and `ASST:` messages. System events and 
 
 - Press `T` to fold tool-use activity into the preview (`TOOL:` lines summarising each Edit/Bash/etc. call).
 - Press `f` to list the files the session changed.
-- Press `/` while in the preview pane to search within the conversation. Matching messages are highlighted; use `n`/`N` to jump between matches.
+- Press `/` while in the preview pane to search within the conversation. Matching messages are highlighted; `Enter` commits the search so `n`/`N` jump between matches, `Esc` clears it.
 
 ## Export
 

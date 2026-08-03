@@ -30,8 +30,8 @@ src/
 - **Claude Code sessions** are JSONL files at `~/.claude/projects/<encoded-path>/<uuid>.jsonl`
 - **Path encoding**: Claude replaces `/` with `-`, so `/Users/me/code/foo` → `-Users-me-code-foo`
 - **Single-pass scan**: `parser::scan_session` reads the whole file once, extracting head meta (title/branch/slug/cwd/first ts), tail meta (last human message/ts/`/rename`), AI title (`type:"ai-title"`), permission mode, Claude Code version, skills (`attributionSkill`), changed files (`file-history-snapshot` → `trackedFileBackups`), tickets, and the human message count. Title/`left off` are derived from the human messages it finds — no separate head/tail seek
-- **Human message detection**: `type=="user"` AND `message.content` is string AND no `toolUseResult` AND `isMeta` is not true
-- **Index cache**: bincode serialized with version header. `INDEX_VERSION` is **4** — bump it whenever `SessionMeta` changes
+- **Human message detection**: `type=="user"` AND `message.content` is string AND no `toolUseResult` AND `isMeta` is not true AND the content isn't command noise (starts with `<command-name>`, `<local-command-stdout>`, `<task-notification>`, `<system-reminder>`, …). Command-only sessions fall back to the slash-command name as title
+- **Index cache**: bincode serialized with version header. `INDEX_VERSION` is **5** — bump it whenever `SessionMeta` *or scan semantics* change
 - **Session name priority**: `/rename` value > `aiTitle` > `slug` field > empty
 - **View pipeline**: search → scope (cwd vs all) → size filter → sort (bookmarked first, then by current sort mode: date/size/duration/messages)
 - **Preview cache**: FIFO-ordered HashMap, max 10 entries. Toggling tool activity (`T`) clears it so lines re-extract
@@ -47,7 +47,7 @@ cargo clippy             # lint (repo is kept clippy-clean)
 cargo run -- --all       # run the TUI against all projects
 ```
 
-CLI flags (see `src/main.rs` / README): default browses sessions for cwd; `--all` (every project), `--project X` (substring filter), `--recent 7d` (1h/7d/2w/1m), `--print` (emit selected session ID to stdout for `claude --resume $(sessy --print)`), `--purge` (delete sessions < 15 KB older than 2 days).
+CLI flags (see `src/main.rs` / README): default browses sessions for cwd; `--all` (every project), `--project X` (substring filter), `--recent 7d` (1h/7d/2w/1m; invalid values exit with an error), `--print` (emit selected session ID to stdout for `claude --resume $(sessy --print)` — the TUI renders on **stderr** in this mode so stdout stays clean), `--purge` (delete sessions < 15 KB older than 2 days; respects `--project`/`--recent`).
 
 ## Conventions
 

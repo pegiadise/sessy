@@ -69,6 +69,9 @@ pub struct PreviewResult {
     pub session_id: String,
     pub lines: Vec<(String, String, Speaker)>,
     pub message_count: u32,
+    /// Tool-activity setting the lines were extracted under; results from a
+    /// stale setting are dropped instead of cached.
+    pub include_tools: bool,
 }
 
 pub struct App {
@@ -629,9 +632,28 @@ impl App {
 
     pub fn exit_preview_search(&mut self) {
         self.focus = Focus::Preview;
+        self.clear_preview_search();
+    }
+
+    /// Leave the search input but keep the query, matches, and highlights so
+    /// `n`/`N` can walk between matches from the preview pane.
+    pub fn commit_preview_search(&mut self) {
+        self.focus = Focus::Preview;
+        if self.preview_search_query.is_empty() {
+            self.clear_preview_search();
+        }
+    }
+
+    /// Reset search state without touching focus. Called when the previewed
+    /// session changes: match indices refer to the old conversation's lines.
+    pub fn clear_preview_search(&mut self) {
         self.preview_search_query.clear();
         self.preview_search_matches.clear();
         self.preview_search_current = 0;
+    }
+
+    pub fn preview_search_active(&self) -> bool {
+        !self.preview_search_query.is_empty() || !self.preview_search_matches.is_empty()
     }
 
     // Status message
@@ -653,8 +675,8 @@ impl App {
     // Cache management (FIFO eviction)
 
     pub fn cache_preview(&mut self, session_id: String, lines: Vec<(String, String, Speaker)>) {
-        if self.preview_cache.contains_key(&session_id) {
-            *self.preview_cache.get_mut(&session_id).unwrap() = lines;
+        if let Some(existing) = self.preview_cache.get_mut(&session_id) {
+            *existing = lines;
             return;
         }
         if self.preview_cache.len() >= 10 {
@@ -711,6 +733,11 @@ impl App {
             }
             Focus::Search => {
                 self.focus = Focus::List;
+            }
+            Focus::Preview if self.preview_search_active() => {
+                // First Esc clears a committed search (like vim's :noh);
+                // a second Esc returns to the list.
+                self.clear_preview_search();
             }
             Focus::Preview => {
                 self.focus = Focus::List;
@@ -949,6 +976,23 @@ mod search_tests {
     }
 
     #[test]
+    fn test_scope_filter_matches_dotted_cwd_encoding() {
+        // Claude Code encodes `.` (any non-alphanumeric) as `-` in project dir
+        // names; the launch-dir encoding must agree or scope shows nothing.
+        let mut a = make_session("a", "x", "", "p", "main", vec![]);
+        a.file_path = PathBuf::from(
+            "/Users/me/.claude/projects/-Users-me-code-web--worktrees-spike/a.jsonl",
+        );
+        let mut app = App::new(vec![a], false, HashSet::new(), empty_cache());
+        app.cwd_encoded = Some(crate::index::encode_project_path(
+            "/Users/me/code/web/.worktrees/spike",
+        ));
+        app.scope = Scope::Current;
+        app.rebuild_view();
+        assert_eq!(app.filtered_indices.len(), 1);
+    }
+
+    #[test]
     fn test_sort_by_messages_orders_desc() {
         let mut a = make_session("a", "x", "", "p", "main", vec![]);
         a.message_count = 3;
@@ -968,6 +1012,72 @@ mod search_tests {
         app.search_query = "auth.rs".into();
         app.apply_search();
         assert_eq!(app.filtered_indices.len(), 1);
+    }
+
+    #[test]
+    fn test_commit_preview_search_keeps_matches_for_n_navigation() {
+        let mut app = App::new(
+            vec![make_session("a", "x", "", "p", "main", vec![])],
+            false,
+            HashSet::new(),
+            empty_cache(),
+        );
+        app.preview_lines = vec![
+            ("hello world".into(), "hello world".into(), Speaker::User),
+            ("nothing".into(), "nothing".into(), Speaker::Assistant),
+            ("hello again".into(), "hello again".into(), Speaker::User),
+        ];
+        app.start_preview_search();
+        app.preview_search_query = "hello".into();
+        app.update_preview_search();
+        assert_eq!(app.preview_search_matches, vec![0, 2]);
+
+        // Enter commits: focus returns to Preview, matches survive, n advances.
+        app.commit_preview_search();
+        assert_eq!(app.focus, Focus::Preview);
+        assert_eq!(app.preview_search_matches, vec![0, 2]);
+        app.next_preview_match();
+        assert_eq!(app.preview_search_current, 1);
+    }
+
+    #[test]
+    fn test_esc_in_preview_clears_search_then_exits() {
+        let mut app = App::new(
+            vec![make_session("a", "x", "", "p", "main", vec![])],
+            false,
+            HashSet::new(),
+            empty_cache(),
+        );
+        app.preview_lines = vec![("hello".into(), "hello".into(), Speaker::User)];
+        app.start_preview_search();
+        app.preview_search_query = "hello".into();
+        app.update_preview_search();
+        app.commit_preview_search();
+
+        // First Esc clears the committed search but stays in the preview…
+        app.handle_esc();
+        assert_eq!(app.focus, Focus::Preview);
+        assert!(!app.preview_search_active());
+        // …second Esc returns to the list.
+        app.handle_esc();
+        assert_eq!(app.focus, Focus::List);
+    }
+
+    #[test]
+    fn test_esc_in_search_input_cancels_completely() {
+        let mut app = App::new(
+            vec![make_session("a", "x", "", "p", "main", vec![])],
+            false,
+            HashSet::new(),
+            empty_cache(),
+        );
+        app.preview_lines = vec![("hello".into(), "hello".into(), Speaker::User)];
+        app.start_preview_search();
+        app.preview_search_query = "hello".into();
+        app.update_preview_search();
+        app.exit_preview_search();
+        assert_eq!(app.focus, Focus::Preview);
+        assert!(!app.preview_search_active());
     }
 
     #[test]

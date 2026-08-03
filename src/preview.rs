@@ -17,6 +17,14 @@ pub fn request_preview(app: &mut App) {
         return;
     }
 
+    // Loading a different session (or reloading after a tools toggle): any
+    // committed search matches point into the old conversation's lines.
+    app.clear_preview_search();
+
+    let session = match app.selected_session() {
+        Some(s) => s,
+        None => return,
+    };
     let session_id = session.id.clone();
     let file_path = session.file_path.clone();
     let include_tools = app.show_tools;
@@ -54,13 +62,20 @@ pub fn request_preview(app: &mut App) {
             session_id,
             lines,
             message_count,
+            include_tools,
         });
     });
 }
 
 /// Check for completed preview loads and update app state.
 pub fn check_preview_updates(app: &mut App) {
-    if let Ok(result) = app.preview_rx.try_recv() {
+    while let Ok(result) = app.preview_rx.try_recv() {
+        // Extracted under a tool-activity setting that has since been toggled:
+        // caching or applying it would show stale lines. A fresh request was
+        // already spawned by the toggle handler, so just drop it.
+        if result.include_tools != app.show_tools {
+            continue;
+        }
         // FIFO cache
         app.cache_preview(result.session_id.clone(), result.lines.clone());
 

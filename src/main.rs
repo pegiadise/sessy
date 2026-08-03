@@ -36,6 +36,21 @@ struct Cli {
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
 
+    // Validate flags before the (potentially slow) index build.
+    let recent_secs = match cli.recent.as_deref() {
+        Some(recent) => match index::parse_recent_filter(recent) {
+            Some(secs) => Some(secs),
+            None => {
+                eprintln!(
+                    "sessy: invalid --recent value '{}' (expected a number followed by h, d, w, or m — e.g. 1h, 7d, 2w, 1m)",
+                    recent
+                );
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
+
     // Build index
     let cached = if cli.rebuild_index {
         None
@@ -49,18 +64,13 @@ fn main() -> io::Result<()> {
     // Save index before applying runtime filters
     index::save_index(&idx);
 
-    // Purge: delete tiny old sessions
-    if cli.purge {
-        return run_purge(&mut idx);
-    }
-
     // Compute the encoded launch-directory prefix so the in-TUI scope toggle
     // (`a`) can switch between current-directory and all-projects live.
     let cwd = std::env::current_dir()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let cwd_encoded = format!("-{}", cwd.trim_start_matches('/').replace('/', "-"));
+    let cwd_encoded = index::encode_project_path(&cwd);
 
     // Apply filters
     if let Some(ref project_filter) = cli.project {
@@ -69,15 +79,19 @@ fn main() -> io::Result<()> {
             .retain(|s| s.project.to_lowercase().contains(&filter_lower));
     }
 
-    if let Some(ref recent) = cli.recent {
-        if let Some(secs) = index::parse_recent_filter(recent) {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            let cutoff = now - secs as i64;
-            idx.sessions.retain(|s| s.timestamp >= cutoff);
-        }
+    if let Some(secs) = recent_secs {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let cutoff = now - secs as i64;
+        idx.sessions.retain(|s| s.timestamp >= cutoff);
+    }
+
+    // Purge: delete tiny old sessions. Runs after the CLI filters so
+    // `--project X --purge` only touches that project's sessions.
+    if cli.purge {
+        return run_purge(&idx);
     }
 
     // Load bookmarks
@@ -87,7 +101,13 @@ fn main() -> io::Result<()> {
     let cfg = config::load();
     let tc = text_cache::TextCache::open(&text_cache::text_cache_path());
     let mut app = App::new(idx.sessions, cli.print, bookmarks, tc);
-    app.cwd_encoded = Some(cwd_encoded);
+    // An unreadable cwd yields an empty encoding; disable scope filtering
+    // instead of silently matching nothing.
+    app.cwd_encoded = if cwd_encoded.is_empty() {
+        None
+    } else {
+        Some(cwd_encoded)
+    };
     app.scope = if cli.all || cfg.scope_is_all() {
         Scope::All
     } else {
@@ -97,9 +117,17 @@ fn main() -> io::Result<()> {
     app.show_tools = cfg.show_tool_activity;
     app.rebuild_view(); // apply scope filter + bookmark floating on initial load
 
-    let mut terminal = ratatui::init();
-    let result = run_event_loop(&mut terminal, &mut app);
-    ratatui::restore();
+    // In --print mode stdout is typically captured by a command substitution
+    // (`claude --resume $(sessy --print)`), so the TUI must render on stderr,
+    // keeping stdout clean for the selected session ID.
+    let result = if cli.print {
+        run_tui_on_stderr(&mut app)
+    } else {
+        let mut terminal = ratatui::init();
+        let result = run_event_loop(&mut terminal, &mut app);
+        ratatui::restore();
+        result
+    };
 
     // Handle post-TUI actions
     handle_post_tui_action(&app);
@@ -107,7 +135,27 @@ fn main() -> io::Result<()> {
     result
 }
 
-fn run_purge(idx: &mut index::SessionIndex) -> io::Result<()> {
+/// Set up and tear down a terminal on stderr (mirror of `ratatui::init()`/
+/// `restore()`, which are hardwired to stdout).
+fn run_tui_on_stderr(app: &mut App) -> io::Result<()> {
+    use crossterm::cursor::Show;
+    use crossterm::terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    };
+
+    enable_raw_mode()?;
+    if let Err(e) = crossterm::execute!(io::stderr(), EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(e);
+    }
+    let result = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stderr()))
+        .and_then(|mut terminal| run_event_loop(&mut terminal, app));
+    let _ = crossterm::execute!(io::stderr(), LeaveAlternateScreen, Show);
+    let _ = disable_raw_mode();
+    result
+}
+
+fn run_purge(idx: &index::SessionIndex) -> io::Result<()> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -115,12 +163,10 @@ fn run_purge(idx: &mut index::SessionIndex) -> io::Result<()> {
     let two_days_ago = now - 2 * 86400;
     let size_limit = 15 * 1024;
 
-    let to_purge: Vec<usize> = idx
+    let to_purge: Vec<&session::SessionMeta> = idx
         .sessions
         .iter()
-        .enumerate()
-        .filter(|(_, s)| s.file_size < size_limit && s.timestamp < two_days_ago)
-        .map(|(i, _)| i)
+        .filter(|s| s.file_size < size_limit && s.timestamp < two_days_ago)
         .collect();
 
     if to_purge.is_empty() {
@@ -136,18 +182,18 @@ fn run_purge(idx: &mut index::SessionIndex) -> io::Result<()> {
     io::stdin().read_line(&mut answer)?;
     if answer.trim().eq_ignore_ascii_case("y") {
         let mut deleted = 0;
-        for &i in to_purge.iter().rev() {
-            let path = &idx.sessions[i].file_path;
-            if std::fs::remove_file(path).is_ok() {
-                let companion = path.with_extension("");
+        for s in &to_purge {
+            if std::fs::remove_file(&s.file_path).is_ok() {
+                let companion = s.file_path.with_extension("");
                 if companion.is_dir() {
                     std::fs::remove_dir_all(&companion).ok();
                 }
-                idx.sessions.remove(i);
                 deleted += 1;
             }
         }
-        index::save_index(idx);
+        // No index save needed: the next launch simply won't find the deleted
+        // files on disk, and stale cache entries keyed by missing paths are
+        // ignored by the incremental rebuild.
         println!("Purged {} sessions.", deleted);
     } else {
         println!("Aborted.");
@@ -190,7 +236,8 @@ fn handle_post_tui_action(app: &App) {
                         if let Err(e) = ctx.set_contents(cmd.clone()) {
                             eprintln!("Clipboard error: {}", e);
                         } else {
-                            println!("Copied: {}", cmd);
+                            // stderr: keeps stdout clean for --print substitution.
+                            eprintln!("Copied: {}", cmd);
                         }
                     }
                     Err(e) => eprintln!("Clipboard error: {}", e),
@@ -206,7 +253,10 @@ fn handle_post_tui_action(app: &App) {
     }
 }
 
-fn run_event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
+fn run_event_loop<B: ratatui::backend::Backend<Error = io::Error>>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut App,
+) -> io::Result<()> {
     if !app.filtered_indices.is_empty() {
         preview::request_preview(app);
     }
@@ -308,8 +358,13 @@ fn handle_preview_search_key(app: &mut App, key: KeyEvent) {
 
     let mut mutated = false;
     match key.code {
-        KeyCode::Esc | KeyCode::Enter => {
+        // Esc cancels; Enter commits the search so n/N can walk the matches.
+        KeyCode::Esc => {
             app.exit_preview_search();
+            return;
+        }
+        KeyCode::Enter => {
+            app.commit_preview_search();
             return;
         }
         KeyCode::Backspace if alt => {
@@ -356,7 +411,9 @@ fn delete_word_backwards(s: &mut String) {
 
 fn handle_preview_key(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Esc | KeyCode::Tab => app.handle_esc(),
+        // Tab always returns to the list; Esc first clears an active search.
+        KeyCode::Tab => app.focus = Focus::List,
+        KeyCode::Esc => app.handle_esc(),
         KeyCode::Up | KeyCode::Char('k') => app.scroll_preview_up(),
         KeyCode::Down | KeyCode::Char('j') => app.scroll_preview_down(),
         KeyCode::PageUp => app.scroll_preview_page_up(app.terminal_height / 2),
@@ -440,20 +497,28 @@ fn handle_list_key(app: &mut App, code: KeyCode) {
             preview::request_preview(app);
         }
         KeyCode::Enter => {
-            if app.print_mode {
-                app.action = AppAction::Print(app.selected);
-            } else {
-                app.action = AppAction::LaunchDangerously(app.selected);
+            if app.selected_session().is_some() {
+                if app.print_mode {
+                    app.action = AppAction::Print(app.selected);
+                } else {
+                    app.action = AppAction::LaunchDangerously(app.selected);
+                }
             }
         }
         KeyCode::Char('l') => {
-            app.action = AppAction::Launch(app.selected);
+            if app.selected_session().is_some() {
+                app.action = AppAction::Launch(app.selected);
+            }
         }
         KeyCode::Char('c') => {
-            app.action = AppAction::Yank(app.selected);
+            if app.selected_session().is_some() {
+                app.action = AppAction::Yank(app.selected);
+            }
         }
         KeyCode::Char('p') => {
-            app.action = AppAction::Print(app.selected);
+            if app.selected_session().is_some() {
+                app.action = AppAction::Print(app.selected);
+            }
         }
         KeyCode::Char('s') => {
             app.cycle_sort();

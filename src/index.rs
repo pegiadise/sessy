@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-pub const INDEX_VERSION: u32 = 4;
+pub const INDEX_VERSION: u32 = 5;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionIndex {
@@ -20,6 +20,15 @@ pub fn index_cache_path() -> PathBuf {
         .join("sessy");
     fs::create_dir_all(&cache_dir).ok();
     cache_dir.join("index.bin")
+}
+
+/// Encode an absolute directory path the way Claude Code names project dirs:
+/// every non-alphanumeric character becomes `-` (not just `/` — dots,
+/// underscores, spaces, and unicode too, e.g. `/a/.worktrees/x` → `-a--worktrees-x`).
+pub fn encode_project_path(path: &str) -> String {
+    path.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 pub fn claude_projects_dir() -> PathBuf {
@@ -374,6 +383,25 @@ mod tests {
         let bytes = serialize_index(&index);
         let restored = deserialize_index(&bytes);
         assert!(restored.is_none());
+    }
+
+    #[test]
+    fn test_encode_project_path_plain() {
+        assert_eq!(
+            encode_project_path("/Users/me/code/foo"),
+            "-Users-me-code-foo"
+        );
+    }
+
+    #[test]
+    fn test_encode_project_path_dots_underscores_unicode() {
+        // Claude Code replaces every non-alphanumeric char, not just `/`.
+        assert_eq!(
+            encode_project_path("/Users/me/code/pitcher/web/.worktrees/pit-6370"),
+            "-Users-me-code-pitcher-web--worktrees-pit-6370"
+        );
+        assert_eq!(encode_project_path("/srv/my_app.v2"), "-srv-my-app-v2");
+        assert_eq!(encode_project_path("/home/ρώτα με"), "-home--------");
     }
 
     #[test]

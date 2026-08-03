@@ -65,7 +65,7 @@ fn draw_search_bar(frame: &mut Frame, app: &App, area: Rect) {
 
     if app.focus == Focus::Search {
         frame.set_cursor_position((
-            area.x + 1 + app.search_query.chars().count() as u16,
+            cursor_x(area.x + 1, &app.search_query, area.right().saturating_sub(2)),
             area.y + 1,
         ));
     }
@@ -539,7 +539,9 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         } else if app.preview_loading {
             "Loading conversation..."
         } else {
-            "Select a session to preview."
+            // A session is selected but its extraction produced nothing
+            // (e.g. only slash commands, no conversation).
+            "No conversation content in this session."
         };
         let p = Paragraph::new(msg).style(Style::default().fg(Color::DarkGray));
         frame.render_widget(p, preview_area);
@@ -627,7 +629,11 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(p, area);
 
         frame.set_cursor_position((
-            area.x + 1 + app.preview_search_query.chars().count() as u16,
+            cursor_x(
+                area.x + 1,
+                &app.preview_search_query,
+                area.right().saturating_sub(1),
+            ),
             area.y,
         ));
     }
@@ -723,7 +729,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("T ", key),
         Span::styled("tools  ", desc),
         Span::styled("Enter ", key),
-        Span::styled("yolo  ", desc),
+        Span::styled(if app.print_mode { "print  " } else { "yolo  " }, desc),
         Span::styled("l ", key),
         Span::styled("launch  ", desc),
         Span::styled("c ", key),
@@ -825,6 +831,13 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Cursor column after `query`, clamped so a pasted mega-string can neither
+/// overflow u16 arithmetic nor push the cursor outside the input box.
+fn cursor_x(start: u16, query: &str, max_x: u16) -> u16 {
+    let chars = query.chars().count().min(u16::MAX as usize) as u16;
+    start.saturating_add(chars).min(max_x.max(start))
 }
 
 fn chrono_format(timestamp: i64) -> String {
@@ -953,6 +966,46 @@ fn highlight_spans(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_truncate_emoji_char_boundaries() {
+        // Must cut on char boundaries, never mid-codepoint.
+        assert_eq!(truncate("🐢🐢🐢🐢", 2), "🐢…");
+        assert_eq!(truncate("🐢🐢", 5), "🐢🐢");
+        assert_eq!(truncate("αβγδε", 3), "αβ…");
+        assert_eq!(truncate("abc", 0), "");
+        assert_eq!(truncate("abc", 1), "…");
+    }
+
+    #[test]
+    fn test_wrap_text_unicode_no_panic() {
+        // Long unbroken emoji run wider than the wrap width.
+        let text = "🐢".repeat(50);
+        let chunks = wrap_text(&text, 10);
+        assert!(chunks.len() >= 5);
+        assert!(chunks.iter().all(|c| c.chars().count() <= 10));
+        // Greek with spaces wraps on spaces.
+        let chunks = wrap_text("καλημέρα κόσμε γεια σου", 10);
+        assert!(chunks.len() >= 2);
+    }
+
+    #[test]
+    fn test_wrap_text_zero_width() {
+        assert_eq!(wrap_text("hello", 0), vec!["hello".to_string()]);
+        assert!(wrap_text("", 10).is_empty());
+    }
+
+    #[test]
+    fn test_cursor_x_clamps() {
+        // Normal case: start + query length.
+        assert_eq!(cursor_x(1, "ab", 40), 3);
+        // Clamped to the box edge.
+        assert_eq!(cursor_x(1, &"x".repeat(100), 40), 40);
+        // Degenerate box (max < start) must not underflow or move left of start.
+        assert_eq!(cursor_x(5, "abc", 2), 5);
+        // Huge paste: no u16 overflow panic.
+        assert_eq!(cursor_x(u16::MAX - 1, &"y".repeat(70_000), u16::MAX), u16::MAX);
+    }
 
     #[test]
     fn test_highlight_unicode_length_change() {
