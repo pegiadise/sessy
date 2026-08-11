@@ -41,7 +41,7 @@ Scripting: `claude --resume $(sessy --print)`
 | `j` / `k` or `Up` / `Down` | Navigate sessions (wraps around) |
 | `g` / `G` or `Home` / `End` | Jump to top / bottom |
 | `PgUp` / `PgDn` | Jump a full page |
-| `/` | Search (project, title, branch, name, changed files, tickets, message text) |
+| `/` | Search (project, title, branch, name, changed files, tickets, full conversation text) |
 | `s` | Cycle sort: date → size → duration → messages |
 | `1` `2` `3` `4` | Filter by size: quick / medium / deep / massive (`0` clears) |
 | `a` | Toggle scope: current directory ↔ all projects |
@@ -123,7 +123,7 @@ A missing or malformed file falls back to these defaults. The `--all` flag overr
 
 ## How It Works
 
-Reads JSONL session files from `~/.claude/projects/`. A single-pass scanner extracts per-session metadata — title, branch, slug, cwd, AI title, permission mode, skills, changed files, tickets, message count, the "left off" message, and the full human-message text used for search — into a cached index (`~/.cache/sessy/index.bin`), with the searchable text stored in an mmap'd companion (`~/.cache/sessy/text.bin`). Full conversations are only parsed when you open a preview.
+Reads JSONL session files from `~/.claude/projects/`. A single-pass scanner extracts per-session metadata — title, branch, slug, cwd, AI title, permission mode, skills, changed files, tickets, message count, the "left off" message, and the full conversation text used for search (user + assistant messages, thinking, tool inputs and outputs) — into a cached index (`~/.cache/sessy/index.bin`), with the searchable text stored in an mmap'd companion (`~/.cache/sessy/text.bin`). Full conversations are only parsed when you open a preview.
 
 Bookmarks are persisted at `~/.cache/sessy/bookmarks.json`.
 

@@ -1,7 +1,10 @@
 use sessy::{app, bookmarks, config, index, preview, session, text_cache, ui};
 use app::{App, AppAction, Focus, Scope, ViewMode};
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use std::io;
 use std::time::Duration;
 
@@ -124,7 +127,14 @@ fn main() -> io::Result<()> {
         run_tui_on_stderr(&mut app)
     } else {
         let mut terminal = ratatui::init();
+        // Kitty keyboard protocol: without it, terminals send legacy codes in
+        // which Cmd/Alt+Backspace are indistinguishable from plain Backspace
+        // (or never delivered), so the modifier-aware search-input bindings
+        // can't fire. Push after entering the alternate screen (the flag stack
+        // is per-screen), pop before leaving it.
+        let kbd_enhanced = push_keyboard_enhancement(&mut io::stdout());
         let result = run_event_loop(&mut terminal, &mut app);
+        pop_keyboard_enhancement(&mut io::stdout(), kbd_enhanced);
         ratatui::restore();
         result
     };
@@ -148,11 +158,35 @@ fn run_tui_on_stderr(app: &mut App) -> io::Result<()> {
         let _ = disable_raw_mode();
         return Err(e);
     }
+    let kbd_enhanced = push_keyboard_enhancement(&mut io::stderr());
     let result = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stderr()))
         .and_then(|mut terminal| run_event_loop(&mut terminal, app));
+    pop_keyboard_enhancement(&mut io::stderr(), kbd_enhanced);
     let _ = crossterm::execute!(io::stderr(), LeaveAlternateScreen, Show);
     let _ = disable_raw_mode();
     result
+}
+
+/// Enable the kitty keyboard protocol when the terminal supports it, so
+/// modifier combinations like Cmd+Backspace and Alt+Backspace reach the app.
+/// The support probe talks to /dev/tty directly, keeping stdout clean for
+/// `--print` command substitution. Returns whether the flags were pushed.
+fn push_keyboard_enhancement<W: io::Write>(out: &mut W) -> bool {
+    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        crossterm::execute!(
+            out,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok()
+    } else {
+        false
+    }
+}
+
+fn pop_keyboard_enhancement<W: io::Write>(out: &mut W, pushed: bool) {
+    if pushed {
+        let _ = crossterm::execute!(out, PopKeyboardEnhancementFlags);
+    }
 }
 
 fn run_purge(idx: &index::SessionIndex) -> io::Result<()> {
@@ -572,6 +606,60 @@ fn handle_list_key(app: &mut App, code: KeyCode) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    fn test_app() -> App {
+        let cache = sessy::text_cache::TextCache::open(std::path::Path::new("/does/not/exist"));
+        App::new(vec![], false, HashSet::new(), cache)
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn cmd_backspace_clears_search_query() {
+        let mut app = test_app();
+        app.focus = Focus::Search;
+        app.search_query = "hello world".into();
+        handle_search_key(&mut app, key(KeyCode::Backspace, KeyModifiers::SUPER));
+        assert_eq!(app.search_query, "");
+    }
+
+    #[test]
+    fn alt_backspace_deletes_word_in_search_query() {
+        let mut app = test_app();
+        app.focus = Focus::Search;
+        app.search_query = "hello world".into();
+        handle_search_key(&mut app, key(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(app.search_query, "hello ");
+    }
+
+    #[test]
+    fn shifted_chars_still_type_into_search_query() {
+        let mut app = test_app();
+        app.focus = Focus::Search;
+        handle_search_key(&mut app, key(KeyCode::Char('A'), KeyModifiers::SHIFT));
+        assert_eq!(app.search_query, "A");
+    }
+
+    #[test]
+    fn cmd_backspace_clears_preview_search_query() {
+        let mut app = test_app();
+        app.focus = Focus::PreviewSearch;
+        app.preview_search_query = "hello world".into();
+        handle_preview_search_key(&mut app, key(KeyCode::Backspace, KeyModifiers::SUPER));
+        assert_eq!(app.preview_search_query, "");
+    }
+
+    #[test]
+    fn alt_backspace_deletes_word_in_preview_search_query() {
+        let mut app = test_app();
+        app.focus = Focus::PreviewSearch;
+        app.preview_search_query = "hello world".into();
+        handle_preview_search_key(&mut app, key(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(app.preview_search_query, "hello ");
+    }
 
     #[test]
     fn delete_word_strips_trailing_space_then_word() {

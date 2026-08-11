@@ -149,10 +149,79 @@ fn extract_command_args(content: &str) -> Option<&str> {
     Some(&content[start..start + end_rel])
 }
 
+fn push_search_text(out: &mut String, text: &str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    out.push_str(&trimmed.to_lowercase());
+    out.push('\n');
+}
+
+/// Accumulate every piece of human-readable text in an entry into the search
+/// text: user messages (string or block form), assistant text and thinking,
+/// tool-use string inputs (commands, paths, …), and tool-result output.
+/// Command noise is filtered; images and JSON structure are not indexed.
+fn append_searchable_text(entry: &Value, out: &mut String) {
+    let Some(content) = entry.get("message").and_then(|m| m.get("content")) else {
+        return;
+    };
+    match content {
+        Value::String(s) => {
+            if !is_command_noise(s) {
+                push_search_text(out, s);
+            }
+        }
+        Value::Array(blocks) => {
+            for block in blocks {
+                match block.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => {
+                        if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                            if !is_command_noise(t) {
+                                push_search_text(out, t);
+                            }
+                        }
+                    }
+                    Some("thinking") => {
+                        if let Some(t) = block.get("thinking").and_then(|t| t.as_str()) {
+                            push_search_text(out, t);
+                        }
+                    }
+                    Some("tool_use") => {
+                        if let Some(input) = block.get("input").and_then(|i| i.as_object()) {
+                            for value in input.values() {
+                                if let Some(s) = value.as_str() {
+                                    push_search_text(out, s);
+                                }
+                            }
+                        }
+                    }
+                    Some("tool_result") => match block.get("content") {
+                        Some(Value::String(s)) => push_search_text(out, s),
+                        Some(Value::Array(parts)) => {
+                            for part in parts {
+                                if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                                    push_search_text(out, t);
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 pub struct ScanResult {
     pub head: HeadMeta,
     pub tail: Option<TailMeta>,
-    pub human_text_lc: String,
+    /// Lowercased searchable text: user messages, assistant text + thinking,
+    /// tool-use string inputs, and tool-result text — everything a person
+    /// could have read in the session, minus JSON structure and images.
+    pub search_text_lc: String,
     pub tickets: Vec<String>,
     /// Claude-generated session title (`type: "ai-title"`), if present.
     pub ai_title: String,
@@ -184,7 +253,7 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
     let mut last_timestamp = String::new();
     let mut rename = String::new();
     let mut fallback_title = String::new();
-    let mut human_text_lc = String::new();
+    let mut search_text_lc = String::new();
     let mut tickets_set: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut ai_title = String::new();
     let mut permission_mode = String::new();
@@ -208,6 +277,8 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
             Ok(v) => v,
             Err(_) => continue,
         };
+
+        append_searchable_text(&entry, &mut search_text_lc);
 
         // Modern-format metadata, harvested in the same single pass.
         match entry.get("type").and_then(|t| t.as_str()) {
@@ -309,8 +380,6 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
                             cwd: working_head.cwd.clone(),
                         });
                     }
-                    human_text_lc.push_str(&trimmed.to_lowercase());
-                    human_text_lc.push('\n');
                     if let Some(text) = human_message_text(&entry) {
                         last_human_message = text;
                     }
@@ -360,7 +429,7 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
     Some(ScanResult {
         head,
         tail,
-        human_text_lc,
+        search_text_lc,
         tickets,
         ai_title,
         permission_mode,
@@ -580,17 +649,17 @@ mod tests {
         let tail = result.tail.expect("should have tail");
         assert_eq!(tail.last_human_message, "looks good, ship it");
         assert!(
-            result.human_text_lc.contains("build a cool thing"),
+            result.search_text_lc.contains("build a cool thing"),
             "got: {:?}",
-            result.human_text_lc
+            result.search_text_lc
         );
         assert!(
-            result.human_text_lc.contains("looks good, ship it"),
+            result.search_text_lc.contains("looks good, ship it"),
             "got: {:?}",
-            result.human_text_lc
+            result.search_text_lc
         );
         assert!(
-            result.human_text_lc.chars().all(|c: char| !c.is_uppercase()),
+            result.search_text_lc.chars().all(|c: char| !c.is_uppercase()),
             "should be lowercased"
         );
     }
@@ -716,7 +785,7 @@ mod tests {
             "task notification must not become the left-off line"
         );
         assert!(
-            !result.human_text_lc.contains("command-name"),
+            !result.search_text_lc.contains("command-name"),
             "noise must not enter the search text"
         );
     }
@@ -740,6 +809,73 @@ mod tests {
         let result = scan_session(&path).expect("command-only session must stay listable");
         assert_eq!(result.head.title, "/exit");
         assert_eq!(result.message_count, 0);
+    }
+
+    #[test]
+    fn test_search_text_includes_assistant_text() {
+        let result = scan_session(&fixture_path("complex_session.jsonl")).expect("should scan");
+        assert!(
+            result.search_text_lc.contains("i'll set up jwt auth."),
+            "assistant text must be searchable, got: {:?}",
+            result.search_text_lc
+        );
+    }
+
+    #[test]
+    fn test_search_text_includes_array_form_user_text() {
+        let result = scan_session(&fixture_path("complex_session.jsonl")).expect("should scan");
+        assert!(
+            result.search_text_lc.contains("skill loaded: auth-helper"),
+            "array-form user text must be searchable, got: {:?}",
+            result.search_text_lc
+        );
+    }
+
+    #[test]
+    fn test_search_text_includes_tool_results_inputs_and_thinking() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("deep.jsonl");
+        let mut f = std::fs::File::create(&path).expect("create");
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"content":"start"}},"timestamp":"2026-01-01T00:00:00Z"}}"#
+        )
+        .unwrap();
+        // Assistant turn: thinking + tool_use with string inputs.
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"thinking","thinking":"maybe the flag is inverted"}},{{"type":"tool_use","id":"t1","name":"Bash","input":{{"command":"cargo build --release"}}}}]}}}}"#
+        )
+        .unwrap();
+        // Tool result in string form…
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"t1","content":"error[E0502]: cannot borrow"}}]}},"toolUseResult":{{}}}}"#
+        )
+        .unwrap();
+        // …and in block-array form.
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"t2","content":[{{"type":"text","text":"warning: unused variable `zeta`"}}]}}]}},"toolUseResult":{{}}}}"#
+        )
+        .unwrap();
+        let result = scan_session(&path).expect("should scan");
+        for needle in [
+            "maybe the flag is inverted",
+            "cargo build --release",
+            "error[e0502]: cannot borrow",
+            "warning: unused variable `zeta`",
+        ] {
+            assert!(
+                result.search_text_lc.contains(needle),
+                "search text must contain {:?}, got: {:?}",
+                needle,
+                result.search_text_lc
+            );
+        }
+        // Deep content must not affect the human message count.
+        assert_eq!(result.message_count, 1);
     }
 
     #[test]

@@ -4,7 +4,7 @@ TUI session manager for Claude Code — browse, search, preview, and resume conv
 
 FOSS Rust CLI, published on crates.io (`cargo install sessy`). Doubles as a studio lead-gen footprint: the crate `homepage`/`repository` metadata and README backlink point to agileturtles.gr (see `Cargo.toml`).
 
-- **Crate / binary**: `sessy` — current published version **1.0.1** (matches `Cargo.toml`; verify there before assuming).
+- **Crate / binary**: `sessy` — current published version **1.1.0** (matches `Cargo.toml`; verify there before assuming).
 - **Repo**: github.com/pegiadise/sessy (also a git checkout here).
 - License MIT, Rust 2024 edition, MSRV 1.86.
 
@@ -19,7 +19,7 @@ src/
   parser.rs     — JSONL single-pass scanner; human message detection; conversation extraction (with optional tool lines)
   session.rs    — SessionMeta struct, formatting helpers (duration, file size, size category)
   preview.rs    — Background thread preview loader with mpsc channel and FIFO cache
-  text_cache.rs — mmap'd companion (~/.cache/sessy/text.bin) holding searchable human text
+  text_cache.rs — mmap'd companion (~/.cache/sessy/text.bin) holding searchable conversation text (user + assistant + thinking + tool I/O)
   config.rs     — Optional ~/.config/sessy/config.toml (scope, sort, show_tool_activity)
   bookmarks.rs  — Bookmark persistence (~/.cache/sessy/bookmarks.json)
   export.rs     — Markdown export of session conversations
@@ -31,7 +31,7 @@ src/
 - **Path encoding**: Claude replaces `/` with `-`, so `/Users/me/code/foo` → `-Users-me-code-foo`
 - **Single-pass scan**: `parser::scan_session` reads the whole file once, extracting head meta (title/branch/slug/cwd/first ts), tail meta (last human message/ts/`/rename`), AI title (`type:"ai-title"`), permission mode, Claude Code version, skills (`attributionSkill`), changed files (`file-history-snapshot` → `trackedFileBackups`), tickets, and the human message count. Title/`left off` are derived from the human messages it finds — no separate head/tail seek
 - **Human message detection**: `type=="user"` AND `message.content` is string AND no `toolUseResult` AND `isMeta` is not true AND the content isn't command noise (starts with `<command-name>`, `<local-command-stdout>`, `<task-notification>`, `<system-reminder>`, …). Command-only sessions fall back to the slash-command name as title
-- **Index cache**: bincode serialized with version header. `INDEX_VERSION` is **5** — bump it whenever `SessionMeta` *or scan semantics* change
+- **Index cache**: bincode serialized with version header. `INDEX_VERSION` is **6** — bump it whenever `SessionMeta` *or scan semantics* change
 - **Session name priority**: `/rename` value > `aiTitle` > `slug` field > empty
 - **View pipeline**: search → scope (cwd vs all) → size filter → sort (bookmarked first, then by current sort mode: date/size/duration/messages)
 - **Preview cache**: FIFO-ordered HashMap, max 10 entries. Toggling tool activity (`T`) clears it so lines re-extract
@@ -62,7 +62,7 @@ CLI flags (see `src/main.rs` / README): default browses sessions for cwd; `--all
 
 ## Release / publish
 
-Releases are tagged `vX.Y.Z` (latest `v1.0.1`). Flow:
+Releases are tagged `vX.Y.Z` (latest `v1.1.0`). Flow:
 
 1. Bump `version` in `Cargo.toml`.
 2. Commit (conventional commit, ticket at end) and tag: `git tag vX.Y.Z`.

@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-pub const INDEX_VERSION: u32 = 5;
+pub const INDEX_VERSION: u32 = 6;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionIndex {
@@ -99,7 +99,7 @@ pub fn scan_session_file(path: &Path) -> Option<(SessionMeta, Vec<u8>)> {
     let branch_lc = branch.to_lowercase();
     let changed_files_lc = scan.changed_files.join("\n").to_lowercase();
 
-    let text_bytes = scan.human_text_lc.into_bytes();
+    let text_bytes = scan.search_text_lc.into_bytes();
 
     let meta = SessionMeta {
         id,
