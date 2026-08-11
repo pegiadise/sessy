@@ -4,7 +4,7 @@ TUI session manager for Claude Code — browse, search, preview, and resume conv
 
 FOSS Rust CLI, published on crates.io (`cargo install sessy`). Doubles as a studio lead-gen footprint: the crate `homepage`/`repository` metadata and README backlink point to agileturtles.gr (see `Cargo.toml`).
 
-- **Crate / binary**: `sessy` — current published version **1.1.0** (matches `Cargo.toml`; verify there before assuming).
+- **Crate / binary**: `sessy` — current published version **1.2.0** (matches `Cargo.toml`; verify there before assuming).
 - **Repo**: github.com/pegiadise/sessy (also a git checkout here).
 - License MIT, Rust 2024 edition, MSRV 1.86.
 
@@ -16,6 +16,7 @@ src/
   app.rs        — App state; focus/view modes; sort/scope/size filter; bookmark/search; tools/files/help toggles
   ui.rs         — Two-pane ratatui rendering: session list + preview/files + timeline + help overlay + status bar
   index.rs      — Filesystem scanner, bincode cache (~/.cache/sessy/index.bin), incremental rebuild
+  input.rs      — TextInput: single-line editor with movable cursor (search bars)
   parser.rs     — JSONL single-pass scanner; human message detection; conversation extraction (with optional tool lines)
   session.rs    — SessionMeta struct, formatting helpers (duration, file size, size category)
   preview.rs    — Background thread preview loader with mpsc channel and FIFO cache
@@ -62,7 +63,7 @@ CLI flags (see `src/main.rs` / README): default browses sessions for cwd; `--all
 
 ## Release / publish
 
-Releases are tagged `vX.Y.Z` (latest `v1.1.0`). Flow:
+Releases are tagged `vX.Y.Z` (latest `v1.2.0`). Flow:
 
 1. Bump `version` in `Cargo.toml`.
 2. Commit (conventional commit, ticket at end) and tag: `git tag vX.Y.Z`.

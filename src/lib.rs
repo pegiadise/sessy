@@ -3,6 +3,7 @@ pub mod bookmarks;
 pub mod config;
 pub mod export;
 pub mod index;
+pub mod input;
 pub mod parser;
 pub mod preview;
 pub mod session;

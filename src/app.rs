@@ -1,3 +1,4 @@
+use crate::input::TextInput;
 use crate::parser::Speaker;
 use crate::session::SessionMeta;
 use crate::text_cache::TextCache;
@@ -79,7 +80,7 @@ pub struct App {
     pub filtered_indices: Vec<usize>,
     pub selected: usize,
     pub preview_scroll: u16,
-    pub search_query: String,
+    pub search_query: TextInput,
     pub focus: Focus,
     pub action: AppAction,
     pub print_mode: bool,
@@ -95,7 +96,7 @@ pub struct App {
     pub size_filter: Option<&'static str>,
     pub bookmarks: HashSet<String>,
     pub text_cache: TextCache,
-    pub preview_search_query: String,
+    pub preview_search_query: TextInput,
     pub preview_search_matches: Vec<usize>,
     pub preview_search_current: usize,
     pub view_mode: ViewMode,
@@ -133,7 +134,7 @@ impl App {
             filtered_indices,
             selected: 0,
             preview_scroll: 0,
-            search_query: String::new(),
+            search_query: TextInput::default(),
             focus: Focus::List,
             action: AppAction::None,
             print_mode,
@@ -149,7 +150,7 @@ impl App {
             size_filter: None,
             bookmarks,
             text_cache,
-            preview_search_query: String::new(),
+            preview_search_query: TextInput::default(),
             preview_search_matches: Vec::new(),
             preview_search_current: 0,
             view_mode: ViewMode::Normal,
@@ -318,8 +319,8 @@ impl App {
         use memchr::memmem::Finder;
         use rayon::prelude::*;
 
-        let query_lc = self.search_query.to_lowercase();
-        let query_upper = self.search_query.to_ascii_uppercase();
+        let query_lc = self.search_query.text().to_lowercase();
+        let query_upper = self.search_query.text().to_ascii_uppercase();
         let is_ticket_form = is_ticket_query(&query_upper);
         let tokens: Vec<&str> = query_lc.split_whitespace().collect();
         if tokens.is_empty() {
@@ -530,7 +531,7 @@ impl App {
     }
 
     pub fn update_preview_search(&mut self) {
-        let query_lc = self.preview_search_query.to_lowercase();
+        let query_lc = self.preview_search_query.text().to_lowercase();
         if query_lc.is_empty() {
             self.preview_search_matches.clear();
             self.preview_search_current = 0;
@@ -608,7 +609,7 @@ impl App {
             Some(t) => t,
             None => return 0,
         };
-        let query_lc = self.preview_search_query.to_lowercase();
+        let query_lc = self.preview_search_query.text().to_lowercase();
         if query_lc.is_empty() {
             return 0;
         }

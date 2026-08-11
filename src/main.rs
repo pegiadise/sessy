@@ -339,108 +339,99 @@ fn run_event_loop<B: ratatui::backend::Backend<Error = io::Error>>(
 }
 
 fn handle_search_key(app: &mut App, key: KeyEvent) {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let cmd = key.modifiers.contains(KeyModifiers::SUPER);
-
-    let mut mutated = false;
     match key.code {
         KeyCode::Esc => {
             app.handle_esc();
-            return;
         }
         KeyCode::Enter => {
             app.focus = Focus::List;
-            return;
         }
-        KeyCode::Backspace if alt => {
-            delete_word_backwards(&mut app.search_query);
-            mutated = true;
+        _ => {
+            if handle_text_input_key(&mut app.search_query, key) {
+                app.apply_search();
+                preview::request_preview(app);
+            }
         }
-        KeyCode::Backspace if cmd => {
-            app.search_query.clear();
-            mutated = true;
-        }
-        KeyCode::Backspace => {
-            app.search_query.pop();
-            mutated = true;
-        }
-        KeyCode::Char('w') if ctrl => {
-            delete_word_backwards(&mut app.search_query);
-            mutated = true;
-        }
-        KeyCode::Char('u') if ctrl => {
-            app.search_query.clear();
-            mutated = true;
-        }
-        KeyCode::Char(c) if !ctrl && !alt && !cmd => {
-            app.search_query.push(c);
-            mutated = true;
-        }
-        _ => {}
-    }
-    if mutated {
-        app.apply_search();
-        preview::request_preview(app);
     }
 }
 
 fn handle_preview_search_key(app: &mut App, key: KeyEvent) {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let cmd = key.modifiers.contains(KeyModifiers::SUPER);
-
-    let mut mutated = false;
     match key.code {
         // Esc cancels; Enter commits the search so n/N can walk the matches.
         KeyCode::Esc => {
             app.exit_preview_search();
-            return;
         }
         KeyCode::Enter => {
             app.commit_preview_search();
-            return;
         }
-        KeyCode::Backspace if alt => {
-            delete_word_backwards(&mut app.preview_search_query);
-            mutated = true;
+        _ => {
+            if handle_text_input_key(&mut app.preview_search_query, key) {
+                app.update_preview_search();
+            }
         }
-        KeyCode::Backspace if cmd => {
-            app.preview_search_query.clear();
-            mutated = true;
-        }
-        KeyCode::Backspace => {
-            app.preview_search_query.pop();
-            mutated = true;
-        }
-        KeyCode::Char('w') if ctrl => {
-            delete_word_backwards(&mut app.preview_search_query);
-            mutated = true;
-        }
-        KeyCode::Char('u') if ctrl => {
-            app.preview_search_query.clear();
-            mutated = true;
-        }
-        KeyCode::Char(c) if !ctrl && !alt && !cmd => {
-            app.preview_search_query.push(c);
-            mutated = true;
-        }
-        _ => {}
-    }
-    if mutated {
-        app.update_preview_search();
     }
 }
 
-/// Readline-style: strip trailing whitespace, then drop the previous word.
-/// `"hello world "` → `"hello"`, `"hello"` → `""`.
-fn delete_word_backwards(s: &mut String) {
-    while s.chars().next_back().is_some_and(|c| c.is_whitespace()) {
-        s.pop();
+/// Shared line editing for the search inputs: cursor movement (arrows, word
+/// jumps, Home/End and their macOS/readline synonyms) and edits at the cursor.
+/// Returns true when the text changed (cursor-only moves return false).
+fn handle_text_input_key(input: &mut sessy::input::TextInput, key: KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let cmd = key.modifiers.contains(KeyModifiers::SUPER);
+
+    match key.code {
+        KeyCode::Backspace if alt || ctrl => input.delete_word_backwards(),
+        KeyCode::Backspace if cmd => input.delete_to_start(),
+        KeyCode::Backspace => input.backspace(),
+        KeyCode::Delete => input.delete_forward(),
+        KeyCode::Char('w') if ctrl => input.delete_word_backwards(),
+        KeyCode::Char('u') if ctrl => input.delete_to_start(),
+        KeyCode::Char('k') if ctrl => input.delete_to_end(),
+        KeyCode::Left if alt || ctrl => {
+            input.move_word_left();
+            return false;
+        }
+        KeyCode::Right if alt || ctrl => {
+            input.move_word_right();
+            return false;
+        }
+        KeyCode::Left if cmd => {
+            input.move_home();
+            return false;
+        }
+        KeyCode::Right if cmd => {
+            input.move_end();
+            return false;
+        }
+        KeyCode::Left => {
+            input.move_left();
+            return false;
+        }
+        KeyCode::Right => {
+            input.move_right();
+            return false;
+        }
+        KeyCode::Home => {
+            input.move_home();
+            return false;
+        }
+        KeyCode::End => {
+            input.move_end();
+            return false;
+        }
+        KeyCode::Char('a') if ctrl => {
+            input.move_home();
+            return false;
+        }
+        KeyCode::Char('e') if ctrl => {
+            input.move_end();
+            return false;
+        }
+        KeyCode::Char(c) if !ctrl && !alt && !cmd => input.insert(c),
+        _ => return false,
     }
-    while s.chars().next_back().is_some_and(|c| !c.is_whitespace()) {
-        s.pop();
-    }
+    true
 }
 
 fn handle_preview_key(app: &mut App, code: KeyCode) {
@@ -623,7 +614,7 @@ mod tests {
         app.focus = Focus::Search;
         app.search_query = "hello world".into();
         handle_search_key(&mut app, key(KeyCode::Backspace, KeyModifiers::SUPER));
-        assert_eq!(app.search_query, "");
+        assert_eq!(app.search_query.text(), "");
     }
 
     #[test]
@@ -632,7 +623,7 @@ mod tests {
         app.focus = Focus::Search;
         app.search_query = "hello world".into();
         handle_search_key(&mut app, key(KeyCode::Backspace, KeyModifiers::ALT));
-        assert_eq!(app.search_query, "hello ");
+        assert_eq!(app.search_query.text(), "hello ");
     }
 
     #[test]
@@ -640,7 +631,54 @@ mod tests {
         let mut app = test_app();
         app.focus = Focus::Search;
         handle_search_key(&mut app, key(KeyCode::Char('A'), KeyModifiers::SHIFT));
-        assert_eq!(app.search_query, "A");
+        assert_eq!(app.search_query.text(), "A");
+    }
+
+    #[test]
+    fn arrows_move_cursor_and_edit_mid_string() {
+        let mut app = test_app();
+        app.focus = Focus::Search;
+        app.search_query = "helo world".into();
+        // ⌘← to start, then → →, then insert the missing 'l'.
+        handle_search_key(&mut app, key(KeyCode::Left, KeyModifiers::SUPER));
+        handle_search_key(&mut app, key(KeyCode::Right, KeyModifiers::NONE));
+        handle_search_key(&mut app, key(KeyCode::Right, KeyModifiers::NONE));
+        handle_search_key(&mut app, key(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.search_query.text(), "hello world");
+    }
+
+    #[test]
+    fn alt_arrows_jump_words_and_backspace_deletes_before_cursor() {
+        let mut app = test_app();
+        app.focus = Focus::Search;
+        app.search_query = "hello brave world".into();
+        // ⌥← twice → cursor at start of "brave"; ⌥⌫ deletes "hello ".
+        handle_search_key(&mut app, key(KeyCode::Left, KeyModifiers::ALT));
+        handle_search_key(&mut app, key(KeyCode::Left, KeyModifiers::ALT));
+        handle_search_key(&mut app, key(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(app.search_query.text(), "brave world");
+    }
+
+    #[test]
+    fn cmd_backspace_deletes_to_start_keeping_tail() {
+        let mut app = test_app();
+        app.focus = Focus::Search;
+        app.search_query = "hello world".into();
+        handle_search_key(&mut app, key(KeyCode::Left, KeyModifiers::ALT));
+        handle_search_key(&mut app, key(KeyCode::Backspace, KeyModifiers::SUPER));
+        assert_eq!(app.search_query.text(), "world");
+    }
+
+    #[test]
+    fn cursor_moves_do_not_reset_selection() {
+        // Cursor-only keys must not rebuild the view (which resets selection).
+        let mut app = test_app();
+        app.focus = Focus::Search;
+        app.search_query = "abc".into();
+        app.selected = 3;
+        handle_search_key(&mut app, key(KeyCode::Left, KeyModifiers::NONE));
+        handle_search_key(&mut app, key(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.selected, 3);
     }
 
     #[test]
@@ -649,7 +687,7 @@ mod tests {
         app.focus = Focus::PreviewSearch;
         app.preview_search_query = "hello world".into();
         handle_preview_search_key(&mut app, key(KeyCode::Backspace, KeyModifiers::SUPER));
-        assert_eq!(app.preview_search_query, "");
+        assert_eq!(app.preview_search_query.text(), "");
     }
 
     #[test]
@@ -658,50 +696,6 @@ mod tests {
         app.focus = Focus::PreviewSearch;
         app.preview_search_query = "hello world".into();
         handle_preview_search_key(&mut app, key(KeyCode::Backspace, KeyModifiers::ALT));
-        assert_eq!(app.preview_search_query, "hello ");
-    }
-
-    #[test]
-    fn delete_word_strips_trailing_space_then_word() {
-        // Readline behavior: skip trailing whitespace, then delete the
-        // word, leaving the space *before* it intact.
-        let mut s = String::from("hello world ");
-        delete_word_backwards(&mut s);
-        assert_eq!(s, "hello ");
-    }
-
-    #[test]
-    fn delete_word_no_trailing_space() {
-        let mut s = String::from("hello world");
-        delete_word_backwards(&mut s);
-        assert_eq!(s, "hello ");
-    }
-
-    #[test]
-    fn delete_word_only_one_word() {
-        let mut s = String::from("hello");
-        delete_word_backwards(&mut s);
-        assert_eq!(s, "");
-    }
-
-    #[test]
-    fn delete_word_empty_string_is_noop() {
-        let mut s = String::new();
-        delete_word_backwards(&mut s);
-        assert_eq!(s, "");
-    }
-
-    #[test]
-    fn delete_word_only_whitespace() {
-        let mut s = String::from("   ");
-        delete_word_backwards(&mut s);
-        assert_eq!(s, "");
-    }
-
-    #[test]
-    fn delete_word_handles_unicode() {
-        let mut s = String::from("καλημέρα κόσμε");
-        delete_word_backwards(&mut s);
-        assert_eq!(s, "καλημέρα ");
+        assert_eq!(app.preview_search_query.text(), "hello ");
     }
 }

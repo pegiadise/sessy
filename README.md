@@ -42,6 +42,8 @@ Scripting: `claude --resume $(sessy --print)`
 | `g` / `G` or `Home` / `End` | Jump to top / bottom |
 | `PgUp` / `PgDn` | Jump a full page |
 | `/` | Search (project, title, branch, name, changed files, tickets, full conversation text) |
+| `←`/`→`, `⌥←`/`⌥→`, `Home`/`End`/`⌘←`/`⌘→` | Move the search cursor (char / word / line) |
+| `⌫`, `⌥⌫`, `⌘⌫` | Delete char / word / to line start (also `Ctrl+W`, `Ctrl+U`, `Ctrl+K` to line end) |
 | `s` | Cycle sort: date → size → duration → messages |
 | `1` `2` `3` `4` | Filter by size: quick / medium / deep / massive (`0` clears) |
 | `a` | Toggle scope: current directory ↔ all projects |

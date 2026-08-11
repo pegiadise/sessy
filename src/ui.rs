@@ -1,4 +1,5 @@
 use crate::app::{App, Focus, Scope, ViewMode};
+use crate::input::TextInput;
 use crate::parser::Speaker;
 use crate::session::{format_duration, format_file_size, size_category};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -43,7 +44,7 @@ fn draw_search_bar(frame: &mut Frame, app: &App, area: Rect) {
             "Type / to search...".to_string()
         }
     } else {
-        app.search_query.clone()
+        app.search_query.text().to_string()
     };
 
     let search_title = if !app.search_query.is_empty() {
@@ -546,7 +547,7 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         let p = Paragraph::new(msg).style(Style::default().fg(Color::DarkGray));
         frame.render_widget(p, preview_area);
     } else {
-        let search_query_lower = app.preview_search_query.to_lowercase();
+        let search_query_lower = app.preview_search_query.text().to_lowercase();
         let has_search = !search_query_lower.is_empty();
         let current_match_idx = app
             .preview_search_matches
@@ -621,7 +622,7 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                &app.preview_search_query,
+                app.preview_search_query.text(),
                 Style::default().fg(Color::Yellow),
             ),
         ]);
@@ -835,8 +836,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
 
 /// Cursor column after `query`, clamped so a pasted mega-string can neither
 /// overflow u16 arithmetic nor push the cursor outside the input box.
-fn cursor_x(start: u16, query: &str, max_x: u16) -> u16 {
-    let chars = query.chars().count().min(u16::MAX as usize) as u16;
+fn cursor_x(start: u16, input: &TextInput, max_x: u16) -> u16 {
+    let chars = input.cursor_chars().min(u16::MAX as usize) as u16;
     start.saturating_add(chars).min(max_x.max(start))
 }
 
@@ -997,14 +998,21 @@ mod tests {
 
     #[test]
     fn test_cursor_x_clamps() {
-        // Normal case: start + query length.
-        assert_eq!(cursor_x(1, "ab", 40), 3);
+        // Normal case: start + cursor column (cursor at end after From).
+        assert_eq!(cursor_x(1, &TextInput::from("ab"), 40), 3);
+        // Cursor mid-string: column follows the cursor, not the text length.
+        let mut mid = TextInput::from("abcdef");
+        mid.move_word_left();
+        assert_eq!(cursor_x(1, &mid, 40), 1);
         // Clamped to the box edge.
-        assert_eq!(cursor_x(1, &"x".repeat(100), 40), 40);
+        assert_eq!(cursor_x(1, &TextInput::from("x".repeat(100).as_str()), 40), 40);
         // Degenerate box (max < start) must not underflow or move left of start.
-        assert_eq!(cursor_x(5, "abc", 2), 5);
+        assert_eq!(cursor_x(5, &TextInput::from("abc"), 2), 5);
         // Huge paste: no u16 overflow panic.
-        assert_eq!(cursor_x(u16::MAX - 1, &"y".repeat(70_000), u16::MAX), u16::MAX);
+        assert_eq!(
+            cursor_x(u16::MAX - 1, &TextInput::from("y".repeat(70_000).as_str()), u16::MAX),
+            u16::MAX
+        );
     }
 
     #[test]
