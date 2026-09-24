@@ -4,7 +4,7 @@ TUI session manager for Claude Code — browse, search, preview, and resume conv
 
 FOSS Rust CLI, published on crates.io (`cargo install sessy`). Doubles as a studio lead-gen footprint: the crate `homepage`/`repository` metadata and README backlink point to agileturtles.gr (see `Cargo.toml`).
 
-- **Crate / binary**: `sessy` — current published version **1.2.0** (matches `Cargo.toml`; verify there before assuming).
+- **Crate / binary**: `sessy` — current version **1.3.0** (matches `Cargo.toml`; verify there before assuming).
 - **Repo**: github.com/pegiadise/sessy (also a git checkout here).
 - License MIT, Rust 2024 edition, MSRV 1.86.
 
@@ -73,11 +73,13 @@ Stdout hygiene in `--print` mode: crossterm's kitty-keyboard probe writes its qu
 
 ## Release / publish
 
-Releases are tagged `vX.Y.Z` (latest `v1.2.0`). Flow:
+Releases are tagged `vX.Y.Z` (latest `v1.3.0`). Every version has a `CHANGELOG.md` section, and that section *is* the GitHub release body — GitHub's auto-generated notes only list merged PRs, and this repo commits straight to `main`, so they come out empty. Flow:
 
-1. Bump `version` in `Cargo.toml`.
-2. Commit (conventional commit, ticket at end) and tag: `git tag vX.Y.Z`.
-3. `cargo publish` from clean git state. crates.io token lives in `~/.cargo/credentials.toml`.
-4. Push commits + tags to `main` (github.com/pegiadise/sessy).
+1. Add the version's section to `CHANGELOG.md` (Keep a Changelog: Added / Changed / Fixed, user-facing wording, no internal/employer names — the repo is public) plus its compare link at the bottom.
+2. Bump `version` in `Cargo.toml` (and the version mentions in this file).
+3. Commit (conventional commit) and tag: `git tag vX.Y.Z`.
+4. `cargo publish` from clean git state. crates.io token lives in `~/.cargo/credentials.toml`.
+5. Push commits + tags to `main` (github.com/pegiadise/sessy) — confirm with the owner first.
+6. `gh release create vX.Y.Z --title vX.Y.Z --notes-file <(scripts/release-notes.sh vX.Y.Z)` (never `--generate-notes`). To fix an existing release: `gh release edit vX.Y.Z --notes-file <(scripts/release-notes.sh vX.Y.Z)`.
 
-Package name is `sessy` on crates.io.
+Package name is `sessy` on crates.io. History quirks: 0.1.0–0.1.9 and 0.2.0–0.2.2 were published without tags; the `v1.0.0` tag points at a release commit that never landed on `main` (1.0.1 is the same code).
