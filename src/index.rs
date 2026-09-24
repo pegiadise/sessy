@@ -6,12 +6,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-pub const INDEX_VERSION: u32 = 6;
+pub const INDEX_VERSION: u32 = 7;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionIndex {
     pub version: u32,
     pub sessions: Vec<SessionMeta>,
+    /// Size of the `text.bin` written alongside this index. A mismatch on load
+    /// means the pair is out of sync (crash, or two instances racing), and the
+    /// recorded text offsets can't be trusted.
+    pub text_cache_len: u64,
 }
 
 pub fn index_cache_path() -> PathBuf {
@@ -31,11 +35,29 @@ pub fn encode_project_path(path: &str) -> String {
         .collect()
 }
 
+/// `~/.claude/projects`, or `$CLAUDE_CONFIG_DIR/projects` when Claude Code
+/// has been pointed at another config directory.
 pub fn claude_projects_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/"))
-        .join(".claude")
-        .join("projects")
+    let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/"))
+                .join(".claude")
+        });
+    config_dir.join("projects")
+}
+
+/// Whether a `.jsonl` file in a project dir is a resumable session. Old
+/// Claude Code versions wrote subagent transcripts (`agent-<id>.jsonl`) next
+/// to the sessions; those can't be resumed.
+fn is_session_file(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+        && !path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.starts_with("agent-"))
 }
 
 pub fn serialize_index(index: &SessionIndex) -> Vec<u8> {
@@ -127,6 +149,8 @@ pub fn scan_session_file(path: &Path) -> Option<(SessionMeta, Vec<u8>)> {
         skills: scan.skills,
         changed_files: scan.changed_files,
         changed_files_lc,
+        prs: scan.prs,
+        recap: scan.recap,
     };
     Some((meta, text_bytes))
 }
@@ -150,6 +174,7 @@ pub fn build_index(cached: Option<SessionIndex>, force_rebuild: bool) -> Session
         return SessionIndex {
             version: INDEX_VERSION,
             sessions: vec![],
+            text_cache_len: 0,
         };
     }
 
@@ -175,9 +200,7 @@ pub fn build_index(cached: Option<SessionIndex>, force_rebuild: bool) -> Session
             if let Ok(files) = fs::read_dir(&proj_dir) {
                 for file_entry in files.flatten() {
                     let path = file_entry.path();
-                    if path.extension().and_then(|e| e.to_str()) == Some("jsonl")
-                        && path.is_file()
-                    {
+                    if is_session_file(&path) && path.is_file() {
                         file_entries.push(path);
                     }
                 }
@@ -223,14 +246,28 @@ pub fn build_index(cached: Option<SessionIndex>, force_rebuild: bool) -> Session
         Ok(o) => o,
         Err(e) => {
             eprintln!("sessy: failed to write text cache: {}", e);
-            // If we can't write text.bin, return empty so the next launch retries.
+            // Without text.bin, full-text search just finds nothing; keep the
+            // sessions browsable. A zero cache length forces a rescan next time.
+            let sessions = scanned
+                .into_iter()
+                .map(|(mut meta, _)| {
+                    meta.text_offset = 0;
+                    meta.text_len = 0;
+                    meta
+                })
+                .collect();
             return SessionIndex {
                 version: INDEX_VERSION,
-                sessions: vec![],
+                sessions,
+                text_cache_len: u64::MAX,
             };
         }
     };
 
+    let text_cache_len = offsets
+        .last()
+        .map(|&(offset, len)| offset + len as u64)
+        .unwrap_or(0);
     let sessions: Vec<SessionMeta> = scanned
         .into_iter()
         .zip(offsets)
@@ -244,6 +281,7 @@ pub fn build_index(cached: Option<SessionIndex>, force_rebuild: bool) -> Session
     SessionIndex {
         version: INDEX_VERSION,
         sessions,
+        text_cache_len,
     }
 }
 
@@ -251,14 +289,8 @@ pub fn load_cached_index() -> Option<SessionIndex> {
     let path = index_cache_path();
     let bytes = fs::read(&path).ok()?;
     let index = deserialize_index(&bytes)?;
-    let text_cache = TextCache::open(&text_cache_path());
-    let max_end: u64 = index
-        .sessions
-        .iter()
-        .map(|s| s.text_offset + s.text_len as u64)
-        .max()
-        .unwrap_or(0);
-    if (text_cache.len() as u64) < max_end {
+    let text_len = fs::metadata(text_cache_path()).map(|m| m.len()).unwrap_or(0);
+    if text_len != index.text_cache_len {
         return None;
     }
     Some(index)
@@ -267,7 +299,12 @@ pub fn load_cached_index() -> Option<SessionIndex> {
 pub fn save_index(index: &SessionIndex) {
     let path = index_cache_path();
     let bytes = serialize_index(index);
-    fs::write(&path, bytes).ok();
+    // Write-then-rename so a crash or a concurrent instance never leaves a
+    // half-written index behind.
+    let tmp = path.with_extension(format!("bin.{}.tmp", std::process::id()));
+    if fs::write(&tmp, bytes).is_ok() && fs::rename(&tmp, &path).is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
 }
 
 pub fn parse_recent_filter(s: &str) -> Option<u64> {
@@ -275,13 +312,15 @@ pub fn parse_recent_filter(s: &str) -> Option<u64> {
     let unit = s.chars().last()?;
     let num_str = &s[..s.len() - unit.len_utf8()];
     let num: u64 = num_str.parse().ok()?;
-    match unit {
-        'h' => Some(num * 3600),
-        'd' => Some(num * 86400),
-        'w' => Some(num * 7 * 86400),
-        'm' => Some(num * 30 * 86400),
-        _ => None,
-    }
+    let unit_secs: u64 = match unit {
+        'h' => 3600,
+        'd' => 86400,
+        'w' => 7 * 86400,
+        'm' => 30 * 86400,
+        _ => return None,
+    };
+    // Reject absurd windows instead of overflowing into a bogus cutoff.
+    num.checked_mul(unit_secs).filter(|&secs| secs <= i64::MAX as u64)
 }
 
 #[cfg(test)]
@@ -360,10 +399,13 @@ mod tests {
             skills: vec![],
             changed_files: vec![],
             changed_files_lc: String::new(),
+            prs: vec![],
+            recap: String::new(),
         }];
         let index = SessionIndex {
             version: INDEX_VERSION,
             sessions,
+            text_cache_len: 0,
         };
         let bytes = serialize_index(&index);
         let restored = deserialize_index(&bytes);
@@ -379,6 +421,7 @@ mod tests {
         let index = SessionIndex {
             version: 999,
             sessions: vec![],
+            text_cache_len: 0,
         };
         let bytes = serialize_index(&index);
         let restored = deserialize_index(&bytes);
@@ -411,5 +454,15 @@ mod tests {
         assert_eq!(parse_recent_filter("2w"), Some(14 * 86400));
         assert_eq!(parse_recent_filter("1m"), Some(30 * 86400));
         assert_eq!(parse_recent_filter("garbage"), None);
+        assert_eq!(parse_recent_filter("d"), None);
+        assert_eq!(parse_recent_filter("99999999999999999999d"), None);
+        assert_eq!(parse_recent_filter("999999999999999w"), None);
+    }
+
+    #[test]
+    fn test_agent_transcripts_are_not_sessions() {
+        assert!(is_session_file(Path::new("/p/-a/1b2c.jsonl")));
+        assert!(!is_session_file(Path::new("/p/-a/agent-a5c3eb79.jsonl")));
+        assert!(!is_session_file(Path::new("/p/-a/notes.txt")));
     }
 }

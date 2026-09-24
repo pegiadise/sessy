@@ -27,12 +27,14 @@ pub enum Role {
 }
 
 /// Who produced a preview line. `Tool` lines are only emitted when tool
-/// activity is requested.
+/// activity is requested; `Recap` is Claude Code's "while you were away"
+/// summary, pinned to the top of the preview.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Speaker {
     User,
     Assistant,
     Tool,
+    Recap,
 }
 
 impl Speaker {
@@ -42,15 +44,7 @@ impl Speaker {
             Speaker::User => "USER: ",
             Speaker::Assistant => "ASST: ",
             Speaker::Tool => "TOOL: ",
-        }
-    }
-
-    /// Lowercased prefix, used when wrapping pre-lowercased text for search.
-    pub fn prefix_lc(self) -> &'static str {
-        match self {
-            Speaker::User => "user: ",
-            Speaker::Assistant => "asst: ",
-            Speaker::Tool => "tool: ",
+            Speaker::Recap => "RECAP ",
         }
     }
 }
@@ -59,6 +53,14 @@ impl Speaker {
 pub struct ConversationMessage {
     pub role: Role,
     pub text: String,
+}
+
+/// A pull request Claude Code linked to the session (`type: "pr-link"`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PrLink {
+    pub repo: String,
+    pub number: u64,
+    pub url: String,
 }
 
 pub struct HeadMeta {
@@ -75,78 +77,199 @@ pub struct TailMeta {
     pub rename: String,
 }
 
-fn is_human_message(entry: &Value) -> bool {
-    entry.get("type").and_then(|t| t.as_str()) == Some("user")
-        && entry.get("isMeta").and_then(|m| m.as_bool()) != Some(true)
-        && entry.get("toolUseResult").is_none()
-        && entry
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .is_some_and(|c| !is_command_noise(c))
+fn flag(entry: &Value, key: &str) -> bool {
+    entry.get(key).and_then(|v| v.as_bool()) == Some(true)
+}
+
+/// Text of a turn the person actually typed, or `None` for everything else
+/// stored as `type:"user"`: tool results, injected/meta turns, compaction
+/// summaries, messages from other sessions or background tasks, interrupt
+/// markers, and command noise. Handles both content forms — a plain string,
+/// and a block array (text + pasted images). A slash command typed with
+/// arguments counts as a human turn ("/loop fix the tests").
+pub fn human_text(entry: &Value) -> Option<String> {
+    if entry.get("type").and_then(|t| t.as_str()) != Some("user")
+        || flag(entry, "isMeta")
+        || flag(entry, "isCompactSummary")
+        || flag(entry, "isVisibleInTranscriptOnly")
+        || entry.get("toolUseResult").is_some()
+    {
+        return None;
+    }
+    // Newer Claude Code tags every turn with its origin; only "human" is typed.
+    if let Some(kind) = entry
+        .get("origin")
+        .and_then(|o| o.get("kind"))
+        .and_then(|k| k.as_str())
+    {
+        if kind != "human" {
+            return None;
+        }
+    }
+    let content = entry.get("message")?.get("content")?;
+    let text = match content {
+        Value::String(s) => s.trim().to_string(),
+        Value::Array(blocks) => {
+            let mut parts: Vec<&str> = Vec::new();
+            let mut has_image = false;
+            for block in blocks {
+                match block.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => {
+                        if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                            parts.push(t);
+                        }
+                    }
+                    Some("image") => has_image = true,
+                    Some("tool_result") => return None,
+                    _ => {}
+                }
+            }
+            let joined = parts.join("\n").trim().to_string();
+            if joined.is_empty() && has_image {
+                "[Image]".to_string()
+            } else {
+                joined
+            }
+        }
+        _ => return None,
+    };
+    if text.is_empty() || text.starts_with("[Request interrupted by user") {
+        return None;
+    }
+    if is_command_noise(&text) {
+        return command_invocation(&text);
+    }
+    Some(text)
 }
 
 /// Machine-generated content stored as `type:"user"` turns — slash-command
-/// invocations, local command output, background-task notifications. These
-/// must not drive titles, "left off", message counts, search text, or
-/// preview lines.
+/// invocations, local command output, bash-mode I/O, background-task
+/// notifications. These must not drive titles, "left off", message counts,
+/// search text, or preview lines (slash commands with arguments excepted, see
+/// `command_invocation`).
 fn is_command_noise(text: &str) -> bool {
+    const NOISE: &[&str] = &[
+        "<command-name>",
+        "<command-message>",
+        "<local-command-stdout>",
+        "<local-command-stderr>",
+        "<local-command-caveat>",
+        "<task-notification>",
+        "<system-reminder>",
+        "<bash-input>",
+        "<bash-stdout>",
+        "<bash-stderr>",
+        "<user-memory-input>",
+        "<user-prompt-submit-hook>",
+    ];
     let t = text.trim_start();
-    t.starts_with("<command-name>")
-        || t.starts_with("<command-message>")
-        || t.starts_with("<local-command-stdout>")
-        || t.starts_with("<local-command-caveat>")
-        || t.starts_with("<task-notification>")
-        || t.starts_with("<system-reminder>")
+    NOISE.iter().any(|p| t.starts_with(p))
+}
+
+/// Content between `<tag>` and the *following* `</tag>`. Returns `None` when
+/// either tag is missing or the closing tag only appears before the opening
+/// one (malformed/truncated content must not panic).
+fn extract_tag<'a>(content: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let start = content.find(&open)? + open.len();
+    let end_rel = content[start..].find(&close)?;
+    Some(&content[start..start + end_rel])
+}
+
+fn extract_command_args(content: &str) -> Option<&str> {
+    extract_tag(content, "command-args")
+}
+
+/// "/name args" for a slash command typed with arguments — that's what the
+/// person wrote. `None` for argument-less commands (/clear, /model, …).
+fn command_invocation(content: &str) -> Option<String> {
+    let args = extract_command_args(content)?.trim();
+    if args.is_empty() {
+        return None;
+    }
+    let name = extract_tag(content, "command-name")?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(format!("{} {}", name, args))
 }
 
 /// Fallback headline for sessions containing only command noise: the slash
 /// command that was run, or a generic label.
 fn command_noise_title(content: &str) -> String {
-    const OPEN: &str = "<command-name>";
-    const CLOSE: &str = "</command-name>";
-    if let Some(start) = content.find(OPEN) {
-        let rest = &content[start + OPEN.len()..];
-        if let Some(end) = rest.find(CLOSE) {
-            let name = rest[..end].trim();
-            if !name.is_empty() {
-                return name.to_string();
+    match extract_tag(content, "command-name").map(str::trim) {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => "(command output)".to_string(),
+    }
+}
+
+/// Drop control characters (ANSI escapes in pasted logs, stray `\r`) that
+/// would corrupt the terminal or shift columns. Tabs become spaces.
+pub fn sanitize_line(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\t' => out.push_str("    "),
+            // Skip CSI sequences whole (ESC [ … final byte) so no residue like
+            // "[31m" is left behind.
+            '\u{1b}' => {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    for n in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
+                    }
+                }
             }
+            c if c.is_control() => {}
+            c => out.push(c),
         }
     }
-    "(command output)".to_string()
+    out
 }
 
-fn human_message_text(entry: &Value) -> Option<String> {
-    entry
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .map(|s| {
-            let trimmed = s.trim();
-            if trimmed.chars().count() > 200 {
-                let end = trimmed
-                    .char_indices()
-                    .nth(200)
-                    .map(|(i, _)| i)
-                    .unwrap_or(trimmed.len());
-                format!("{}…", &trimmed[..end])
-            } else {
-                trimmed.to_string()
+/// Collapse a message to a single display line for titles and "left off":
+/// `<pasted_content …>` wrapper tags removed (their text kept), all whitespace
+/// runs (including newlines) folded to one space, control characters dropped,
+/// and capped at `max_chars` with an ellipsis.
+pub fn one_line(text: &str, max_chars: usize) -> String {
+    let mut stripped = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find("<pasted_content") {
+        stripped.push_str(&rest[..pos]);
+        stripped.push(' ');
+        rest = match rest[pos..].find('>') {
+            Some(end) => &rest[pos + end + 1..],
+            None => "",
+        };
+    }
+    stripped.push_str(rest);
+    let stripped = stripped.replace("</pasted_content>", " ");
+
+    let stripped = sanitize_line(&stripped.replace(['\n', '\t'], " "));
+
+    let mut out = String::with_capacity(stripped.len().min(max_chars * 4));
+    let mut count = 0;
+    for word in stripped.split_whitespace() {
+        if count > 0 {
+            out.push(' ');
+            count += 1;
+        }
+        for c in word.chars() {
+            if count >= max_chars {
+                let kept = out.trim_end().len();
+                out.truncate(kept);
+                out.push('…');
+                return out;
             }
-        })
-}
-
-
-/// Pull the text between `<command-args>` and the *following* `</command-args>`.
-/// Returns `None` when either tag is missing or the closing tag only appears
-/// before the opening one (malformed/truncated content must not panic).
-fn extract_command_args(content: &str) -> Option<&str> {
-    const OPEN: &str = "<command-args>";
-    const CLOSE: &str = "</command-args>";
-    let start = content.find(OPEN)? + OPEN.len();
-    let end_rel = content[start..].find(CLOSE)?;
-    Some(&content[start..start + end_rel])
+            out.push(c);
+            count += 1;
+        }
+    }
+    out
 }
 
 fn push_search_text(out: &mut String, text: &str) {
@@ -161,7 +284,8 @@ fn push_search_text(out: &mut String, text: &str) {
 /// Accumulate every piece of human-readable text in an entry into the search
 /// text: user messages (string or block form), assistant text and thinking,
 /// tool-use string inputs (commands, paths, …), and tool-result output.
-/// Command noise is filtered; images and JSON structure are not indexed.
+/// Command noise is filtered (a slash command's arguments are kept); images
+/// and JSON structure are not indexed.
 fn append_searchable_text(entry: &Value, out: &mut String) {
     let Some(content) = entry.get("message").and_then(|m| m.get("content")) else {
         return;
@@ -170,6 +294,8 @@ fn append_searchable_text(entry: &Value, out: &mut String) {
         Value::String(s) => {
             if !is_command_noise(s) {
                 push_search_text(out, s);
+            } else if let Some(cmd) = command_invocation(s) {
+                push_search_text(out, &cmd);
             }
         }
         Value::Array(blocks) => {
@@ -215,6 +341,26 @@ fn append_searchable_text(entry: &Value, out: &mut String) {
     }
 }
 
+/// Claude Code's "while you were away" recap text, without the settings hint
+/// it appends.
+fn recap_text(entry: &Value) -> Option<String> {
+    if entry.get("type").and_then(|t| t.as_str()) != Some("system")
+        || entry.get("subtype").and_then(|s| s.as_str()) != Some("away_summary")
+    {
+        return None;
+    }
+    let content = entry.get("content").and_then(|c| c.as_str())?.trim();
+    let content = content
+        .strip_suffix("(disable recaps in /config)")
+        .unwrap_or(content)
+        .trim();
+    if content.is_empty() {
+        None
+    } else {
+        Some(content.to_string())
+    }
+}
+
 pub struct ScanResult {
     pub head: HeadMeta,
     pub tail: Option<TailMeta>,
@@ -231,10 +377,14 @@ pub struct ScanResult {
     pub cc_version: String,
     /// Distinct `attributionSkill` values, sorted.
     pub skills: Vec<String>,
-    /// Sorted union of `trackedFileBackups` paths across file-history snapshots.
+    /// Sorted union of tracked file paths across file-history snapshots and deltas.
     pub changed_files: Vec<String>,
-    /// Count of non-empty human messages.
+    /// Count of human messages outside sidechains.
     pub message_count: u32,
+    /// Linked pull requests, in the order they were first linked.
+    pub prs: Vec<PrLink>,
+    /// Latest "while you were away" recap, if any.
+    pub recap: String,
 }
 
 pub fn scan_session(path: &Path) -> Option<ScanResult> {
@@ -251,7 +401,8 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
     };
     let mut last_human_message = String::new();
     let mut last_timestamp = String::new();
-    let mut rename = String::new();
+    let mut custom_title = String::new();
+    let mut legacy_rename = String::new();
     let mut fallback_title = String::new();
     let mut search_text_lc = String::new();
     let mut tickets_set: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -261,6 +412,8 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
     let mut skills_set: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut changed_files_set: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut message_count: u32 = 0;
+    let mut prs: Vec<PrLink> = Vec::new();
+    let mut recap = String::new();
 
     for line in reader.lines() {
         let line = match line {
@@ -284,7 +437,13 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
         match entry.get("type").and_then(|t| t.as_str()) {
             Some("ai-title") => {
                 if let Some(t) = entry.get("aiTitle").and_then(|t| t.as_str()) {
-                    ai_title = t.to_string();
+                    ai_title = one_line(t, 200);
+                }
+            }
+            // `/rename` (and Claude Code's own naming) persists the title here.
+            Some("custom-title") => {
+                if let Some(t) = entry.get("customTitle").and_then(|t| t.as_str()) {
+                    custom_title = one_line(t, 200);
                 }
             }
             Some("permission-mode") => {
@@ -303,7 +462,35 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
                     }
                 }
             }
+            // Newer Claude Code records edits one file at a time.
+            Some("file-history-delta") => {
+                if let Some(p) = entry.get("trackingPath").and_then(|p| p.as_str()) {
+                    changed_files_set.insert(p.to_string());
+                }
+            }
+            Some("pr-link") => {
+                let number = entry.get("prNumber").and_then(|n| n.as_u64());
+                let url = entry.get("prUrl").and_then(|u| u.as_str()).unwrap_or("");
+                if let Some(number) = number {
+                    if !prs.iter().any(|p| p.number == number && p.url == url) {
+                        prs.push(PrLink {
+                            repo: entry
+                                .get("prRepository")
+                                .and_then(|r| r.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            number,
+                            url: url.to_string(),
+                        });
+                    }
+                    // `#123` finds the session through ticket search.
+                    tickets_set.insert(format!("#{}", number));
+                }
+            }
             _ => {}
+        }
+        if let Some(r) = recap_text(&entry) {
+            recap = one_line(&r, 1000);
         }
         if cc_version.is_empty() {
             if let Some(v) = entry.get("version").and_then(|v| v.as_str()) {
@@ -357,46 +544,47 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
             }
         }
 
-        if is_human_message(&entry) {
-            if let Some(full) = entry
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-            {
-                let trimmed = full.trim();
-                if !trimmed.is_empty() {
-                    // Count only non-sidechain turns, to match the conversation
-                    // preview (which skips sidechains) and the `· N msgs` label.
-                    if entry.get("isSidechain").and_then(|s| s.as_bool()) != Some(true) {
-                        message_count += 1;
-                    }
-                    if head.is_none() {
-                        let title = human_message_text(&entry).unwrap_or_default();
-                        head = Some(HeadMeta {
-                            title,
-                            branch: working_head.branch.clone(),
-                            slug: working_head.slug.clone(),
-                            first_timestamp: working_head.first_timestamp.clone(),
-                            cwd: working_head.cwd.clone(),
-                        });
-                    }
-                    if let Some(text) = human_message_text(&entry) {
-                        last_human_message = text;
-                    }
+        // Sidechain turns belong to subagents, not the person; the preview
+        // skips them, so titles and counts must too.
+        if !flag(&entry, "isSidechain") {
+            if let Some(text) = human_text(&entry) {
+                let line = one_line(&text, 200);
+                message_count += 1;
+                if head.is_none() {
+                    head = Some(HeadMeta {
+                        title: line.clone(),
+                        branch: working_head.branch.clone(),
+                        slug: working_head.slug.clone(),
+                        first_timestamp: working_head.first_timestamp.clone(),
+                        cwd: working_head.cwd.clone(),
+                    });
                 }
+                last_human_message = line;
             }
         }
 
+        // Pre-`custom-title` Claude Code only recorded /rename as a local
+        // command. A bare `/rename` (auto-generated name) has empty args and
+        // must not clear a name set earlier.
         if entry.get("subtype").and_then(|s| s.as_str()) == Some("local_command") {
             if let Some(content) = entry.get("content").and_then(|c| c.as_str()) {
                 if content.contains("<command-name>/rename</command-name>") {
                     if let Some(args) = extract_command_args(content) {
-                        rename = args.to_string();
+                        let args = one_line(args, 200);
+                        if !args.is_empty() {
+                            legacy_rename = args;
+                        }
                     }
                 }
             }
         }
     }
+
+    let rename = if custom_title.is_empty() {
+        legacy_rename
+    } else {
+        custom_title
+    };
 
     let head = match head {
         Some(h) => h,
@@ -437,6 +625,8 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
         skills,
         changed_files,
         message_count,
+        prs,
+        recap,
     })
 }
 
@@ -444,12 +634,13 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
 pub fn extract_conversation(path: &Path) -> Vec<ConversationMessage> {
     extract_conversation_ext(path, false)
         .into_iter()
-        .map(|(speaker, text)| ConversationMessage {
-            role: match speaker {
+        .filter_map(|(speaker, text)| {
+            let role = match speaker {
                 Speaker::User => Role::User,
-                _ => Role::Assistant,
-            },
-            text,
+                Speaker::Assistant => Role::Assistant,
+                Speaker::Tool | Speaker::Recap => return None,
+            };
+            Some(ConversationMessage { role, text })
         })
         .collect()
 }
@@ -478,23 +669,14 @@ pub fn extract_conversation_ext(path: &Path, include_tools: bool) -> Vec<(Speake
             Err(_) => continue,
         };
 
-        if entry.get("isSidechain").and_then(|s| s.as_bool()) == Some(true) {
+        if flag(&entry, "isSidechain") {
             continue;
         }
 
-        let entry_type = entry.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-        match entry_type {
-            "user" if is_human_message(&entry) => {
-                if let Some(text) = entry
-                    .get("message")
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| c.as_str())
-                {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        messages.push((Speaker::User, trimmed.to_string()));
-                    }
+        match entry.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+            "user" => {
+                if let Some(text) = human_text(&entry) {
+                    messages.push((Speaker::User, text));
                 }
             }
             "assistant" => {
@@ -533,17 +715,25 @@ pub fn extract_conversation_ext(path: &Path, include_tools: bool) -> Vec<(Speake
 fn summarize_tool_use(name: &str, input: Option<&Value>) -> String {
     let detail = input
         .and_then(|inp| {
-            ["file_path", "path", "command", "pattern", "query", "url", "description"]
-                .iter()
-                .find_map(|k| inp.get(*k).and_then(|v| v.as_str()))
+            [
+                "file_path",
+                "path",
+                "command",
+                "pattern",
+                "query",
+                "url",
+                "skill",
+                "description",
+                "prompt",
+            ]
+            .iter()
+            .find_map(|k| inp.get(*k).and_then(|v| v.as_str()))
         })
-        .unwrap_or("")
-        .trim()
-        .replace('\n', " ");
+        .unwrap_or("");
+    let detail = one_line(detail, 120);
     if detail.is_empty() {
         name.to_string()
     } else {
-        let detail: String = detail.chars().take(120).collect();
         format!("{} {}", name, detail)
     }
 }
@@ -882,6 +1072,82 @@ mod tests {
     fn test_extract_conversation_missing_file_returns_empty() {
         let messages = extract_conversation(Path::new("/does/not/exist.jsonl"));
         assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_scan_current_format() {
+        let r = scan_session(&fixture_path("current_format_session.jsonl")).expect("should scan");
+        // A slash command typed with arguments is what the person wrote.
+        assert_eq!(r.head.title, "/loop fix the flaky tests");
+        // /loop, the image message, the pasted message. Not: the meta
+        // expansion, the interrupt marker, the compaction summary, the task
+        // notification, or the message from another session.
+        assert_eq!(r.message_count, 3);
+        let tail = r.tail.expect("tail");
+        assert_eq!(
+            tail.last_human_message, "FAILED spec/cart_spec.rb:12 this one too",
+            "pasted_content tags stripped, newlines folded"
+        );
+        // Latest custom-title wins; a bare /rename afterwards doesn't clear it.
+        assert_eq!(tail.rename, "auth-rework");
+        assert_eq!(r.ai_title, "Fix flaky specs");
+        assert!(r.changed_files.contains(&"spec/auth_spec.rb".to_string()));
+        assert_eq!(
+            r.prs,
+            vec![PrLink {
+                repo: "acme/shop".into(),
+                number: 42,
+                url: "https://github.com/acme/shop/pull/42".into(),
+            }]
+        );
+        assert!(r.tickets.contains(&"#42".to_string()), "PR number is ticket-searchable");
+        assert_eq!(
+            r.recap,
+            "Both flaky specs are fixed and PR #42 is open. Next: merge after CI."
+        );
+        assert!(r.search_text_lc.contains("/loop fix the flaky tests"));
+    }
+
+    #[test]
+    fn test_extract_current_format_conversation() {
+        let lines = extract_conversation_ext(&fixture_path("current_format_session.jsonl"), false);
+        let users: Vec<&str> = lines
+            .iter()
+            .filter(|(sp, _)| *sp == Speaker::User)
+            .map(|(_, t)| t.as_str())
+            .collect();
+        assert_eq!(users.len(), 3, "got {:?}", users);
+        assert_eq!(users[0], "/loop fix the flaky tests");
+        assert_eq!(users[1], "why is this red? [Image #1]");
+        assert!(!users.iter().any(|u| u.contains("being continued")));
+        assert!(!users.iter().any(|u| u.contains("another session")));
+        // Multi-line assistant text keeps its line breaks for the preview.
+        assert!(lines.iter().any(|(sp, t)| *sp == Speaker::Assistant && t.contains("\n\n1. `auth_spec`")));
+    }
+
+    #[test]
+    fn test_image_only_message_is_a_turn() {
+        let entry: Value = serde_json::from_str(
+            r#"{"type":"user","message":{"content":[{"type":"image","source":{}}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(human_text(&entry).as_deref(), Some("[Image]"));
+    }
+
+    #[test]
+    fn test_sanitize_strips_ansi_and_controls() {
+        assert_eq!(sanitize_line("\u{1b}[31mred\u{1b}[0m\r"), "red");
+        assert_eq!(sanitize_line("a\tb"), "a    b");
+        assert_eq!(sanitize_line("bell\u{7}"), "bell");
+    }
+
+    #[test]
+    fn test_one_line_cleanup() {
+        assert_eq!(one_line("a\n\n  b\tc", 200), "a b c");
+        assert_eq!(one_line("abc def", 4), "abc…");
+        assert_eq!(one_line("x\u{1b}[31my\u{1b}[0m", 200), "xy");
+        assert_eq!(one_line("<pasted_content id=\"1\">log</pasted_content> fix", 200), "log fix");
+        assert_eq!(one_line("<pasted_content id=\"1\" truncated", 200), "");
     }
 
     #[test]

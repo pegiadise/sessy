@@ -3,6 +3,7 @@ use crate::parser::Speaker;
 use crate::session::SessionMeta;
 use crate::text_cache::TextCache;
 use std::collections::{HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -12,6 +13,7 @@ pub enum Focus {
     Search,
     Preview,
     PreviewSearch,
+    Rename,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -31,6 +33,15 @@ impl SortMode {
             SortMode::Messages => "messages",
         }
     }
+
+    fn next(self) -> SortMode {
+        match self {
+            SortMode::Date => SortMode::Size,
+            SortMode::Size => SortMode::Duration,
+            SortMode::Duration => SortMode::Messages,
+            SortMode::Messages => SortMode::Date,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -41,7 +52,8 @@ pub enum ViewMode {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Scope {
-    /// Only sessions whose path is under the launch directory's project.
+    /// Only sessions started in the launch project (git root, or the launch
+    /// directory outside a repo) or any directory below it.
     Current,
     /// Every project's sessions.
     All,
@@ -50,7 +62,7 @@ pub enum Scope {
 impl Scope {
     pub fn label(self) -> &'static str {
         match self {
-            Scope::Current => "cwd",
+            Scope::Current => "project",
             Scope::All => "all",
         }
     }
@@ -61,7 +73,6 @@ pub enum AppAction {
     None,
     Launch(usize),
     LaunchDangerously(usize),
-    Yank(usize),
     Print(usize),
     Quit,
 }
@@ -79,39 +90,58 @@ pub struct App {
     pub sessions: Vec<SessionMeta>,
     pub filtered_indices: Vec<usize>,
     pub selected: usize,
-    pub preview_scroll: u16,
+    /// First visible row of the session list (in sessions, not screen rows).
+    pub list_offset: usize,
+    /// Sessions that fit on one list page (set by the renderer each frame).
+    pub list_page_size: usize,
+    /// Preview scroll position, in wrapped rows. `usize` because long
+    /// sessions easily exceed 65k rows.
+    pub preview_scroll: usize,
     pub search_query: TextInput,
+    /// The query changed since the last search; the event loop runs the
+    /// search once after draining pending keys, so typing (or pasting) fast
+    /// doesn't search the full text once per character.
+    pub search_dirty: bool,
     pub focus: Focus,
     pub action: AppAction,
     pub print_mode: bool,
+    /// What Enter does: resume with `--dangerously-skip-permissions` (true)
+    /// or a plain resume.
+    pub enter_yolo: bool,
     pub preview_lines: Vec<(String, String, Speaker)>,
     pub preview_loading: bool,
     pub preview_session_id: String,
-    pub preview_tx: mpsc::Sender<PreviewResult>,
+    pub preview_req_tx: mpsc::Sender<crate::preview::PreviewRequest>,
     pub preview_rx: mpsc::Receiver<PreviewResult>,
     pub preview_cache: std::collections::HashMap<String, Vec<(String, String, Speaker)>>,
     pub preview_cache_order: VecDeque<String>,
     pub confirm_delete: bool,
     pub sort_mode: SortMode,
+    /// Sort applied to search results; `None` keeps relevance order.
+    pub search_sort: Option<SortMode>,
     pub size_filter: Option<&'static str>,
     pub bookmarks: HashSet<String>,
+    /// Where bookmark changes are saved; `None` keeps them in memory (tests).
+    pub bookmarks_file: Option<PathBuf>,
     pub text_cache: TextCache,
     pub preview_search_query: TextInput,
     pub preview_search_matches: Vec<usize>,
     pub preview_search_current: usize,
+    pub rename_input: TextInput,
     pub view_mode: ViewMode,
     pub status_message: Option<(String, Instant)>,
     pub terminal_height: u16,
     pub preview_inner_width: u16,
-    pub preview_line_offsets: Vec<u16>,
+    /// First wrapped row of each preview message.
+    pub preview_line_offsets: Vec<usize>,
     pub scope: Scope,
-    /// Encoded launch-directory prefix (e.g. `-Users-me-code-foo`) used by
-    /// `Scope::Current`. `None` disables scope filtering entirely.
-    pub cwd_encoded: Option<String>,
+    /// Directory `Scope::Current` covers (the launch project). `None`
+    /// disables scope filtering entirely.
+    pub scope_root: Option<PathBuf>,
     /// Total wrapped rows of the current preview (set by `recompute_preview_offsets`).
-    pub preview_total_rows: u16,
+    pub preview_total_rows: usize,
     /// Height of the preview viewport (set by the renderer each frame).
-    pub preview_viewport_height: u16,
+    pub preview_viewport_height: usize,
     /// Whether the preview includes tool-use lines.
     pub show_tools: bool,
     /// Whether the preview pane shows the changed-files list instead of the conversation.
@@ -128,38 +158,46 @@ impl App {
         text_cache: TextCache,
     ) -> Self {
         let filtered_indices: Vec<usize> = (0..sessions.len()).collect();
-        let (preview_tx, preview_rx) = mpsc::channel();
+        let (result_tx, preview_rx) = mpsc::channel();
+        let preview_req_tx = crate::preview::spawn_worker(result_tx);
         Self {
             sessions,
             filtered_indices,
             selected: 0,
+            list_offset: 0,
+            list_page_size: 1,
             preview_scroll: 0,
             search_query: TextInput::default(),
+            search_dirty: false,
             focus: Focus::List,
             action: AppAction::None,
             print_mode,
+            enter_yolo: true,
             preview_lines: Vec::new(),
             preview_loading: false,
             preview_session_id: String::new(),
-            preview_tx,
+            preview_req_tx,
             preview_rx,
             preview_cache: std::collections::HashMap::new(),
             preview_cache_order: VecDeque::new(),
             confirm_delete: false,
             sort_mode: SortMode::Date,
+            search_sort: None,
             size_filter: None,
             bookmarks,
+            bookmarks_file: None,
             text_cache,
             preview_search_query: TextInput::default(),
             preview_search_matches: Vec::new(),
             preview_search_current: 0,
+            rename_input: TextInput::default(),
             view_mode: ViewMode::Normal,
             status_message: None,
             terminal_height: 40,
             preview_inner_width: 0,
             preview_line_offsets: Vec::new(),
             scope: Scope::Current,
-            cwd_encoded: None,
+            scope_root: None,
             preview_total_rows: 0,
             preview_viewport_height: 0,
             show_tools: false,
@@ -178,6 +216,12 @@ impl App {
         self.preview_session_id.clear();
         self.preview_loading = false;
         self.preview_scroll = 0;
+        self.recompute_preview_offsets();
+        self.set_status(if self.show_tools {
+            "Tool calls shown in preview".to_string()
+        } else {
+            "Tool calls hidden".to_string()
+        });
     }
 
     pub fn toggle_files(&mut self) {
@@ -191,56 +235,81 @@ impl App {
             .and_then(|&idx| self.sessions.get(idx))
     }
 
+    fn selected_id(&self) -> Option<String> {
+        self.selected_session().map(|s| s.id.clone())
+    }
+
+    /// Put the selection back on session `id` after the view was rebuilt, or
+    /// on the first row when it's no longer visible.
+    fn reselect(&mut self, id: Option<String>) {
+        let pos = id.and_then(|id| {
+            self.filtered_indices
+                .iter()
+                .position(|&i| self.sessions[i].id == id)
+        });
+        match pos {
+            Some(p) => self.selected = p,
+            None => {
+                self.selected = 0;
+                self.preview_scroll = 0;
+            }
+        }
+    }
+
+    fn select(&mut self, index: usize) {
+        if index != self.selected {
+            self.selected = index;
+            self.preview_scroll = 0;
+        }
+    }
+
     pub fn move_up(&mut self) {
         if self.filtered_indices.is_empty() {
             return;
         }
-        if self.selected > 0 {
-            self.selected -= 1;
+        let target = if self.selected > 0 {
+            self.selected - 1
         } else {
-            self.selected = self.filtered_indices.len() - 1;
-        }
-        self.preview_scroll = 0;
+            self.filtered_indices.len() - 1
+        };
+        self.select(target);
     }
 
     pub fn move_down(&mut self) {
         if self.filtered_indices.is_empty() {
             return;
         }
-        if self.selected + 1 < self.filtered_indices.len() {
-            self.selected += 1;
+        let target = if self.selected + 1 < self.filtered_indices.len() {
+            self.selected + 1
         } else {
-            self.selected = 0;
-        }
-        self.preview_scroll = 0;
+            0
+        };
+        self.select(target);
     }
 
     pub fn move_to_top(&mut self) {
-        self.selected = 0;
-        self.preview_scroll = 0;
+        self.select(0);
     }
 
     pub fn move_to_bottom(&mut self) {
         if !self.filtered_indices.is_empty() {
-            self.selected = self.filtered_indices.len() - 1;
+            self.select(self.filtered_indices.len() - 1);
         }
-        self.preview_scroll = 0;
     }
 
-    pub fn page_up(&mut self, page_size: usize) {
+    pub fn page_up(&mut self) {
         if self.filtered_indices.is_empty() {
             return;
         }
-        self.selected = self.selected.saturating_sub(page_size);
-        self.preview_scroll = 0;
+        self.select(self.selected.saturating_sub(self.list_page_size.max(1)));
     }
 
-    pub fn page_down(&mut self, page_size: usize) {
+    pub fn page_down(&mut self) {
         if self.filtered_indices.is_empty() {
             return;
         }
-        self.selected = (self.selected + page_size).min(self.filtered_indices.len() - 1);
-        self.preview_scroll = 0;
+        let target = (self.selected + self.list_page_size.max(1)).min(self.filtered_indices.len() - 1);
+        self.select(target);
     }
 
     pub fn scroll_preview_up(&mut self) {
@@ -248,30 +317,34 @@ impl App {
     }
 
     pub fn scroll_preview_down(&mut self) {
-        self.preview_scroll = self
-            .preview_scroll
-            .saturating_add(3)
-            .min(self.max_preview_scroll());
+        self.preview_scroll = (self.preview_scroll + 3).min(self.max_preview_scroll());
     }
 
-    pub fn scroll_preview_page_up(&mut self, page_size: u16) {
-        self.preview_scroll = self.preview_scroll.saturating_sub(page_size);
+    pub fn scroll_preview_page_up(&mut self) {
+        let page = (self.preview_viewport_height.saturating_sub(2)).max(1);
+        self.preview_scroll = self.preview_scroll.saturating_sub(page);
     }
 
-    pub fn scroll_preview_page_down(&mut self, page_size: u16) {
-        self.preview_scroll = self
-            .preview_scroll
-            .saturating_add(page_size)
-            .min(self.max_preview_scroll());
+    pub fn scroll_preview_page_down(&mut self) {
+        let page = (self.preview_viewport_height.saturating_sub(2)).max(1);
+        self.preview_scroll = (self.preview_scroll + page).min(self.max_preview_scroll());
+    }
+
+    pub fn scroll_preview_top(&mut self) {
+        self.preview_scroll = 0;
+    }
+
+    pub fn scroll_preview_bottom(&mut self) {
+        self.preview_scroll = self.max_preview_scroll();
     }
 
     /// Largest scroll offset that still keeps content on screen. Zero when the
     /// content is shorter than the viewport. In the files view the content is
     /// the changed-files list, not the conversation rows.
-    pub fn max_preview_scroll(&self) -> u16 {
+    pub fn max_preview_scroll(&self) -> usize {
         let total = if self.show_files {
             self.selected_session()
-                .map(|s| s.changed_files.len() as u16)
+                .map(|s| s.changed_files.len())
                 .unwrap_or(0)
         } else {
             self.preview_total_rows
@@ -279,27 +352,58 @@ impl App {
         total.saturating_sub(self.preview_viewport_height)
     }
 
-    /// Rebuild filtered_indices from scratch: search → scope → size filter → sort.
+    /// Whether `s` belongs to the current scope. Sessions record the
+    /// directory they started in; without one, fall back to the encoded
+    /// project-dir name Claude Code stores the file under.
+    pub fn in_scope(&self, s: &SessionMeta) -> bool {
+        if self.scope == Scope::All {
+            return true;
+        }
+        let Some(root) = &self.scope_root else {
+            return true;
+        };
+        if !s.cwd.is_empty() {
+            return Path::new(&s.cwd).starts_with(root);
+        }
+        let encoded = crate::index::encode_project_path(&root.to_string_lossy());
+        s.file_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|name| name.to_string_lossy() == encoded)
+    }
+
+    /// Rebuild filtered_indices from scratch: search → scope → size filter →
+    /// sort, with the selection reset to the top (the best match).
     pub fn rebuild_view(&mut self) {
-        self.apply_search_inner();
-        self.apply_scope_filter();
-        self.apply_size_filter();
-        self.apply_sort();
+        self.recompute_view();
         self.selected = 0;
         self.preview_scroll = 0;
     }
 
-    /// Retain only sessions under the launch directory when scope is `Current`.
+    /// Rebuild the view but keep the selected session selected when it's
+    /// still visible.
+    fn rebuild_view_keep_selection(&mut self) {
+        let id = self.selected_id();
+        self.recompute_view();
+        self.reselect(id);
+    }
+
+    fn recompute_view(&mut self) {
+        if self.search_query.text().trim().is_empty() {
+            self.search_sort = None;
+        }
+        self.apply_search_inner();
+        self.apply_scope_filter();
+        self.apply_size_filter();
+        self.apply_sort();
+    }
+
     fn apply_scope_filter(&mut self) {
-        if self.scope == Scope::All {
+        if self.scope == Scope::All || self.scope_root.is_none() {
             return;
         }
-        if let Some(enc) = &self.cwd_encoded {
-            let needle = format!("/{}/", enc);
-            let sessions = &self.sessions;
-            self.filtered_indices
-                .retain(|&i| sessions[i].file_path.to_string_lossy().contains(&needle));
-        }
+        let keep: Vec<bool> = self.sessions.iter().map(|s| self.in_scope(s)).collect();
+        self.filtered_indices.retain(|&i| keep[i]);
     }
 
     pub fn toggle_scope(&mut self) {
@@ -307,7 +411,7 @@ impl App {
             Scope::Current => Scope::All,
             Scope::All => Scope::Current,
         };
-        self.rebuild_view();
+        self.rebuild_view_keep_selection();
     }
 
     fn apply_search_inner(&mut self) {
@@ -320,7 +424,7 @@ impl App {
         use rayon::prelude::*;
 
         let query_lc = self.search_query.text().to_lowercase();
-        let query_upper = self.search_query.text().to_ascii_uppercase();
+        let query_upper = self.search_query.text().trim().to_ascii_uppercase();
         let is_ticket_form = is_ticket_query(&query_upper);
         let tokens: Vec<&str> = query_lc.split_whitespace().collect();
         if tokens.is_empty() {
@@ -419,56 +523,65 @@ impl App {
         }
     }
 
-    /// Invariant when search is active: callers must ensure `filtered_indices`
-    /// is already in score-descending order (i.e., `apply_search_inner` has run
-    /// since the last query change). The bookmark-pin pass uses a stable sort,
-    /// so it preserves relevance order — but only because that order is the
-    /// pre-existing one. Re-sorting after a non-search mutation would scramble it.
+    /// Order the view: bookmarks first, then the active sort. While a search
+    /// is active and no explicit sort was chosen (`search_sort` is `None`),
+    /// the relevance order from `apply_search_inner` is kept — the sort is
+    /// stable, so this relies on `filtered_indices` already being in score
+    /// order (i.e. the search ran since the last query change).
     pub fn apply_sort(&mut self) {
         let sessions = &self.sessions;
         let bookmarks = &self.bookmarks;
-        let search_active = !self.search_query.is_empty();
-
-        // When search is active, preserve the relevance ordering (score desc,
-        // date tiebreak) computed by apply_search_inner. Only float bookmarks.
-        if search_active {
-            self.filtered_indices.sort_by(|&a, &b| {
-                let a_pinned = bookmarks.contains(&sessions[a].id);
-                let b_pinned = bookmarks.contains(&sessions[b].id);
-                b_pinned.cmp(&a_pinned)
-            });
-            return;
-        }
+        let mode = if self.search_query.is_empty() {
+            Some(self.sort_mode)
+        } else {
+            self.search_sort
+        };
 
         self.filtered_indices.sort_by(|&a, &b| {
             let a_pinned = bookmarks.contains(&sessions[a].id);
             let b_pinned = bookmarks.contains(&sessions[b].id);
-            b_pinned
-                .cmp(&a_pinned)
-                .then_with(|| match self.sort_mode {
-                    SortMode::Date => sessions[b].timestamp.cmp(&sessions[a].timestamp),
-                    SortMode::Size => sessions[b].file_size.cmp(&sessions[a].file_size),
-                    SortMode::Duration => sessions[b].duration_secs.cmp(&sessions[a].duration_secs),
-                    SortMode::Messages => sessions[b].message_count.cmp(&sessions[a].message_count),
-                })
+            b_pinned.cmp(&a_pinned).then_with(|| match mode {
+                None => std::cmp::Ordering::Equal,
+                Some(SortMode::Date) => sessions[b].timestamp.cmp(&sessions[a].timestamp),
+                Some(SortMode::Size) => sessions[b].file_size.cmp(&sessions[a].file_size),
+                Some(SortMode::Duration) => {
+                    sessions[b].duration_secs.cmp(&sessions[a].duration_secs)
+                }
+                Some(SortMode::Messages) => {
+                    sessions[b].message_count.cmp(&sessions[a].message_count)
+                }
+            })
         });
+    }
+
+    /// Label for the sort currently shaping the list.
+    pub fn sort_label(&self) -> &'static str {
+        if self.search_query.is_empty() {
+            self.sort_mode.label()
+        } else {
+            self.search_sort.map(SortMode::label).unwrap_or("relevance")
+        }
     }
 
     /// Called when search query changes.
     pub fn apply_search(&mut self) {
+        self.search_dirty = false;
         self.rebuild_view();
     }
 
+    /// Cycle the sort. Search results cycle relevance → date → … → messages
+    /// → relevance; the browse sort is remembered separately.
     pub fn cycle_sort(&mut self) {
-        self.sort_mode = match self.sort_mode {
-            SortMode::Date => SortMode::Size,
-            SortMode::Size => SortMode::Duration,
-            SortMode::Duration => SortMode::Messages,
-            SortMode::Messages => SortMode::Date,
-        };
-        self.apply_sort();
-        self.selected = 0;
-        self.preview_scroll = 0;
+        if self.search_query.is_empty() {
+            self.sort_mode = self.sort_mode.next();
+        } else {
+            self.search_sort = match self.search_sort {
+                None => Some(SortMode::Date),
+                Some(SortMode::Messages) => None,
+                Some(mode) => Some(mode.next()),
+            };
+        }
+        self.rebuild_view();
     }
 
     pub fn toggle_size_filter(&mut self, category: &'static str) {
@@ -477,26 +590,30 @@ impl App {
         } else {
             self.size_filter = Some(category);
         }
-        self.rebuild_view();
+        self.rebuild_view_keep_selection();
     }
 
     pub fn clear_size_filter(&mut self) {
         self.size_filter = None;
-        self.rebuild_view();
+        self.rebuild_view_keep_selection();
     }
 
     pub fn toggle_bookmark(&mut self) {
-        if let Some(session) = self.selected_session() {
-            let id = session.id.clone();
-            if self.bookmarks.contains(&id) {
-                self.bookmarks.remove(&id);
-            } else {
-                self.bookmarks.insert(id);
-            }
-            crate::bookmarks::save_bookmarks(&self.bookmarks);
-            // Re-sort to float bookmarks to top
-            self.apply_sort();
-        }
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        let pinned = if self.bookmarks.remove(&id) {
+            false
+        } else {
+            self.bookmarks.insert(id.clone());
+            true
+        };
+        self.save_bookmarks();
+        // Re-sort to float bookmarks to top, keeping the cursor on this
+        // session. A full rebuild (not just `apply_sort`) so relevance order
+        // is recomputed rather than inherited from the pre-pin order.
+        self.rebuild_view_keep_selection();
+        self.set_status(if pinned { "Pinned".to_string() } else { "Unpinned".to_string() });
     }
 
     pub fn export_selected(&mut self) {
@@ -509,6 +626,71 @@ impl App {
                     self.set_status(format!("Export failed: {}", e));
                 }
             }
+        }
+    }
+
+    /// Copy a ready-to-run resume command for the selected session. The TUI
+    /// stays open.
+    pub fn copy_selected(&mut self) {
+        let Some(session) = self.selected_session() else {
+            return;
+        };
+        let here = std::env::current_dir().ok();
+        let cmd = resume_command(session, here.as_deref());
+        match crate::clipboard::copy(&cmd) {
+            Ok(()) => self.set_status(format!("Copied: {}", cmd)),
+            Err(e) => self.set_status(format!("Copy failed ({}): {}", e, cmd)),
+        }
+    }
+
+    /// Open the most recently linked pull request in the browser.
+    pub fn open_pr(&mut self) {
+        let Some(pr) = self.selected_session().and_then(|s| s.prs.last()).cloned() else {
+            self.set_status("No pull request linked to this session".to_string());
+            return;
+        };
+        match crate::clipboard::open_url(&pr.url) {
+            Ok(()) => self.set_status(format!("Opened PR #{} {}", pr.number, pr.url)),
+            Err(e) => self.set_status(format!("Couldn't open {}: {}", pr.url, e)),
+        }
+    }
+
+    // Rename
+
+    pub fn start_rename(&mut self) {
+        let Some(name) = self.selected_session().map(|s| s.name.clone()) else {
+            return;
+        };
+        self.rename_input = TextInput::from(name.as_str());
+        self.focus = Focus::Rename;
+    }
+
+    pub fn cancel_rename(&mut self) {
+        self.rename_input.clear();
+        self.focus = Focus::List;
+    }
+
+    /// Persist the new name the way Claude Code's `/rename` does (a
+    /// `custom-title` entry), so `claude --resume` shows it too.
+    pub fn commit_rename(&mut self) {
+        self.focus = Focus::List;
+        let name = crate::parser::one_line(self.rename_input.text(), 200);
+        self.rename_input.clear();
+        let Some(&real) = self.filtered_indices.get(self.selected) else {
+            return;
+        };
+        if name.is_empty() || name == self.sessions[real].name {
+            return;
+        }
+        let session = &self.sessions[real];
+        match crate::session::write_custom_title(&session.file_path, &session.id, &name) {
+            Ok(()) => {
+                let session = &mut self.sessions[real];
+                session.name_lc = name.to_lowercase();
+                session.name = name.clone();
+                self.set_status(format!("Renamed → {}", name));
+            }
+            Err(e) => self.set_status(format!("Rename failed: {}", e)),
         }
     }
 
@@ -575,17 +757,23 @@ impl App {
         self.scroll_to_current_match();
     }
 
+    /// Width available to message text: the pane minus the match-marker
+    /// column and the speaker-prefix column.
+    pub fn preview_body_width(&self) -> usize {
+        (self.preview_inner_width as usize)
+            .saturating_sub(1 + crate::ui::PREFIX_WIDTH)
+            .max(10)
+    }
+
     pub fn recompute_preview_offsets(&mut self) {
-        let width = self.preview_inner_width.saturating_sub(1) as usize;
+        let width = self.preview_body_width();
         self.preview_line_offsets.clear();
         self.preview_line_offsets.reserve(self.preview_lines.len());
-        let mut cursor: u16 = 0;
-        for (text, _lower, speaker) in self.preview_lines.iter() {
+        let mut cursor: usize = 0;
+        for (text, _lower, _speaker) in self.preview_lines.iter() {
             self.preview_line_offsets.push(cursor);
-            let prefix = speaker.prefix();
-            let full = format!("{}{}", prefix, text);
-            let lines = crate::ui::wrap_text(&full, width).len().max(1) as u16;
-            cursor = cursor.saturating_add(lines).saturating_add(1); // +1 blank separator
+            let rows = crate::ui::message_rows(text, width).len();
+            cursor += rows + 1; // +1 blank separator
         }
         self.preview_total_rows = cursor;
     }
@@ -600,35 +788,25 @@ impl App {
             .get(line_idx)
             .copied()
             .unwrap_or(0);
-        let intra = self.intra_match_chunk_offset(line_idx);
-        self.preview_scroll = base.saturating_add(intra).saturating_sub(2);
+        let intra = self.intra_match_row(line_idx);
+        self.preview_scroll = (base + intra).saturating_sub(2).min(self.max_preview_scroll());
     }
 
-    fn intra_match_chunk_offset(&self, line_idx: usize) -> u16 {
-        let (_text, lower, speaker) = match self.preview_lines.get(line_idx) {
-            Some(t) => t,
-            None => return 0,
+    /// Row within message `line_idx` holding the first match, so long
+    /// messages scroll to the hit rather than their first line.
+    fn intra_match_row(&self, line_idx: usize) -> usize {
+        let Some((_text, lower, _speaker)) = self.preview_lines.get(line_idx) else {
+            return 0;
         };
         let query_lc = self.preview_search_query.text().to_lowercase();
         if query_lc.is_empty() {
             return 0;
         }
-        let width = self.preview_inner_width.saturating_sub(1) as usize;
-        if width == 0 {
-            return 0;
-        }
-        // Wrap the pre-lowercased message (with the same prefix length as the
-        // render pass) so memmem scans bytes directly.
-        let prefix = speaker.prefix_lc();
-        let full_lc = format!("{}{}", prefix, lower);
         let finder = memchr::memmem::Finder::new(query_lc.as_bytes());
-        let chunks = crate::ui::wrap_text(&full_lc, width);
-        for (idx, chunk) in chunks.iter().enumerate() {
-            if finder.find(chunk.as_bytes()).is_some() {
-                return idx as u16;
-            }
-        }
-        0
+        crate::ui::message_rows(lower, self.preview_body_width())
+            .iter()
+            .position(|row| finder.find(row.as_bytes()).is_some())
+            .unwrap_or(0)
     }
 
     pub fn exit_preview_search(&mut self) {
@@ -690,37 +868,59 @@ impl App {
     }
 
     pub fn delete_selected(&mut self) {
-        if let Some(&real_idx) = self.filtered_indices.get(self.selected) {
-            let id = self.sessions[real_idx].id.clone();
-            let path = self.sessions[real_idx].file_path.clone();
-            if std::fs::remove_file(&path).is_ok() {
-                let companion_dir = path.with_extension("");
-                if companion_dir.is_dir() {
-                    std::fs::remove_dir_all(&companion_dir).ok();
-                }
-                self.sessions.remove(real_idx);
-                self.filtered_indices.retain(|&i| i != real_idx);
-                for idx in &mut self.filtered_indices {
-                    if *idx > real_idx {
-                        *idx -= 1;
-                    }
-                }
-                if self.selected >= self.filtered_indices.len() && self.selected > 0 {
-                    self.selected -= 1;
-                }
-                self.preview_lines.clear();
-                self.preview_session_id.clear();
-                self.preview_loading = false;
-                self.cleanup_bookmark_for_deleted(&id);
+        self.confirm_delete = false;
+        let Some(&real_idx) = self.filtered_indices.get(self.selected) else {
+            return;
+        };
+        let id = self.sessions[real_idx].id.clone();
+        let path = self.sessions[real_idx].file_path.clone();
+        if let Err(e) = std::fs::remove_file(&path) {
+            self.set_status(format!("Delete failed: {}", e));
+            return;
+        }
+        let companion_dir = path.with_extension("");
+        if companion_dir.is_dir() {
+            std::fs::remove_dir_all(&companion_dir).ok();
+        }
+        self.sessions.remove(real_idx);
+        self.filtered_indices.retain(|&i| i != real_idx);
+        for idx in &mut self.filtered_indices {
+            if *idx > real_idx {
+                *idx -= 1;
             }
         }
-        self.confirm_delete = false;
+        if self.selected >= self.filtered_indices.len() && self.selected > 0 {
+            self.selected -= 1;
+        }
+        self.preview_scroll = 0;
+        self.preview_lines.clear();
+        self.preview_session_id.clear();
+        self.preview_loading = false;
+        self.recompute_preview_offsets();
+        self.preview_cache.remove(&id);
+        self.preview_cache_order.retain(|c| c != &id);
+        self.cleanup_bookmark_for_deleted(&id);
+        self.set_status("Session deleted".to_string());
     }
 
     pub fn cleanup_bookmark_for_deleted(&mut self, id: &str) {
         if self.bookmarks.remove(id) {
-            crate::bookmarks::save_bookmarks(&self.bookmarks);
+            self.save_bookmarks();
         }
+    }
+
+    fn save_bookmarks(&self) {
+        if let Some(path) = &self.bookmarks_file {
+            crate::bookmarks::save_bookmarks(path, &self.bookmarks);
+        }
+    }
+
+    fn clear_search(&mut self) {
+        self.search_query.clear();
+        let id = self.selected_id();
+        self.apply_search();
+        // Leaving a search keeps the session you were on, in its browse position.
+        self.reselect(id);
     }
 
     pub fn handle_esc(&mut self) {
@@ -728,9 +928,9 @@ impl App {
             Focus::PreviewSearch => {
                 self.exit_preview_search();
             }
+            Focus::Rename => self.cancel_rename(),
             Focus::Search if !self.search_query.is_empty() => {
-                self.search_query.clear();
-                self.apply_search();
+                self.clear_search();
             }
             Focus::Search => {
                 self.focus = Focus::List;
@@ -746,10 +946,39 @@ impl App {
             Focus::List if self.view_mode == ViewMode::Timeline => {
                 self.view_mode = ViewMode::Normal;
             }
+            // An active filter is the thing Esc should undo, not the whole app.
+            Focus::List if !self.search_query.is_empty() => {
+                self.clear_search();
+            }
             Focus::List => {
                 self.action = AppAction::Quit;
             }
         }
+    }
+}
+
+/// Shell command that resumes `session`, prefixed with a `cd` into its
+/// directory when that differs from `here` (Claude Code looks sessions up by
+/// the directory it's started in).
+pub fn resume_command(session: &SessionMeta, here: Option<&Path>) -> String {
+    let resume = format!("claude --resume {}", session.id);
+    let dir = Path::new(&session.cwd);
+    if session.cwd.is_empty() || here == Some(dir) {
+        return resume;
+    }
+    format!("cd {} && {}", shell_quote(&session.cwd), resume)
+}
+
+/// Quote `s` for POSIX shells when it contains anything beyond safe characters.
+pub fn shell_quote(s: &str) -> String {
+    let safe = !s.is_empty()
+        && s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+=:@%,~".contains(c));
+    if safe {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
     }
 }
 
@@ -778,7 +1007,6 @@ fn starts_at_word_boundary(haystack: &[u8], needle: &[u8]) -> bool {
 mod search_tests {
     use super::*;
     use crate::text_cache::TextCache;
-    use std::path::PathBuf;
 
     fn make_session(
         id: &str,
@@ -814,6 +1042,8 @@ mod search_tests {
             skills: vec![],
             changed_files: vec![],
             changed_files_lc: String::new(),
+            prs: vec![],
+            recap: String::new(),
         }
     }
 
@@ -960,24 +1190,34 @@ mod search_tests {
     }
 
     #[test]
-    fn test_scope_filter_current_limits_to_cwd() {
+    fn test_scope_filter_current_covers_project_and_subdirs() {
         let mut a = make_session("a", "x", "", "p", "main", vec![]);
-        a.file_path = PathBuf::from("/Users/me/.claude/projects/-Users-me-code-foo/a.jsonl");
+        a.cwd = "/Users/me/code/foo".into();
         let mut b = make_session("b", "y", "", "p", "main", vec![]);
-        b.file_path = PathBuf::from("/Users/me/.claude/projects/-Users-me-code-bar/b.jsonl");
-        let mut app = App::new(vec![a, b], false, HashSet::new(), empty_cache());
-        app.cwd_encoded = Some("-Users-me-code-foo".to_string());
+        b.cwd = "/Users/me/code/bar".into();
+        let mut c = make_session("c", "z", "", "p", "main", vec![]);
+        c.cwd = "/Users/me/code/foo/.worktrees/spike".into();
+        // Shares the prefix but is a sibling directory, not a child.
+        let mut d = make_session("d", "w", "", "p", "main", vec![]);
+        d.cwd = "/Users/me/code/foobar".into();
+        let mut app = App::new(vec![a, b, c, d], false, HashSet::new(), empty_cache());
+        app.scope_root = Some(PathBuf::from("/Users/me/code/foo"));
         app.scope = Scope::Current;
         app.rebuild_view();
-        assert_eq!(app.filtered_indices.len(), 1);
-        assert_eq!(app.sessions[app.filtered_indices[0]].id, "a");
-        // toggling to All shows both
+        let mut ids: Vec<&str> = app
+            .filtered_indices
+            .iter()
+            .map(|&i| app.sessions[i].id.as_str())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "c"]);
+        // toggling to All shows everything
         app.toggle_scope();
-        assert_eq!(app.filtered_indices.len(), 2);
+        assert_eq!(app.filtered_indices.len(), 4);
     }
 
     #[test]
-    fn test_scope_filter_matches_dotted_cwd_encoding() {
+    fn test_scope_filter_without_cwd_falls_back_to_encoded_dir() {
         // Claude Code encodes `.` (any non-alphanumeric) as `-` in project dir
         // names; the launch-dir encoding must agree or scope shows nothing.
         let mut a = make_session("a", "x", "", "p", "main", vec![]);
@@ -985,12 +1225,180 @@ mod search_tests {
             "/Users/me/.claude/projects/-Users-me-code-web--worktrees-spike/a.jsonl",
         );
         let mut app = App::new(vec![a], false, HashSet::new(), empty_cache());
-        app.cwd_encoded = Some(crate::index::encode_project_path(
-            "/Users/me/code/web/.worktrees/spike",
-        ));
+        app.scope_root = Some(PathBuf::from("/Users/me/code/web/.worktrees/spike"));
         app.scope = Scope::Current;
         app.rebuild_view();
         assert_eq!(app.filtered_indices.len(), 1);
+    }
+
+    fn three_sessions() -> App {
+        let mut sessions = Vec::new();
+        for (i, id) in ["a", "b", "c"].iter().enumerate() {
+            let mut s = make_session(id, &format!("name {}", id), "", "p", "main", vec![]);
+            s.timestamp = 100 - i as i64; // a newest
+            sessions.push(s);
+        }
+        let mut app = App::new(sessions, false, HashSet::new(), empty_cache());
+        app.rebuild_view();
+        app
+    }
+
+    fn selected_id(app: &App) -> &str {
+        app.selected_session().map(|s| s.id.as_str()).unwrap_or("")
+    }
+
+    #[test]
+    fn test_bookmark_keeps_cursor_on_the_same_session() {
+        let mut app = three_sessions();
+        app.move_to_bottom();
+        assert_eq!(selected_id(&app), "c");
+        // Pinning floats "c" to the top; the cursor must follow it rather than
+        // stay on row 2 (now a different session, with a stale preview).
+        app.toggle_bookmark();
+        assert_eq!(app.selected, 0);
+        assert_eq!(selected_id(&app), "c");
+        app.toggle_bookmark();
+        assert_eq!(selected_id(&app), "c");
+        assert_eq!(app.selected, 2, "unpinning returns it to its date slot");
+    }
+
+    #[test]
+    fn test_unpin_restores_relevance_order() {
+        let sessions = vec![
+            make_session("a", "kerveros kerveros", "", "p", "main", vec![]),
+            make_session("b", "", "", "kerveros", "main", vec![]),
+        ];
+        let mut app = App::new(sessions, false, HashSet::new(), empty_cache());
+        app.search_query = "kerveros".into();
+        app.apply_search();
+        app.move_down(); // "b", the weaker (project-only) match
+        app.toggle_bookmark();
+        assert_eq!(selected_id(&app), "b");
+        assert_eq!(app.selected, 0, "pinned floats to the top");
+        app.toggle_bookmark();
+        assert_eq!(selected_id(&app), "b");
+        assert_eq!(app.selected, 1, "unpinned drops back to its relevance slot");
+    }
+
+    #[test]
+    fn test_esc_in_list_clears_active_search_before_quitting() {
+        let mut app = three_sessions();
+        app.search_query = "name b".into();
+        app.apply_search();
+        assert_eq!(app.filtered_indices.len(), 1);
+        app.focus = Focus::List;
+
+        app.handle_esc();
+        assert_eq!(app.action, AppAction::None, "first Esc clears the search");
+        assert!(app.search_query.is_empty());
+        assert_eq!(app.filtered_indices.len(), 3);
+        assert_eq!(selected_id(&app), "b", "selection stays on the session");
+
+        app.handle_esc();
+        assert_eq!(app.action, AppAction::Quit);
+    }
+
+    #[test]
+    fn test_sort_cycles_through_relevance_while_searching() {
+        let mut app = three_sessions();
+        app.sessions[2].file_size = 999;
+        app.search_query = "name".into();
+        app.apply_search();
+        assert_eq!(app.sort_label(), "relevance");
+        app.cycle_sort();
+        assert_eq!(app.sort_label(), "date");
+        app.cycle_sort();
+        assert_eq!(app.sort_label(), "size");
+        assert_eq!(selected_id(&app), "c", "size sort applies to the results");
+        app.cycle_sort();
+        app.cycle_sort();
+        app.cycle_sort();
+        assert_eq!(app.sort_label(), "relevance");
+        // The browse sort is untouched by search sorting.
+        assert_eq!(app.sort_mode, SortMode::Date);
+    }
+
+    #[test]
+    fn test_scope_toggle_keeps_selection_when_visible() {
+        let mut app = three_sessions();
+        app.move_down();
+        app.toggle_scope();
+        assert_eq!(selected_id(&app), "b");
+    }
+
+    #[test]
+    fn test_resume_command_cds_only_when_needed() {
+        let mut s = make_session("abc", "", "", "p", "main", vec![]);
+        s.cwd = "/Users/me/My Projects/it's".into();
+        assert_eq!(
+            resume_command(&s, Some(Path::new("/tmp"))),
+            r"cd '/Users/me/My Projects/it'\''s' && claude --resume abc"
+        );
+        assert_eq!(
+            resume_command(&s, Some(Path::new("/Users/me/My Projects/it's"))),
+            "claude --resume abc"
+        );
+        s.cwd = String::new();
+        assert_eq!(resume_command(&s, None), "claude --resume abc");
+    }
+
+    #[test]
+    fn test_shell_quote() {
+        assert_eq!(shell_quote("/Users/me/code/foo-bar_1.2"), "/Users/me/code/foo-bar_1.2");
+        assert_eq!(shell_quote("/a b"), "'/a b'");
+        assert_eq!(shell_quote("$(rm -rf ~)"), "'$(rm -rf ~)'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn test_rename_writes_custom_title_and_updates_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("abc.jsonl");
+        std::fs::write(&path, "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n").unwrap();
+        let mut s = make_session("abc", "old name", "", "p", "main", vec![]);
+        s.file_path = path.clone();
+        let mut app = App::new(vec![s], false, HashSet::new(), empty_cache());
+
+        app.start_rename();
+        assert_eq!(app.focus, Focus::Rename);
+        assert_eq!(app.rename_input.text(), "old name");
+        app.rename_input = "Auth rework".into();
+        app.commit_rename();
+
+        assert_eq!(app.focus, Focus::List);
+        assert_eq!(app.sessions[0].name, "Auth rework");
+        assert_eq!(app.sessions[0].name_lc, "auth rework");
+        let scan = crate::parser::scan_session(&path).unwrap();
+        assert_eq!(scan.tail.unwrap().rename, "Auth rework");
+    }
+
+    #[test]
+    fn test_rename_to_blank_is_a_no_op() {
+        let mut s = make_session("abc", "keep", "", "p", "main", vec![]);
+        s.file_path = PathBuf::from("/does/not/exist.jsonl");
+        let mut app = App::new(vec![s], false, HashSet::new(), empty_cache());
+        app.start_rename();
+        app.rename_input = "   ".into();
+        app.commit_rename();
+        assert_eq!(app.sessions[0].name, "keep");
+        assert!(app.active_status().is_none(), "nothing written, nothing reported");
+    }
+
+    #[test]
+    fn test_preview_offsets_count_newlines_and_scroll_past_u16() {
+        let mut app = three_sessions();
+        app.preview_inner_width = 60;
+        // One message of 70k lines: the old u16 row math capped scrolling at 65 535.
+        let long = "line\n".repeat(70_000);
+        app.preview_lines = vec![
+            (long.clone(), long.to_lowercase(), Speaker::Assistant),
+            ("tail".into(), "tail".into(), Speaker::User),
+        ];
+        app.recompute_preview_offsets();
+        assert_eq!(app.preview_line_offsets, vec![0, 70_001]);
+        app.preview_viewport_height = 10;
+        app.scroll_preview_bottom();
+        assert!(app.preview_scroll > u16::MAX as usize);
     }
 
     #[test]

@@ -59,7 +59,9 @@ impl TextCache {
 /// Writes `text.bin` atomically. Returns the per-session (offset, len) pairs
 /// in the order of the input.
 pub fn write_text_cache(path: &Path, chunks: &[&[u8]]) -> std::io::Result<Vec<(u64, u32)>> {
-    let tmp = path.with_extension("bin.tmp");
+    // Per-process temp name: two sessy instances rebuilding at once must not
+    // interleave writes into the same file.
+    let tmp = path.with_extension(format!("bin.{}.tmp", std::process::id()));
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -75,7 +77,10 @@ pub fn write_text_cache(path: &Path, chunks: &[&[u8]]) -> std::io::Result<Vec<(u
     }
     file.sync_all()?;
     drop(file);
-    fs::rename(&tmp, path)?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(out)
 }
 

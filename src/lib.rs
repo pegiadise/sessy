@@ -1,5 +1,6 @@
 pub mod app;
 pub mod bookmarks;
+pub mod clipboard;
 pub mod config;
 pub mod export;
 pub mod index;

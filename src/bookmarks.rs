@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-fn bookmarks_path() -> PathBuf {
+pub fn bookmarks_path() -> PathBuf {
     let cache_dir = dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("sessy");
@@ -18,10 +18,9 @@ pub fn load_bookmarks() -> HashSet<String> {
     serde_json::from_str(&content).unwrap_or_default()
 }
 
-pub fn save_bookmarks(bookmarks: &HashSet<String>) {
-    let path = bookmarks_path();
+pub fn save_bookmarks(path: &std::path::Path, bookmarks: &HashSet<String>) {
     if let Ok(json) = serde_json::to_string(bookmarks) {
-        std::fs::write(&path, json).ok();
+        std::fs::write(path, json).ok();
     }
 }
 

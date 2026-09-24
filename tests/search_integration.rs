@@ -35,6 +35,8 @@ fn make_session(id: &str, name: &str, project: &str, tickets: Vec<&str>) -> Sess
         skills: vec![],
         changed_files: vec![],
         changed_files_lc: String::new(),
+        prs: vec![],
+        recap: String::new(),
     }
 }
 

@@ -31,6 +31,19 @@ impl TextInput {
         self.cursor += c.len_utf8();
     }
 
+    /// Insert pasted text at the cursor. Newlines and tabs become spaces:
+    /// the inputs are single-line.
+    pub fn insert_str(&mut self, s: &str) {
+        let clean: String = s
+            .chars()
+            .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
+            .filter(|c| !c.is_control())
+            .collect();
+        let clean = clean.trim_end_matches(' ');
+        self.text.insert_str(self.cursor, clean);
+        self.cursor += clean.len();
+    }
+
     fn prev_boundary(&self) -> Option<usize> {
         self.text[..self.cursor]
             .char_indices()
@@ -245,6 +258,15 @@ mod tests {
         input.move_word_left();
         input.delete_to_end();
         assert_eq!(input.text(), "hello ");
+    }
+
+    #[test]
+    fn insert_str_flattens_pasted_lines() {
+        let mut input = TextInput::from("ab");
+        input.move_left();
+        input.insert_str("x\ny\r\n");
+        assert_eq!(input.text(), "ax yb");
+        assert_eq!(input.cursor_chars(), 4);
     }
 
     #[test]

@@ -2,20 +2,23 @@ use sessy::{app, bookmarks, config, index, preview, session, text_cache, ui};
 use app::{App, AppAction, Focus, Scope, ViewMode};
 use clap::Parser;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use std::io;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(name = "sessy", version, about = "TUI session manager for Claude Code")]
 struct Cli {
-    /// Filter to sessions from a specific project (substring match)
+    /// Only sessions whose project name contains this (case-insensitive);
+    /// searches across all projects
     #[arg(long)]
     project: Option<String>,
 
-    /// Print selected session ID to stdout and exit
+    /// Print the selected session ID to stdout instead of resuming it
     #[arg(long)]
     print: bool,
 
@@ -23,7 +26,7 @@ struct Cli {
     #[arg(long)]
     recent: Option<String>,
 
-    /// Show sessions from all projects (default: current directory only)
+    /// Show sessions from all projects (default: the current project)
     #[arg(long, short)]
     all: bool,
 
@@ -62,18 +65,10 @@ fn main() -> io::Result<()> {
     };
 
     let mut idx = index::build_index(cached, cli.rebuild_index);
-    idx.sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    idx.sessions.sort_by_key(|s| std::cmp::Reverse(s.timestamp));
 
     // Save index before applying runtime filters
     index::save_index(&idx);
-
-    // Compute the encoded launch-directory prefix so the in-TUI scope toggle
-    // (`a`) can switch between current-directory and all-projects live.
-    let cwd = std::env::current_dir()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    let cwd_encoded = index::encode_project_path(&cwd);
 
     // Apply filters
     if let Some(ref project_filter) = cli.project {
@@ -87,38 +82,39 @@ fn main() -> io::Result<()> {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        let cutoff = now - secs as i64;
+        let cutoff = now.saturating_sub(secs as i64);
         idx.sessions.retain(|s| s.timestamp >= cutoff);
-    }
-
-    // Purge: delete tiny old sessions. Runs after the CLI filters so
-    // `--project X --purge` only touches that project's sessions.
-    if cli.purge {
-        return run_purge(&idx);
     }
 
     // Load bookmarks
     let bookmarks = bookmarks::load_bookmarks();
 
+    // Purge: delete tiny old sessions. Runs after the CLI filters so
+    // `--project X --purge` only touches that project's sessions.
+    if cli.purge {
+        return run_purge(&idx, &bookmarks);
+    }
+
     // Run TUI
-    let cfg = config::load();
+    let (cfg, cfg_warning) = config::load();
     let tc = text_cache::TextCache::open(&text_cache::text_cache_path());
     let mut app = App::new(idx.sessions, cli.print, bookmarks, tc);
-    // An unreadable cwd yields an empty encoding; disable scope filtering
-    // instead of silently matching nothing.
-    app.cwd_encoded = if cwd_encoded.is_empty() {
-        None
-    } else {
-        Some(cwd_encoded)
-    };
-    app.scope = if cli.all || cfg.scope_is_all() {
+    app.bookmarks_file = Some(bookmarks::bookmarks_path());
+    app.scope_root = std::env::current_dir().ok().map(|cwd| project_root(&cwd));
+    // `--project` names the project explicitly; restricting it further to
+    // the launch directory would usually leave nothing.
+    app.scope = if cli.all || cli.project.is_some() || cfg.scope_is_all() {
         Scope::All
     } else {
         Scope::Current
     };
     app.sort_mode = cfg.sort_mode();
     app.show_tools = cfg.show_tool_activity;
+    app.enter_yolo = cfg.enter_is_yolo();
     app.rebuild_view(); // apply scope filter + bookmark floating on initial load
+    if let Some(warning) = cfg_warning {
+        app.set_status(warning);
+    }
 
     // In --print mode stdout is typically captured by a command substitution
     // (`claude --resume $(sessy --print)`), so the TUI must render on stderr,
@@ -133,16 +129,35 @@ fn main() -> io::Result<()> {
         // can't fire. Push after entering the alternate screen (the flag stack
         // is per-screen), pop before leaving it.
         let kbd_enhanced = push_keyboard_enhancement(&mut io::stdout());
+        let _ = crossterm::execute!(io::stdout(), EnableBracketedPaste);
         let result = run_event_loop(&mut terminal, &mut app);
+        let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste);
         pop_keyboard_enhancement(&mut io::stdout(), kbd_enhanced);
         ratatui::restore();
         result
     };
+    result?;
 
     // Handle post-TUI actions
-    handle_post_tui_action(&app);
+    let code = handle_post_tui_action(&app);
+    std::process::exit(code);
+}
 
-    result
+/// The directory `Scope::Current` covers: the enclosing git checkout, so
+/// launching from `repo/src` still finds sessions started at `repo/`.
+/// Outside a repo (or when the nearest `.git` is the home directory itself,
+/// e.g. a dotfiles repo) it's the launch directory.
+fn project_root(cwd: &Path) -> PathBuf {
+    let home = dirs::home_dir();
+    for dir in cwd.ancestors() {
+        if home.as_deref() == Some(dir) {
+            break;
+        }
+        if dir.join(".git").exists() {
+            return dir.to_path_buf();
+        }
+    }
+    cwd.to_path_buf()
 }
 
 /// Set up and tear down a terminal on stderr (mirror of `ratatui::init()`/
@@ -159,8 +174,10 @@ fn run_tui_on_stderr(app: &mut App) -> io::Result<()> {
         return Err(e);
     }
     let kbd_enhanced = push_keyboard_enhancement(&mut io::stderr());
+    let _ = crossterm::execute!(io::stderr(), EnableBracketedPaste);
     let result = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stderr()))
         .and_then(|mut terminal| run_event_loop(&mut terminal, app));
+    let _ = crossterm::execute!(io::stderr(), DisableBracketedPaste);
     pop_keyboard_enhancement(&mut io::stderr(), kbd_enhanced);
     let _ = crossterm::execute!(io::stderr(), LeaveAlternateScreen, Show);
     let _ = disable_raw_mode();
@@ -169,10 +186,17 @@ fn run_tui_on_stderr(app: &mut App) -> io::Result<()> {
 
 /// Enable the kitty keyboard protocol when the terminal supports it, so
 /// modifier combinations like Cmd+Backspace and Alt+Backspace reach the app.
-/// The support probe talks to /dev/tty directly, keeping stdout clean for
-/// `--print` command substitution. Returns whether the flags were pushed.
+/// Returns whether the flags were pushed.
+///
+/// Skipped when stdout isn't a terminal: crossterm's support probe opens
+/// /dev/tty read-only, fails to write its query there, and falls back to
+/// stdout — which under `$(sessy --print)` would prepend `ESC[?u ESC[c` to
+/// the captured session ID.
 fn push_keyboard_enhancement<W: io::Write>(out: &mut W) -> bool {
-    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+    use std::io::IsTerminal;
+    if io::stdout().is_terminal()
+        && crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
+    {
         crossterm::execute!(
             out,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
@@ -189,7 +213,10 @@ fn pop_keyboard_enhancement<W: io::Write>(out: &mut W, pushed: bool) {
     }
 }
 
-fn run_purge(idx: &index::SessionIndex) -> io::Result<()> {
+fn run_purge(
+    idx: &index::SessionIndex,
+    bookmarks: &std::collections::HashSet<String>,
+) -> io::Result<()> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -197,10 +224,14 @@ fn run_purge(idx: &index::SessionIndex) -> io::Result<()> {
     let two_days_ago = now - 2 * 86400;
     let size_limit = 15 * 1024;
 
+    // Pinned sessions are kept no matter how small: pinning is an explicit
+    // "keep this".
     let to_purge: Vec<&session::SessionMeta> = idx
         .sessions
         .iter()
-        .filter(|s| s.file_size < size_limit && s.timestamp < two_days_ago)
+        .filter(|s| {
+            s.file_size < size_limit && s.timestamp < two_days_ago && !bookmarks.contains(&s.id)
+        })
         .collect();
 
     if to_purge.is_empty() {
@@ -235,7 +266,10 @@ fn run_purge(idx: &index::SessionIndex) -> io::Result<()> {
     Ok(())
 }
 
-fn handle_post_tui_action(app: &App) {
+/// Run the action chosen in the TUI. Returns the process exit code: claude's
+/// own when resuming, 1 when `--print` ends without a selection (so
+/// `id=$(sessy --print) && claude --resume "$id"` stops cleanly).
+fn handle_post_tui_action(app: &App) -> i32 {
     let resolve = |idx: usize| -> Option<&session::SessionMeta> {
         app.filtered_indices
             .get(idx)
@@ -244,46 +278,45 @@ fn handle_post_tui_action(app: &App) {
 
     match app.action {
         AppAction::Launch(idx) | AppAction::LaunchDangerously(idx) => {
-            if let Some(session) = resolve(idx) {
-                if !session.cwd.is_empty() {
-                    let cwd_path = std::path::Path::new(&session.cwd);
-                    if cwd_path.is_dir() {
-                        std::env::set_current_dir(cwd_path).ok();
-                    }
+            let Some(session) = resolve(idx) else {
+                return 1;
+            };
+            if !session.cwd.is_empty() {
+                let cwd_path = Path::new(&session.cwd);
+                if cwd_path.is_dir() {
+                    std::env::set_current_dir(cwd_path).ok();
+                } else {
+                    eprintln!(
+                        "sessy: {} no longer exists; resuming from the current directory",
+                        session.cwd
+                    );
                 }
-                let mut cmd = std::process::Command::new("claude");
-                cmd.arg("--resume").arg(&session.id);
-                if matches!(app.action, AppAction::LaunchDangerously(_)) {
-                    cmd.arg("--dangerously-skip-permissions");
-                }
-                if let Err(e) = cmd.status() {
-                    eprintln!("Failed to launch claude: {}", e);
+            }
+            let mut cmd = std::process::Command::new("claude");
+            cmd.arg("--resume").arg(&session.id);
+            if matches!(app.action, AppAction::LaunchDangerously(_)) {
+                cmd.arg("--dangerously-skip-permissions");
+            }
+            match cmd.status() {
+                Ok(status) => status.code().unwrap_or(1),
+                Err(e) => {
+                    eprintln!(
+                        "sessy: couldn't run `claude` ({}). Is Claude Code installed and on your PATH?",
+                        e
+                    );
+                    127
                 }
             }
         }
-        AppAction::Yank(idx) => {
-            if let Some(session) = resolve(idx) {
-                let cmd = format!("claude --resume {}", session.id);
-                match copypasta::ClipboardContext::new() {
-                    Ok(mut ctx) => {
-                        use copypasta::ClipboardProvider;
-                        if let Err(e) = ctx.set_contents(cmd.clone()) {
-                            eprintln!("Clipboard error: {}", e);
-                        } else {
-                            // stderr: keeps stdout clean for --print substitution.
-                            eprintln!("Copied: {}", cmd);
-                        }
-                    }
-                    Err(e) => eprintln!("Clipboard error: {}", e),
-                }
-            }
-        }
-        AppAction::Print(idx) => {
-            if let Some(session) = resolve(idx) {
+        AppAction::Print(idx) => match resolve(idx) {
+            Some(session) => {
                 println!("{}", session.id);
+                0
             }
-        }
-        _ => {}
+            None => 1,
+        },
+        _ if app.print_mode => 1,
+        _ => 0,
     }
 }
 
@@ -291,44 +324,42 @@ fn run_event_loop<B: ratatui::backend::Backend<Error = io::Error>>(
     terminal: &mut ratatui::Terminal<B>,
     app: &mut App,
 ) -> io::Result<()> {
-    if !app.filtered_indices.is_empty() {
-        preview::request_preview(app);
-    }
+    preview::request_preview(app);
 
+    let mut dirty = true;
+    let mut last_draw = Instant::now();
     loop {
-        terminal.draw(|frame| ui::draw(frame, app))?;
-        // terminal_height is updated inside draw()
+        // Redraw on change, plus a slow tick so the loading indicator and
+        // status-message expiry still update when idle.
+        if dirty || last_draw.elapsed() >= Duration::from_millis(250) {
+            terminal.draw(|frame| ui::draw(frame, app))?;
+            last_draw = Instant::now();
+            dirty = false;
+        }
 
         if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+            // Drain everything already queued (fast typing, key repeat) before
+            // searching and redrawing once.
+            loop {
+                match event::read()? {
+                    Event::Key(key) if key.kind != KeyEventKind::Release => handle_key(app, key),
+                    Event::Paste(text) => handle_paste(app, &text),
+                    _ => {}
                 }
-
-                // Delete confirmation
-                if app.confirm_delete {
-                    match key.code {
-                        KeyCode::Char('d') | KeyCode::Char('y') => {
-                            app.delete_selected();
-                            preview::request_preview(app);
-                        }
-                        _ => {
-                            app.confirm_delete = false;
-                        }
-                    }
-                    continue;
+                dirty = true;
+                if app.action != AppAction::None || !event::poll(Duration::ZERO)? {
+                    break;
                 }
-
-                match app.focus {
-                    Focus::Search => handle_search_key(app, key),
-                    Focus::PreviewSearch => handle_preview_search_key(app, key),
-                    Focus::Preview => handle_preview_key(app, key.code),
-                    Focus::List => handle_list_key(app, key.code),
-                }
+            }
+            if app.search_dirty {
+                app.apply_search();
+                preview::request_preview(app);
             }
         }
 
-        preview::check_preview_updates(app);
+        if preview::check_preview_updates(app) {
+            dirty = true;
+        }
 
         if app.action != AppAction::None {
             break;
@@ -338,18 +369,95 @@ fn run_event_loop<B: ratatui::backend::Backend<Error = io::Error>>(
     Ok(())
 }
 
+fn handle_key(app: &mut App, key: KeyEvent) {
+    // Ctrl+C quits from anywhere, as in every other terminal program.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.action = AppAction::Quit;
+        return;
+    }
+
+    // Delete confirmation: only an explicit `y` deletes.
+    if app.confirm_delete {
+        app.confirm_delete = false;
+        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+            app.delete_selected();
+            preview::request_preview(app);
+        }
+        return;
+    }
+
+    // The help overlay captures the next keypress to dismiss itself.
+    if app.show_help {
+        app.show_help = false;
+        return;
+    }
+
+    // Typed a query and left the input within one burst of keys: the view
+    // must be current before any list action reads the selection.
+    if app.search_dirty && app.focus != Focus::Search {
+        app.apply_search();
+        preview::request_preview(app);
+    }
+
+    match app.focus {
+        Focus::Search => handle_search_key(app, key),
+        Focus::PreviewSearch => handle_preview_search_key(app, key),
+        Focus::Rename => handle_rename_key(app, key),
+        Focus::Preview => handle_preview_key(app, key),
+        Focus::List => handle_list_key(app, key),
+    }
+}
+
+fn handle_paste(app: &mut App, text: &str) {
+    match app.focus {
+        Focus::Search => {
+            app.search_query.insert_str(text);
+            app.search_dirty = true;
+        }
+        Focus::PreviewSearch => {
+            app.preview_search_query.insert_str(text);
+            app.update_preview_search();
+        }
+        Focus::Rename => app.rename_input.insert_str(text),
+        Focus::List | Focus::Preview => {}
+    }
+}
+
 fn handle_search_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Navigation moves through the results (like fzf) without leaving the input.
+    let nav = match key.code {
+        KeyCode::Up => Some(App::move_up as fn(&mut App)),
+        KeyCode::Down => Some(App::move_down as fn(&mut App)),
+        KeyCode::Char('p') if ctrl => Some(App::move_up as fn(&mut App)),
+        KeyCode::Char('n') if ctrl => Some(App::move_down as fn(&mut App)),
+        KeyCode::PageUp => Some(App::page_up as fn(&mut App)),
+        KeyCode::PageDown => Some(App::page_down as fn(&mut App)),
+        _ => None,
+    };
+    if let Some(nav) = nav {
+        if app.search_dirty {
+            app.apply_search();
+        }
+        nav(app);
+        preview::request_preview(app);
+        return;
+    }
+
     match key.code {
         KeyCode::Esc => {
             app.handle_esc();
+            preview::request_preview(app);
         }
         KeyCode::Enter => {
             app.focus = Focus::List;
         }
+        KeyCode::Tab => {
+            app.focus = Focus::Preview;
+        }
         _ => {
             if handle_text_input_key(&mut app.search_query, key) {
-                app.apply_search();
-                preview::request_preview(app);
+                app.search_dirty = true;
             }
         }
     }
@@ -372,10 +480,28 @@ fn handle_preview_search_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Shared line editing for the search inputs: cursor movement (arrows, word
+fn handle_rename_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.cancel_rename(),
+        KeyCode::Enter => app.commit_rename(),
+        _ => {
+            handle_text_input_key(&mut app.rename_input, key);
+        }
+    }
+}
+
+/// Shared line editing for the text inputs: cursor movement (arrows, word
 /// jumps, Home/End and their macOS/readline synonyms) and edits at the cursor.
-/// Returns true when the text changed (cursor-only moves return false).
+/// Returns true only when the text actually changed — cursor moves and no-op
+/// edits (Backspace on an empty query) must not re-run the search, which
+/// would reset the selection.
 fn handle_text_input_key(input: &mut sessy::input::TextInput, key: KeyEvent) -> bool {
+    let before = input.text().to_string();
+    edit_text_input(input, key);
+    input.text() != before
+}
+
+fn edit_text_input(input: &mut sessy::input::TextInput, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let cmd = key.modifiers.contains(KeyModifiers::SUPER);
@@ -385,64 +511,57 @@ fn handle_text_input_key(input: &mut sessy::input::TextInput, key: KeyEvent) -> 
         KeyCode::Backspace if cmd => input.delete_to_start(),
         KeyCode::Backspace => input.backspace(),
         KeyCode::Delete => input.delete_forward(),
+        KeyCode::Char('h') if ctrl => input.backspace(),
         KeyCode::Char('w') if ctrl => input.delete_word_backwards(),
         KeyCode::Char('u') if ctrl => input.delete_to_start(),
         KeyCode::Char('k') if ctrl => input.delete_to_end(),
-        KeyCode::Left if alt || ctrl => {
-            input.move_word_left();
-            return false;
-        }
-        KeyCode::Right if alt || ctrl => {
-            input.move_word_right();
-            return false;
-        }
-        KeyCode::Left if cmd => {
-            input.move_home();
-            return false;
-        }
-        KeyCode::Right if cmd => {
-            input.move_end();
-            return false;
-        }
-        KeyCode::Left => {
-            input.move_left();
-            return false;
-        }
-        KeyCode::Right => {
-            input.move_right();
-            return false;
-        }
-        KeyCode::Home => {
-            input.move_home();
-            return false;
-        }
-        KeyCode::End => {
-            input.move_end();
-            return false;
-        }
-        KeyCode::Char('a') if ctrl => {
-            input.move_home();
-            return false;
-        }
-        KeyCode::Char('e') if ctrl => {
-            input.move_end();
-            return false;
-        }
+        KeyCode::Left if alt || ctrl => input.move_word_left(),
+        KeyCode::Right if alt || ctrl => input.move_word_right(),
+        KeyCode::Char('b') if alt => input.move_word_left(),
+        KeyCode::Char('f') if alt => input.move_word_right(),
+        KeyCode::Left if cmd => input.move_home(),
+        KeyCode::Right if cmd => input.move_end(),
+        KeyCode::Left => input.move_left(),
+        KeyCode::Right => input.move_right(),
+        KeyCode::Home => input.move_home(),
+        KeyCode::End => input.move_end(),
+        KeyCode::Char('a') if ctrl => input.move_home(),
+        KeyCode::Char('e') if ctrl => input.move_end(),
         KeyCode::Char(c) if !ctrl && !alt && !cmd => input.insert(c),
-        _ => return false,
+        _ => {}
     }
-    true
 }
 
-fn handle_preview_key(app: &mut App, code: KeyCode) {
-    match code {
-        // Tab always returns to the list; Esc first clears an active search.
-        KeyCode::Tab => app.focus = Focus::List,
+/// Modifier combos other than Shift. Keys are bound on their bare letter; a
+/// stray Ctrl+D must not reach the `d` (delete) binding.
+fn has_command_modifier(key: &KeyEvent) -> bool {
+    key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+}
+
+fn handle_preview_key(app: &mut App, key: KeyEvent) {
+    if has_command_modifier(&key) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('d') | KeyCode::Char('f') => app.scroll_preview_page_down(),
+                KeyCode::Char('u') | KeyCode::Char('b') => app.scroll_preview_page_up(),
+                KeyCode::Char('n') => app.scroll_preview_down(),
+                KeyCode::Char('p') => app.scroll_preview_up(),
+                _ => {}
+            }
+        }
+        return;
+    }
+    match key.code {
+        // Tab/← always return to the list; Esc first clears an active search.
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Left => app.focus = Focus::List,
         KeyCode::Esc => app.handle_esc(),
         KeyCode::Up | KeyCode::Char('k') => app.scroll_preview_up(),
         KeyCode::Down | KeyCode::Char('j') => app.scroll_preview_down(),
-        KeyCode::PageUp => app.scroll_preview_page_up(app.terminal_height / 2),
-        KeyCode::PageDown => app.scroll_preview_page_down(app.terminal_height / 2),
+        KeyCode::PageUp => app.scroll_preview_page_up(),
+        KeyCode::PageDown | KeyCode::Char(' ') => app.scroll_preview_page_down(),
+        KeyCode::Home | KeyCode::Char('g') => app.scroll_preview_top(),
+        KeyCode::End | KeyCode::Char('G') => app.scroll_preview_bottom(),
         KeyCode::Char('/') => app.start_preview_search(),
         KeyCode::Char('n') => app.next_preview_match(),
         KeyCode::Char('N') => app.prev_preview_match(),
@@ -451,6 +570,7 @@ fn handle_preview_key(app: &mut App, code: KeyCode) {
             preview::request_preview(app);
         }
         KeyCode::Char('f') => app.toggle_files(),
+        KeyCode::Char('?') => app.show_help = true,
         KeyCode::Char('q') => {
             app.action = AppAction::Quit;
         }
@@ -458,17 +578,26 @@ fn handle_preview_key(app: &mut App, code: KeyCode) {
     }
 }
 
-fn handle_list_key(app: &mut App, code: KeyCode) {
-    // The help overlay captures the next keypress to dismiss itself.
-    if app.show_help {
-        app.show_help = false;
+fn handle_list_key(app: &mut App, key: KeyEvent) {
+    if has_command_modifier(&key) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && app.view_mode == ViewMode::Normal {
+            match key.code {
+                KeyCode::Char('n') => app.move_down(),
+                KeyCode::Char('p') => app.move_up(),
+                KeyCode::Char('d') | KeyCode::Char('f') => app.page_down(),
+                KeyCode::Char('u') | KeyCode::Char('b') => app.page_up(),
+                _ => return,
+            }
+            preview::request_preview(app);
+        }
         return;
     }
 
-    // In timeline view, only allow t/Esc/q
+    // In timeline view, only allow t/Esc/q/?
     if app.view_mode == ViewMode::Timeline {
-        match code {
+        match key.code {
             KeyCode::Char('t') | KeyCode::Esc => app.handle_esc(),
+            KeyCode::Char('?') => app.show_help = true,
             KeyCode::Char('q') => {
                 app.action = AppAction::Quit;
             }
@@ -477,8 +606,12 @@ fn handle_list_key(app: &mut App, code: KeyCode) {
         return;
     }
 
-    match code {
-        KeyCode::Esc => app.handle_esc(),
+    let has_selection = app.selected_session().is_some();
+    match key.code {
+        KeyCode::Esc => {
+            app.handle_esc();
+            preview::request_preview(app);
+        }
         KeyCode::Char('q') => {
             app.action = AppAction::Quit;
         }
@@ -492,7 +625,7 @@ fn handle_list_key(app: &mut App, code: KeyCode) {
         KeyCode::Char('?') => {
             app.show_help = true;
         }
-        KeyCode::Tab => {
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Right => {
             app.focus = Focus::Preview;
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -504,13 +637,11 @@ fn handle_list_key(app: &mut App, code: KeyCode) {
             preview::request_preview(app);
         }
         KeyCode::PageUp => {
-            let page = (app.terminal_height as usize / 4).max(1);
-            app.page_up(page);
+            app.page_up();
             preview::request_preview(app);
         }
         KeyCode::PageDown => {
-            let page = (app.terminal_height as usize / 4).max(1);
-            app.page_down(page);
+            app.page_down();
             preview::request_preview(app);
         }
         KeyCode::Char('g') | KeyCode::Home => {
@@ -521,30 +652,27 @@ fn handle_list_key(app: &mut App, code: KeyCode) {
             app.move_to_bottom();
             preview::request_preview(app);
         }
-        KeyCode::Enter => {
-            if app.selected_session().is_some() {
-                if app.print_mode {
-                    app.action = AppAction::Print(app.selected);
-                } else {
-                    app.action = AppAction::LaunchDangerously(app.selected);
-                }
-            }
+        // In --print mode every "pick this one" key prints: launching claude
+        // inside `$(sessy --print)` would capture its output.
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Char('p') if has_selection && app.print_mode => {
+            app.action = AppAction::Print(app.selected);
         }
-        KeyCode::Char('l') => {
-            if app.selected_session().is_some() {
-                app.action = AppAction::Launch(app.selected);
-            }
+        KeyCode::Enter if has_selection => {
+            app.action = if app.enter_yolo {
+                AppAction::LaunchDangerously(app.selected)
+            } else {
+                AppAction::Launch(app.selected)
+            };
         }
-        KeyCode::Char('c') => {
-            if app.selected_session().is_some() {
-                app.action = AppAction::Yank(app.selected);
-            }
+        KeyCode::Char('l') if has_selection => {
+            app.action = AppAction::Launch(app.selected);
         }
-        KeyCode::Char('p') => {
-            if app.selected_session().is_some() {
-                app.action = AppAction::Print(app.selected);
-            }
+        KeyCode::Char('p') if has_selection => {
+            app.action = AppAction::Print(app.selected);
         }
+        KeyCode::Char('c') => app.copy_selected(),
+        KeyCode::Char('o') => app.open_pr(),
+        KeyCode::Char('r') => app.start_rename(),
         KeyCode::Char('s') => {
             app.cycle_sort();
             preview::request_preview(app);
@@ -565,25 +693,17 @@ fn handle_list_key(app: &mut App, code: KeyCode) {
         KeyCode::Char('f') => {
             app.toggle_files();
         }
-        KeyCode::Char('d') => {
-            if !app.filtered_indices.is_empty() {
-                app.confirm_delete = true;
-            }
+        KeyCode::Char('d') if has_selection => {
+            app.confirm_delete = true;
         }
-        KeyCode::Char('1') => {
-            app.toggle_size_filter("quick");
-            preview::request_preview(app);
-        }
-        KeyCode::Char('2') => {
-            app.toggle_size_filter("medium");
-            preview::request_preview(app);
-        }
-        KeyCode::Char('3') => {
-            app.toggle_size_filter("deep");
-            preview::request_preview(app);
-        }
-        KeyCode::Char('4') => {
-            app.toggle_size_filter("massive");
+        KeyCode::Char(c @ '1'..='4') => {
+            let category = match c {
+                '1' => "quick",
+                '2' => "medium",
+                '3' => "deep",
+                _ => "massive",
+            };
+            app.toggle_size_filter(category);
             preview::request_preview(app);
         }
         KeyCode::Char('0') => {
@@ -606,6 +726,156 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    fn app_with(ids: &[&str]) -> App {
+        let sessions = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| session::SessionMeta {
+                id: id.to_string(),
+                project: "p".into(),
+                branch: String::new(),
+                name: format!("session {}", id),
+                title: String::new(),
+                last_message: String::new(),
+                duration_secs: 0,
+                timestamp: 100 - i as i64,
+                file_size: 0,
+                file_mtime: 0,
+                file_path: PathBuf::from(format!("/does/not/exist/{}.jsonl", id)),
+                cwd: String::new(),
+                message_count: 0,
+                tickets: vec![],
+                text_offset: 0,
+                text_len: 0,
+                name_lc: format!("session {}", id),
+                title_lc: String::new(),
+                project_lc: "p".into(),
+                branch_lc: String::new(),
+                permission_mode: String::new(),
+                cc_version: String::new(),
+                skills: vec![],
+                changed_files: vec![],
+                changed_files_lc: String::new(),
+                prs: vec![],
+                recap: String::new(),
+            })
+            .collect();
+        let cache = sessy::text_cache::TextCache::open(Path::new("/does/not/exist"));
+        let mut app = App::new(sessions, false, HashSet::new(), cache);
+        app.rebuild_view();
+        app
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        handle_key(app, key(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_the_search_input() {
+        let mut app = app_with(&["a"]);
+        app.focus = Focus::Search;
+        handle_key(&mut app, key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(app.action, AppAction::Quit);
+        assert_eq!(app.search_query.text(), "");
+    }
+
+    #[test]
+    fn ctrl_letters_do_not_trigger_list_actions() {
+        let mut app = app_with(&["a", "b"]);
+        // Ctrl+D is a page-down habit, not "delete"; Ctrl+L must not launch.
+        handle_key(&mut app, key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(!app.confirm_delete);
+        assert_eq!(app.selected, 1, "Ctrl+D pages down");
+        handle_key(&mut app, key(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert_eq!(app.action, AppAction::None);
+        handle_key(&mut app, key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.selected, 0, "Ctrl+P moves up");
+    }
+
+    #[test]
+    fn delete_needs_an_explicit_y() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.confirm_delete);
+        // A second `d` (double tap) cancels instead of deleting.
+        press(&mut app, KeyCode::Char('d'));
+        assert!(!app.confirm_delete);
+        assert_eq!(app.sessions.len(), 1);
+    }
+
+    #[test]
+    fn arrows_in_search_move_through_fresh_results() {
+        let mut app = app_with(&["a", "b", "c"]);
+        press(&mut app, KeyCode::Char('/'));
+        for c in "session".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert!(app.search_dirty, "typing defers the search to the event loop");
+        press(&mut app, KeyCode::Down);
+        assert!(!app.search_dirty, "navigation runs the pending search first");
+        assert_eq!(app.focus, Focus::Search, "focus stays in the input");
+        assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn list_keys_in_the_same_burst_see_the_typed_query() {
+        let mut app = app_with(&["a", "b", "c"]);
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('c'));
+        press(&mut app, KeyCode::Enter); // back to the list, search still pending
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.action, AppAction::Print(0));
+        assert_eq!(app.selected_session().map(|s| s.id.as_str()), Some("c"));
+    }
+
+    #[test]
+    fn print_mode_makes_every_pick_key_print() {
+        let mut app = app_with(&["a"]);
+        app.print_mode = true;
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(app.action, AppAction::Print(0));
+    }
+
+    #[test]
+    fn enter_follows_the_configured_action() {
+        let mut app = app_with(&["a"]);
+        app.enter_yolo = false;
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.action, AppAction::Launch(0));
+    }
+
+    #[test]
+    fn help_opens_from_preview_and_any_key_closes_it() {
+        let mut app = app_with(&["a"]);
+        app.focus = Focus::Preview;
+        press(&mut app, KeyCode::Char('?'));
+        assert!(app.show_help);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.show_help);
+        assert_eq!(app.action, AppAction::None, "the closing key is swallowed");
+    }
+
+    #[test]
+    fn paste_into_search_is_one_edit() {
+        let mut app = app_with(&["a"]);
+        app.focus = Focus::Search;
+        handle_paste(&mut app, "PROJ-123\n");
+        assert_eq!(app.search_query.text(), "PROJ-123");
+        assert!(app.search_dirty);
+    }
+
+    #[test]
+    fn project_root_is_the_enclosing_git_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src/deep")).unwrap();
+        assert_eq!(project_root(&repo.join("src/deep")), repo);
+        let loose = dir.path().join("loose");
+        std::fs::create_dir_all(&loose).unwrap();
+        assert_eq!(project_root(&loose), loose);
     }
 
     #[test]
@@ -679,6 +949,19 @@ mod tests {
         handle_search_key(&mut app, key(KeyCode::Left, KeyModifiers::NONE));
         handle_search_key(&mut app, key(KeyCode::Home, KeyModifiers::NONE));
         assert_eq!(app.selected, 3);
+    }
+
+    #[test]
+    fn noop_edits_do_not_reset_the_selection() {
+        let mut app = app_with(&["a", "b", "c"]);
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        // Stray Backspace / Delete on an empty query changes nothing.
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Delete);
+        assert!(!app.search_dirty);
+        assert_eq!(app.selected, 2);
     }
 
     #[test]
