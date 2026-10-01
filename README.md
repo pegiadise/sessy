@@ -72,7 +72,7 @@ Press `?` in the app for the full list.
 
 ### Search input
 
-Type to filter; `↑` / `↓` move through the results without leaving the input, `Enter` moves focus to the list, `Esc` clears. Pasting works as one edit; `Ctrl+V` reads the system clipboard when the terminal doesn't paste on its own (pbpaste / wl-paste / xclip / xsel, or the Windows clipboard).
+Type to filter; `↑` / `↓` move through the results without leaving the input, `Enter` moves focus to the list, `Esc` clears. Pasting works as one edit; `Ctrl+V` reads the system clipboard when the terminal doesn't paste on its own (pbpaste / wl-paste / xclip / xsel, or the Windows clipboard). Windows Terminal pastes `Ctrl+V` as keystrokes, so press `/` first there.
 
 | Key | Action |
 |-----|--------|

@@ -4,12 +4,12 @@ All notable changes to sessy. The format follows [Keep a Changelog](https://keep
 
 Each version's section doubles as its GitHub release notes (`scripts/release-notes.sh vX.Y.Z`).
 
-## [Unreleased]
+## [1.4.0] - 2026-10-01
 
 ### Added
 
 - Pasting while browsing the list or preview (`⌘V`, `Ctrl+V`, or the terminal's own paste) searches for the pasted text right away, replacing the current query.
-- `Ctrl+V` reads the system clipboard when the terminal sends it as a key instead of pasting, as most Linux terminals and some Windows consoles do. It also works in the search, find-in-preview and rename inputs.
+- `Ctrl+V` reads the system clipboard when the terminal sends it as a key instead of pasting, as most Linux terminals and some Windows consoles do. It also works in the search, find-in-preview and rename inputs. Windows Terminal types `Ctrl+V` pastes as keystrokes, so there press `/` before pasting (or unbind `Ctrl+V` in its settings to let sessy read the clipboard).
 
 ## [1.3.0] - 2026-09-24
 
@@ -159,7 +159,7 @@ Covers 0.2.0 – 0.2.3.
 
 First release (0.1.0 – 0.1.10): a two-pane TUI to browse, search, preview, and resume Claude Code sessions.
 
-[Unreleased]: https://github.com/pegiadise/sessy/compare/v1.3.0...HEAD
+[1.4.0]: https://github.com/pegiadise/sessy/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/pegiadise/sessy/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/pegiadise/sessy/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/pegiadise/sessy/compare/v1.0.1...v1.1.0

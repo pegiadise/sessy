@@ -4,7 +4,7 @@ TUI session manager for Claude Code — browse, search, preview, and resume conv
 
 FOSS Rust CLI, published on crates.io (`cargo install sessy`). Doubles as a studio lead-gen footprint: the crate `homepage`/`repository` metadata and README backlink point to agileturtles.gr (see `Cargo.toml`).
 
-- **Crate / binary**: `sessy` — current version **1.3.0** (matches `Cargo.toml`; verify there before assuming).
+- **Crate / binary**: `sessy` — current version **1.4.0** (matches `Cargo.toml`; verify there before assuming).
 - **Repo**: github.com/pegiadise/sessy (also a git checkout here).
 - License MIT, Rust 2024 edition, MSRV 1.86.
 
@@ -69,11 +69,11 @@ Stdout hygiene in `--print` mode: crossterm's kitty-keyboard probe writes its qu
 - Filter out `gitBranch: "HEAD"` — it's noise from detached HEAD states
 - Timeline heatmap uses GitHub-style green color scale
 - Bookmarked sessions float to top of any sort order
-- List/preview key handlers ignore Ctrl/Alt/Super combos except explicit ones (Ctrl+N/P/D/U/F/B); Ctrl+C quits from any focus; delete confirms only on `y`
+- List/preview key handlers ignore Ctrl/Alt/Super combos except explicit ones (Ctrl+N/P/D/U/F/B); Ctrl+C quits from any focus; Ctrl+V/⌘V (as a key) reads the clipboard from any focus; a paste outside an input replaces the query and searches; delete confirms only on `y`. Windows has no paste events (crossterm), so Windows Terminal's Ctrl+V arrives as keystrokes
 
 ## Release / publish
 
-Releases are tagged `vX.Y.Z` (latest `v1.3.0`). Every version has a `CHANGELOG.md` section, and that section *is* the GitHub release body — GitHub's auto-generated notes only list merged PRs, and this repo commits straight to `main`, so they come out empty. Flow:
+Releases are tagged `vX.Y.Z` (latest `v1.4.0`). Every version has a `CHANGELOG.md` section, and that section *is* the GitHub release body — GitHub's auto-generated notes only list merged PRs, and this repo commits straight to `main`, so they come out empty. Flow:
 
 1. Add the version's section to `CHANGELOG.md` (Keep a Changelog: Added / Changed / Fixed, user-facing wording, no internal/employer names — the repo is public) plus its compare link at the bottom.
 2. Bump `version` in `Cargo.toml` (and the version mentions in this file).
