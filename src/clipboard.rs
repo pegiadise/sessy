@@ -42,6 +42,54 @@ fn clipboard_tools() -> Vec<(&'static str, &'static [&'static str])> {
     tools
 }
 
+/// Read the system clipboard as text. Used when Ctrl+V/⌘V reaches sessy as a
+/// key instead of the terminal pasting (bracketed paste) on its own.
+pub fn paste() -> Result<String, String> {
+    for (program, args) in paste_tools() {
+        if let Ok(text) = read_from(program, args) {
+            return Ok(text);
+        }
+    }
+    copypasta_paste().map_err(|e| format!("no clipboard available: {}", e))
+}
+
+fn paste_tools() -> Vec<(&'static str, &'static [&'static str])> {
+    let mut tools: Vec<(&'static str, &'static [&'static str])> = Vec::new();
+    if cfg!(target_os = "macos") {
+        tools.push(("pbpaste", &[]));
+    } else if cfg!(windows) {
+        // copypasta reads the Win32 clipboard directly.
+    } else {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            tools.push(("wl-paste", &["--no-newline", "--type", "text"]));
+        }
+        if std::env::var_os("DISPLAY").is_some() {
+            tools.push(("xclip", &["-selection", "clipboard", "-o"]));
+            tools.push(("xsel", &["--clipboard", "--output"]));
+        }
+    }
+    tools
+}
+
+fn read_from(program: &str, args: &[&str]) -> std::io::Result<String> {
+    let out = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(std::io::Error::other(format!("{} exited with {}", program, out.status)))
+    }
+}
+
+fn copypasta_paste() -> Result<String, String> {
+    use copypasta::ClipboardProvider;
+    let mut ctx = copypasta::ClipboardContext::new().map_err(|e| e.to_string())?;
+    ctx.get_contents().map_err(|e| e.to_string())
+}
+
 fn pipe_to(program: &str, args: &[&str], text: &str) -> std::io::Result<()> {
     let mut child = Command::new(program)
         .args(args)

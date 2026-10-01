@@ -392,6 +392,17 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Terminals that don't paste on Ctrl+V (most Linux ones, Windows consoles
+    // with the binding off) send the key through; read the clipboard instead.
+    if is_paste_key(&key) {
+        match sessy::clipboard::paste() {
+            Ok(text) if !text.trim().is_empty() => handle_paste(app, &text),
+            Ok(_) => app.set_status("Clipboard is empty".to_string()),
+            Err(e) => app.set_status(format!("Paste failed: {}", e)),
+        }
+        return;
+    }
+
     // Typed a query and left the input within one burst of keys: the view
     // must be current before any list action reads the selection.
     if app.search_dirty && app.focus != Focus::Search {
@@ -408,7 +419,21 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Ctrl+V, or ⌘V when the terminal forwards it as a key.
+fn is_paste_key(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+        && key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
 fn handle_paste(app: &mut App, text: &str) {
+    // An open prompt takes the paste as its next input, like any key: it
+    // isn't `y`, so a pending delete is cancelled.
+    if app.confirm_delete || app.show_help {
+        app.confirm_delete = false;
+        app.show_help = false;
+        return;
+    }
     match app.focus {
         Focus::Search => {
             app.search_query.insert_str(text);
@@ -419,7 +444,18 @@ fn handle_paste(app: &mut App, text: &str) {
             app.update_preview_search();
         }
         Focus::Rename => app.rename_input.insert_str(text),
-        Focus::List | Focus::Preview => {}
+        // Outside an input, pasting searches for the pasted text right away.
+        Focus::List | Focus::Preview => {
+            let text = text.trim();
+            if text.is_empty() {
+                return;
+            }
+            app.view_mode = ViewMode::Normal;
+            app.focus = Focus::Search;
+            app.search_query.clear();
+            app.search_query.insert_str(text);
+            app.search_dirty = true;
+        }
     }
 }
 
@@ -864,6 +900,69 @@ mod tests {
         handle_paste(&mut app, "PROJ-123\n");
         assert_eq!(app.search_query.text(), "PROJ-123");
         assert!(app.search_dirty);
+    }
+
+    #[test]
+    fn paste_in_the_list_starts_a_fresh_search() {
+        let mut app = app_with(&["a", "b"]);
+        app.search_query = "old".into();
+        handle_paste(&mut app, "  PROJ-123\n");
+        assert_eq!(app.focus, Focus::Search);
+        assert_eq!(app.search_query.text(), "PROJ-123", "replaces the query, trimmed");
+        assert!(app.search_dirty, "the event loop searches right after the paste");
+    }
+
+    #[test]
+    fn paste_in_the_preview_or_timeline_searches_sessions() {
+        let mut app = app_with(&["a"]);
+        app.focus = Focus::Preview;
+        handle_paste(&mut app, "b");
+        assert_eq!(app.focus, Focus::Search);
+        assert_eq!(app.search_query.text(), "b");
+
+        let mut app = app_with(&["a"]);
+        app.view_mode = ViewMode::Timeline;
+        handle_paste(&mut app, "b");
+        assert_eq!(app.view_mode, ViewMode::Normal, "results need the list view");
+        assert_eq!(app.search_query.text(), "b");
+    }
+
+    #[test]
+    fn blank_paste_in_the_list_keeps_the_current_search() {
+        let mut app = app_with(&["a"]);
+        app.search_query = "keep".into();
+        handle_paste(&mut app, " \n");
+        assert_eq!(app.focus, Focus::List);
+        assert_eq!(app.search_query.text(), "keep");
+        assert!(!app.search_dirty);
+    }
+
+    #[test]
+    fn paste_cancels_a_pending_delete() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('d'));
+        handle_paste(&mut app, "yes");
+        assert!(!app.confirm_delete);
+        assert_eq!(app.focus, Focus::List, "the prompt swallows the paste");
+        // The next `y` is a plain key again, not a delete confirmation.
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.sessions.len(), 1);
+    }
+
+    #[test]
+    fn ctrl_v_and_cmd_v_are_paste_keys() {
+        assert!(is_paste_key(&key(KeyCode::Char('v'), KeyModifiers::CONTROL)));
+        assert!(is_paste_key(&key(KeyCode::Char('v'), KeyModifiers::SUPER)));
+        assert!(is_paste_key(&key(
+            KeyCode::Char('V'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )));
+        assert!(!is_paste_key(&key(KeyCode::Char('v'), KeyModifiers::NONE)));
+        assert!(!is_paste_key(&key(KeyCode::Char('v'), KeyModifiers::ALT)));
+        assert!(!is_paste_key(&key(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        )));
     }
 
     #[test]

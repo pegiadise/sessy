@@ -54,6 +54,7 @@ Press `?` in the app for the full list.
 | `c` | Copy a ready-to-run `cd <dir> && claude --resume <id>` command (stays open) |
 | `p` | Print session ID to stdout and exit |
 | `/` | Search (title, name, project, branch, changed files, tickets/PR numbers, full conversation text) |
+| `⌘V` / `Ctrl+V` | Search for the pasted text right away (replaces the current query) |
 | `s` | Cycle sort: date → size → duration → messages (while searching: relevance → date → …) |
 | `1` `2` `3` `4` | Filter by size: quick / medium / deep / massive (`0` clears) |
 | `a` | Toggle scope: current project ↔ all projects |
@@ -71,7 +72,7 @@ Press `?` in the app for the full list.
 
 ### Search input
 
-Type to filter; `↑` / `↓` move through the results without leaving the input, `Enter` moves focus to the list, `Esc` clears. Pasting works as one edit.
+Type to filter; `↑` / `↓` move through the results without leaving the input, `Enter` moves focus to the list, `Esc` clears. Pasting works as one edit; `Ctrl+V` reads the system clipboard when the terminal doesn't paste on its own (pbpaste / wl-paste / xclip / xsel, or the Windows clipboard).
 
 | Key | Action |
 |-----|--------|

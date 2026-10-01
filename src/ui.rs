@@ -77,7 +77,7 @@ fn draw_search_bar(frame: &mut Frame, app: &App, area: Rect) {
         let hint = if focused {
             "titles, projects, branches, files, tickets, full conversation text…"
         } else {
-            "Press / to search"
+            "Press / to search, or paste"
         };
         let p = Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))).block(block);
         frame.render_widget(p, area);
@@ -938,6 +938,7 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
                 ("c", "copy the resume command"),
                 ("p", "print session id and exit"),
                 ("/", "search titles, files, tickets, full text"),
+                ("⌘V  Ctrl+V", "search for the pasted text"),
                 ("s", "sort: date · size · duration · messages"),
                 ("a", "scope: this project ↔ all projects"),
                 ("1-4  0", "size filter: quick…massive / clear"),
