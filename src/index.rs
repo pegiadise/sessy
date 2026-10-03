@@ -60,12 +60,15 @@ fn is_session_file(path: &Path) -> bool {
             .is_some_and(|s| s.starts_with("agent-"))
 }
 
+/// bincode 2 with the `legacy` config writes the same bytes as bincode 1's
+/// `serialize`/`deserialize`, so caches written by older sessy builds still load.
 pub fn serialize_index(index: &SessionIndex) -> Vec<u8> {
-    bincode::serialize(index).unwrap_or_default()
+    bincode::serde::encode_to_vec(index, bincode::config::legacy()).unwrap_or_default()
 }
 
 pub fn deserialize_index(bytes: &[u8]) -> Option<SessionIndex> {
-    let index: SessionIndex = bincode::deserialize(bytes).ok()?;
+    let (index, _): (SessionIndex, usize) =
+        bincode::serde::decode_from_slice(bytes, bincode::config::legacy()).ok()?;
     if index.version != INDEX_VERSION {
         return None;
     }

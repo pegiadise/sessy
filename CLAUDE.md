@@ -7,7 +7,10 @@ TUI session manager for Claude Code — browse, search, preview, and resume conv
 ## Status (2026-10-02)
 
 - Latest release **v1.4.0** (2026-10-01): on crates.io, tagged, GitHub release published. `Cargo.toml` is the source of truth for the version.
-- Rust 2024 edition, MSRV 1.86 (`rust-version` in `Cargo.toml`; README says "Requires Rust 1.86+").
+- Rust 2024 edition, MSRV 1.86 (`rust-version` in `Cargo.toml`; README says "Requires Rust 1.86+"). Raising it is the owner's call.
+- Dependencies are at latest stable as of 2026-10-02, with two exceptions:
+  - **ratatui stays on 0.30.0**: 0.30.1+ needs Rust 1.88. Edition 2024 means Cargo's MSRV-aware resolver, so `cargo update` holds it (and other deps) back on its own. `cargo update --verbose` lists what's held and why.
+  - **bincode stays on 2.0.1**: 3.0.0 is a tombstone release that only contains `compile_error!`, and the crate is unmaintained (RUSTSEC-2025-0141). Moving to wincode/postcard would change the cache format, so that's the owner's call.
 - The crate `homepage` (agileturtles.gr/en/products/sessy) and the README link back to the author's site; keep them when touching metadata.
 
 ## Commands
@@ -16,9 +19,13 @@ TUI session manager for Claude Code — browse, search, preview, and resume conv
 cargo build              # dev build
 cargo test               # unit tests + tests/search_integration.rs (fixtures in tests/fixtures/)
 cargo clippy --all-targets  # lint (repo is kept clippy-clean)
+cargo +1.86 check --all-targets --locked  # MSRV check (1.86 toolchain is installed)
 cargo build --release    # optimized build (lto + strip, see [profile.release])
 cargo run -- --all       # run the TUI against all projects
 ```
+
+- The tree is **not** rustfmt-clean (`cargo fmt --check` fails on `main`). Don't run `cargo fmt` over the whole crate in an unrelated change; format only the lines you touch.
+- TUI smoke test without touching the real cache: run in a pty with `HOME=<scratch>` and `CLAUDE_CONFIG_DIR=<scratch>` holding a `projects/<dir>/` with a few `.jsonl` files (e.g. copies of `tests/fixtures/`). Against the real `~/.claude/projects`, the first index build in a fresh `HOME` is slow (a debug build still hadn't drawn after ~20 s).
 
 CLI flags (`src/main.rs`, README): default = sessions for the current project; `--all`/`-a` (every project); `--project X` (substring filter, implies all projects); `--recent 7d` (1h/7d/2w/1m; invalid values exit with an error); `--rebuild-index` (ignore the cache; not in the README); `--print` (emit the picked session ID for `claude --resume $(sessy --print)`; the TUI renders on **stderr** so stdout stays clean, every pick key prints, quitting exits 1); `--purge` (delete sessions < 15 KB older than 2 days, pinned ones kept; respects `--project`/`--recent`). After a resume, sessy exits with claude's exit code.
 
@@ -31,16 +38,18 @@ src/
   app.rs        — App state; focus/view modes; sort/scope/size filter; bookmark/search/rename/copy; selection preservation
   ui.rs         — Two-pane ratatui rendering: session list + preview/files + timeline + help overlay + context-sensitive status bar; wrapping helpers
   clipboard.rs  — Copy (pbcopy / wl-copy / xclip / xsel / copypasta / OSC 52) and open-URL
-  index.rs      — Filesystem scanner, bincode cache (~/.cache/sessy/index.bin), incremental rebuild
+  index.rs      — Filesystem scanner, bincode cache (<cache>/sessy/index.bin), incremental rebuild
   input.rs      — TextInput: single-line editor with movable cursor (search bars)
   parser.rs     — JSONL single-pass scanner; human message detection; conversation extraction (with optional tool lines)
   session.rs    — SessionMeta struct, formatting helpers (duration, file size, size category)
   preview.rs    — Single background preview worker (skips to the newest request) + FIFO cache
-  text_cache.rs — mmap'd companion (~/.cache/sessy/text.bin) holding searchable conversation text (user + assistant + thinking + tool I/O)
+  text_cache.rs — mmap'd companion (<cache>/sessy/text.bin) holding searchable conversation text (user + assistant + thinking + tool I/O)
   config.rs     — Optional ~/.config/sessy/config.toml (scope, sort, show_tool_activity, enter); parse errors surface in the status bar
-  bookmarks.rs  — Bookmark persistence (~/.cache/sessy/bookmarks.json)
+  bookmarks.rs  — Bookmark persistence (<cache>/sessy/bookmarks.json)
   export.rs     — Markdown export of session conversations
 ```
+
+`<cache>` is `dirs::cache_dir()`: `~/Library/Caches` on macOS, `~/.cache` on Linux. The README says `~/.cache/sessy/…` throughout, which is only right on Linux.
 
 ## Key concepts and gotchas
 
@@ -49,7 +58,7 @@ src/
 - **Single-pass scan**: `parser::scan_session` reads the whole file once, extracting head meta (title/branch/slug/cwd/first ts), tail meta (last human message/ts/rename), AI title (`type:"ai-title"`), custom title (`type:"custom-title"` — what `/rename` writes today; legacy `/rename` local-command args are the fallback), permission mode, Claude Code version, skills (`attributionSkill`), changed files (`file-history-snapshot` → `trackedFileBackups` + `file-history-delta` → `trackingPath`), PRs (`type:"pr-link"`, also added to tickets as `#N`), recap (`system`/`away_summary`), tickets, and the human message count. Title/`left off` are derived from the human messages it finds — no separate head/tail seek
 - **Human message detection** (`parser::human_text`, shared by scan + preview + export): `type=="user"`, not sidechain, no `toolUseResult`, not `isMeta`/`isCompactSummary`/`isVisibleInTranscriptOnly`, `origin.kind` absent or `"human"` (excludes task notifications and peer-session messages), content is a string **or** a block array (text blocks joined; image-only → `[Image]`), not `[Request interrupted by user…]`, and not command noise (`<command-name>`, `<local-command-stdout>`, `<task-notification>`, `<bash-input>`, …) — except a slash command **with arguments** counts as `"/name args"`. Command-only sessions fall back to the slash-command name as title. Titles/left-off go through `parser::one_line` (pasted_content tags stripped, whitespace folded, ANSI/control chars dropped)
 - **Real format evolves**: before changing the parser, survey real files (`~/.claude/projects/*/*.jsonl`) for entry `type`s and user-content shapes; `tests/fixtures/current_format_session.jsonl` captures the 2026-09 shapes
-- **Index cache**: bincode serialized with version header. `INDEX_VERSION` (in `index.rs`) is **7** — bump it whenever `SessionMeta` *or scan semantics* change. `SessionIndex.text_cache_len` must equal text.bin's size on load, else full rescan (guards against a crash or two instances racing); both files are written temp+rename
+- **Index cache**: bincode serialized with version header. It uses bincode 2's `bincode::serde` API with `config::legacy()`, which writes the same bytes as bincode 1 (checked against a real 1.4.0 cache), so the 1→2 move didn't need a version bump. A different config or serializer changes the format, so bump `INDEX_VERSION` with it. `INDEX_VERSION` (in `index.rs`) is **7** — bump it whenever `SessionMeta` *or scan semantics* change. `SessionIndex.text_cache_len` must equal text.bin's size on load, else full rescan (guards against a crash or two instances racing); both files are written temp+rename
 - **Scope**: `Scope::Current` = sessions whose recorded `cwd` is under the launch project root (nearest `.git` ancestor below `$HOME`, else the launch dir); sessions without a cwd fall back to the encoded dir name. `--project` implies `Scope::All`
 - **Rename** (`r`) appends a `custom-title` entry (Claude Code's own format) and restores the file mtime so the session keeps its date slot
 - **Session name priority**: custom title (`/rename`) > `aiTitle` > `slug` field > empty
