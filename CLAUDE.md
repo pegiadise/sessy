@@ -6,7 +6,7 @@ TUI session manager for Claude Code — browse, search, preview, and resume conv
 
 ## Status (2026-10-02)
 
-- Latest release **v1.4.0** (2026-10-01): on crates.io, tagged, GitHub release published. `Cargo.toml` is the source of truth for the version.
+- Latest release **v1.5.0** (2026-10-22): on crates.io, tagged, GitHub release published. `Cargo.toml` is the source of truth for the version.
 - Rust 2024 edition, MSRV 1.86 (`rust-version` in `Cargo.toml`; README says "Requires Rust 1.86+"). Raising it is the owner's call.
 - Dependencies are at latest stable as of 2026-10-02, with two exceptions:
   - **ratatui stays on 0.30.0**: 0.30.1+ needs Rust 1.88. Edition 2024 means Cargo's MSRV-aware resolver, so `cargo update` holds it (and other deps) back on its own. `cargo update --verbose` lists what's held and why.
