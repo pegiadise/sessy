@@ -59,8 +59,13 @@ fn draw_search_bar(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let search_title = if !app.search_query.is_empty() {
+        let exact = match app.exact_match_count() {
+            0 => String::new(),
+            n => format!("{} exact · ", n),
+        };
         format!(
-            " Search ({}/{}) ",
+            " Search ({}{}/{}) ",
+            exact,
             app.filtered_indices.len(),
             app.sessions.len()
         )
@@ -175,6 +180,11 @@ fn draw_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let mut lines: Vec<Line> = Vec::new();
     let max_width = inner.width as usize;
+    let phrase = app.search_phrase();
+    let match_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
 
     for (visual_idx, &real_idx) in app
         .filtered_indices
@@ -189,6 +199,9 @@ fn draw_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
         let session = &app.sessions[real_idx];
         let is_selected = visual_idx == app.selected;
         let is_bookmarked = app.bookmarks.contains(&session.id);
+        let is_exact = app.is_exact_match(real_idx);
+        // Exact matches show where the query hit; partial ones stay plain.
+        let hl = if is_exact { phrase.as_str() } else { "" };
 
         let prefix = match (is_selected, is_bookmarked) {
             (true, true) => "▸★ ",
@@ -223,16 +236,24 @@ fn draw_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
         let ts = format!("{}  ", chrono_format(session.timestamp));
         let avail = max_width.saturating_sub(prefix.width() + ts.width());
         let (project, branch, name) = fit_line1(&session.project, &session.branch, &session.name, avail);
-        let mut line1_spans: Vec<Span> = vec![
-            Span::styled(prefix, highlight),
-            Span::styled(ts, dim),
-            Span::styled(project, highlight),
-        ];
+        let mut line1_spans: Vec<Span> =
+            vec![Span::styled(prefix, highlight), Span::styled(ts, dim)];
+        line1_spans.extend(highlight_spans(&project, hl, highlight, match_style));
         if !branch.is_empty() {
-            line1_spans.push(Span::styled(format!("  {}", branch), branch_style));
+            line1_spans.extend(highlight_spans(
+                &format!("  {}", branch),
+                hl,
+                branch_style,
+                match_style,
+            ));
         }
         if !name.is_empty() {
-            line1_spans.push(Span::styled(format!("  {}", name), name_style));
+            line1_spans.extend(highlight_spans(
+                &format!("  {}", name),
+                hl,
+                name_style,
+                match_style,
+            ));
         }
         lines.push(Line::from(line1_spans));
 
@@ -263,7 +284,7 @@ fn draw_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
         } else {
             String::new()
         };
-        lines.push(Line::from(vec![
+        let mut line2_spans = vec![
             Span::styled(dur_str, dim),
             Span::styled(size_str, dim),
             Span::styled(
@@ -274,27 +295,49 @@ fn draw_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
             ),
             Span::styled(msgs_str, dim),
             Span::styled(pr_str, Style::default().fg(Color::Magenta)),
-            Span::styled(title_str, dim),
-        ]));
+        ];
+        line2_spans.extend(highlight_spans(&title_str, hl, dim, match_style));
+        lines.push(Line::from(line2_spans));
 
         // Line 3: where you left off (skipped when it's just the first message again)
         if !session.last_message.is_empty() && session.last_message != session.title {
             let left_off = format!("   └ left off: \"{}\"", session.last_message);
-            lines.push(Line::from(Span::styled(
-                truncate_width(&left_off, max_width),
+            lines.push(Line::from(highlight_spans(
+                &truncate_width(&left_off, max_width),
+                hl,
                 Style::default().fg(Color::DarkGray),
+                match_style,
             )));
         } else {
             lines.push(Line::from(""));
         }
 
         if lines.len() < inner.height as usize {
-            lines.push(Line::from(""));
+            // The gap after the last exact match divides it from the partial ones.
+            let next_is_partial = app
+                .filtered_indices
+                .get(visual_idx + 1)
+                .is_some_and(|&next| !app.is_exact_match(next));
+            if is_exact && next_is_partial {
+                lines.push(Line::from(Span::styled(
+                    tier_divider("partial matches", max_width),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                lines.push(Line::from(""));
+            }
         }
     }
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner);
+}
+
+/// `── label ─────` filling `width` columns.
+fn tier_divider(label: &str, width: usize) -> String {
+    let head = format!("   ── {} ", label);
+    let fill = width.saturating_sub(head.width());
+    truncate_width(&format!("{}{}", head, "─".repeat(fill)), width)
 }
 
 fn empty_list_message(app: &App) -> String {

@@ -53,7 +53,7 @@ Press `?` in the app for the full list.
 | `l` | Resume with normal permissions |
 | `c` | Copy a ready-to-run `cd <dir> && claude --resume <id>` command (stays open) |
 | `p` | Print session ID to stdout and exit |
-| `/` | Search (title, name, project, branch, changed files, tickets/PR numbers, full conversation text) |
+| `/` | Search (title, name, project, branch, changed files, tickets/PR numbers, full conversation text). Exact matches (the whole query as whole words; a `/` doesn't end a word, so part of a longer URL or path is partial) come first with the match highlighted; partial matches follow below a divider |
 | `⌘V` / `Ctrl+V` | Search for the pasted text right away (replaces the current query) |
 | `s` | Cycle sort: date → size → duration → messages (while searching: relevance → date → …) |
 | `1` `2` `3` `4` | Filter by size: quick / medium / deep / massive (`0` clears) |

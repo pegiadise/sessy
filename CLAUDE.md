@@ -62,7 +62,8 @@ src/
 - **Scope**: `Scope::Current` = sessions whose recorded `cwd` is under the launch project root (nearest `.git` ancestor below `$HOME`, else the launch dir); sessions without a cwd fall back to the encoded dir name. `--project` implies `Scope::All`
 - **Rename** (`r`) appends a `custom-title` entry (Claude Code's own format) and restores the file mtime so the session keeps its date slot
 - **Session name priority**: custom title (`/rename`) > `aiTitle` > `slug` field > empty
-- **View pipeline**: search → scope (cwd vs all) → size filter → sort (bookmarked first, then by current sort mode: date/size/duration/messages)
+- **View pipeline**: search → scope (cwd vs all) → size filter → sort (exact search matches first, then bookmarked, then by current sort mode: date/size/duration/messages)
+- **Exact vs partial search**: a hit is *exact* when the whole query (lowercased, whitespace folded: `App::search_phrase`) occurs as whole words (`contains_whole_words`, Unicode-aware; `_` and `/` count as word chars, so "deploy" isn't whole in "redeploy" or "deploy_all", and a URL/path fragment like "github.com/foo" inside "github.com/foo/bar" is partial) in any field or the conversation text, or the query equals a ticket. `App.exact_matches` (indexed like `sessions`) holds the flags; keep it aligned when sessions are removed. The list highlights the phrase on exact rows and draws a `── partial matches ──` divider in the gap row after the last exact one
 - **Preview cache**: FIFO-ordered HashMap, max 10 entries. Toggling tool activity (`T`) clears it so lines re-extract. `preview_session_id` set ⇒ loaded or in flight; anything that invalidates lines must clear it
 - **Preview line role**: `parser::Speaker` (User/Assistant/Tool/Recap); Tool lines only appear when tool activity is on; the latest recap is pinned as line 0
 - **Preview rendering**: `ui::message_rows` (newline-preserving, display-width wrapping) is the single source of truth for row counts — `recompute_preview_offsets`, match scrolling, and `visible_preview_lines` all call it with `App::preview_body_width()`. Scroll/offsets are `usize` (long sessions exceed 65k rows); only on-screen rows are built each frame
@@ -91,5 +92,5 @@ History quirks (don't "fix" them): 0.1.0–0.1.9 and 0.2.0–0.2.2 were publishe
 - Size categories: quick <1MB (green), medium 1-10MB (yellow), deep 10-30MB (magenta), massive >30MB (red)
 - Filter out `gitBranch: "HEAD"` — it's noise from detached HEAD states
 - Timeline heatmap uses GitHub-style green color scale
-- Bookmarked sessions float to top of any sort order
+- Bookmarked sessions float to top of any sort order (below exact matches while searching)
 - List/preview key handlers ignore Ctrl/Alt/Super combos except explicit ones (Ctrl+N/P/D/U/F/B); Ctrl+C quits from any focus; Ctrl+V/⌘V (as a key) reads the clipboard from any focus; a paste outside an input replaces the query and searches; delete confirms only on `y`. Windows has no paste events (crossterm), so Windows Terminal's Ctrl+V arrives as keystrokes

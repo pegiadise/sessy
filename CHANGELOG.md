@@ -4,6 +4,12 @@ All notable changes to sessy. The format follows [Keep a Changelog](https://keep
 
 Each version's section doubles as its GitHub release notes (`scripts/release-notes.sh vX.Y.Z`).
 
+## [Unreleased]
+
+### Changed
+
+- Search lists exact matches first: sessions containing the whole query as whole words (or the exact ticket/PR number), with the match highlighted. A `/` doesn't end a word, so part of a longer URL or path is a partial match. Partial matches follow below a "partial matches" divider. Exact matches stay on top of bookmarks and of any sort, and the search bar counts them.
+
 ## [1.4.0] - 2026-10-01
 
 ### Added
@@ -159,6 +165,7 @@ Covers 0.2.0 – 0.2.3.
 
 First release (0.1.0 – 0.1.10): a two-pane TUI to browse, search, preview, and resume Claude Code sessions.
 
+[Unreleased]: https://github.com/pegiadise/sessy/compare/v1.4.0...HEAD
 [1.4.0]: https://github.com/pegiadise/sessy/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/pegiadise/sessy/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/pegiadise/sessy/compare/v1.1.0...v1.2.0

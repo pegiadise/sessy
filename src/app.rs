@@ -102,6 +102,10 @@ pub struct App {
     /// search once after draining pending keys, so typing (or pasting) fast
     /// doesn't search the full text once per character.
     pub search_dirty: bool,
+    /// Per session (indexed like `sessions`): the last search found the whole
+    /// query as whole words. Exact matches list above partial ones. Empty
+    /// while not searching.
+    pub exact_matches: Vec<bool>,
     pub focus: Focus,
     pub action: AppAction,
     pub print_mode: bool,
@@ -169,6 +173,7 @@ impl App {
             preview_scroll: 0,
             search_query: TextInput::default(),
             search_dirty: false,
+            exact_matches: Vec::new(),
             focus: Focus::List,
             action: AppAction::None,
             print_mode,
@@ -415,6 +420,7 @@ impl App {
     }
 
     fn apply_search_inner(&mut self) {
+        self.exact_matches.clear();
         if self.search_query.is_empty() {
             self.filtered_indices = (0..self.sessions.len()).collect();
             return;
@@ -432,6 +438,8 @@ impl App {
             return;
         }
         let finders: Vec<Finder> = tokens.iter().map(|t| Finder::new(t.as_bytes())).collect();
+        let phrase = tokens.join(" ");
+        let phrase_finder = Finder::new(phrase.as_bytes());
 
         let text_cache = &self.text_cache;
 
@@ -441,7 +449,7 @@ impl App {
             .map(|s| is_ticket_form && s.tickets.binary_search(&query_upper).is_ok())
             .collect();
 
-        let mut scored: Vec<(usize, i64)> = self
+        let mut scored: Vec<(usize, i64, bool)> = self
             .sessions
             .par_iter()
             .enumerate()
@@ -502,17 +510,62 @@ impl App {
                         return None;
                     }
                 }
-                Some((i, score))
+                let exact = ticket_hit
+                    || [
+                        &s.name_lc,
+                        &s.title_lc,
+                        &s.project_lc,
+                        &s.branch_lc,
+                        &s.changed_files_lc,
+                    ]
+                    .iter()
+                    .any(|field| contains_whole_words(field.as_bytes(), &phrase_finder))
+                    || contains_whole_words(
+                        text_cache.slice(s.text_offset, s.text_len),
+                        &phrase_finder,
+                    );
+                Some((i, score, exact))
             })
             .collect();
 
-        // score desc, timestamp desc tiebreak
+        // exact first, then score desc, timestamp desc tiebreak
         scored.sort_by(|a, b| {
-            b.1.cmp(&a.1)
-                .then_with(|| self.sessions[b.0].timestamp.cmp(&self.sessions[a.0].timestamp))
+            b.2.cmp(&a.2).then_with(|| b.1.cmp(&a.1)).then_with(|| {
+                self.sessions[b.0]
+                    .timestamp
+                    .cmp(&self.sessions[a.0].timestamp)
+            })
         });
 
-        self.filtered_indices = scored.into_iter().map(|(i, _)| i).collect();
+        self.exact_matches = vec![false; self.sessions.len()];
+        for &(i, _, exact) in &scored {
+            self.exact_matches[i] = exact;
+        }
+        self.filtered_indices = scored.into_iter().map(|(i, _, _)| i).collect();
+    }
+
+    /// Whether the last search matched session `real_idx` exactly.
+    pub fn is_exact_match(&self, real_idx: usize) -> bool {
+        self.exact_matches.get(real_idx).copied().unwrap_or(false)
+    }
+
+    /// Number of listed sessions that match the search exactly.
+    pub fn exact_match_count(&self) -> usize {
+        self.filtered_indices
+            .iter()
+            .filter(|&&i| self.is_exact_match(i))
+            .count()
+    }
+
+    /// The search query as the exact tier compares it: lowercased, with
+    /// whitespace runs folded to single spaces.
+    pub fn search_phrase(&self) -> String {
+        self.search_query
+            .text()
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn apply_size_filter(&mut self) {
@@ -523,14 +576,16 @@ impl App {
         }
     }
 
-    /// Order the view: bookmarks first, then the active sort. While a search
-    /// is active and no explicit sort was chosen (`search_sort` is `None`),
-    /// the relevance order from `apply_search_inner` is kept — the sort is
-    /// stable, so this relies on `filtered_indices` already being in score
-    /// order (i.e. the search ran since the last query change).
+    /// Order the view: exact search matches first, then bookmarks, then the
+    /// active sort. While a search is active and no explicit sort was chosen
+    /// (`search_sort` is `None`), the relevance order from
+    /// `apply_search_inner` is kept — the sort is stable, so this relies on
+    /// `filtered_indices` already being in score order (i.e. the search ran
+    /// since the last query change).
     pub fn apply_sort(&mut self) {
         let sessions = &self.sessions;
         let bookmarks = &self.bookmarks;
+        let exact = |i: usize| self.exact_matches.get(i).copied().unwrap_or(false);
         let mode = if self.search_query.is_empty() {
             Some(self.sort_mode)
         } else {
@@ -540,17 +595,20 @@ impl App {
         self.filtered_indices.sort_by(|&a, &b| {
             let a_pinned = bookmarks.contains(&sessions[a].id);
             let b_pinned = bookmarks.contains(&sessions[b].id);
-            b_pinned.cmp(&a_pinned).then_with(|| match mode {
-                None => std::cmp::Ordering::Equal,
-                Some(SortMode::Date) => sessions[b].timestamp.cmp(&sessions[a].timestamp),
-                Some(SortMode::Size) => sessions[b].file_size.cmp(&sessions[a].file_size),
-                Some(SortMode::Duration) => {
-                    sessions[b].duration_secs.cmp(&sessions[a].duration_secs)
-                }
-                Some(SortMode::Messages) => {
-                    sessions[b].message_count.cmp(&sessions[a].message_count)
-                }
-            })
+            exact(b)
+                .cmp(&exact(a))
+                .then(b_pinned.cmp(&a_pinned))
+                .then_with(|| match mode {
+                    None => std::cmp::Ordering::Equal,
+                    Some(SortMode::Date) => sessions[b].timestamp.cmp(&sessions[a].timestamp),
+                    Some(SortMode::Size) => sessions[b].file_size.cmp(&sessions[a].file_size),
+                    Some(SortMode::Duration) => {
+                        sessions[b].duration_secs.cmp(&sessions[a].duration_secs)
+                    }
+                    Some(SortMode::Messages) => {
+                        sessions[b].message_count.cmp(&sessions[a].message_count)
+                    }
+                })
         });
     }
 
@@ -883,6 +941,9 @@ impl App {
             std::fs::remove_dir_all(&companion_dir).ok();
         }
         self.sessions.remove(real_idx);
+        if real_idx < self.exact_matches.len() {
+            self.exact_matches.remove(real_idx);
+        }
         self.filtered_indices.retain(|&i| i != real_idx);
         for idx in &mut self.filtered_indices {
             if *idx > real_idx {
@@ -989,6 +1050,50 @@ fn is_ticket_query(q_upper: &str) -> bool {
         regex::Regex::new(r"^[A-Z][A-Z0-9]{1,9}-\d{1,7}$|^#\d{1,7}$").unwrap()
     });
     re.is_match(q_upper)
+}
+
+/// Letters, digits, `_` and `/`: a slash doesn't end a word, so a piece of
+/// a URL or path ("github.com/foo" in "github.com/foo/bar") isn't exact.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '/'
+}
+
+/// First char of UTF-8 `bytes` (`None` when empty or not valid UTF-8).
+fn first_char(bytes: &[u8]) -> Option<char> {
+    let head = &bytes[..bytes.len().min(4)];
+    let valid = match std::str::from_utf8(head) {
+        Ok(s) => s,
+        Err(e) => std::str::from_utf8(&head[..e.valid_up_to()]).ok()?,
+    };
+    valid.chars().next()
+}
+
+/// Last char of UTF-8 `bytes` (`None` when empty or not valid UTF-8).
+fn last_char(bytes: &[u8]) -> Option<char> {
+    let tail = &bytes[bytes.len().saturating_sub(4)..];
+    // The 4-byte window may start mid-char; skip to the first char start.
+    (0..tail.len())
+        .find_map(|i| std::str::from_utf8(&tail[i..]).ok())
+        .and_then(|s| s.chars().next_back())
+}
+
+/// Whether `finder`'s needle occurs in `haystack` as whole words, i.e. not
+/// glued to a word char (`is_word_char`) on either side: "deploy" is whole
+/// in "deploy the app" but not in "redeployment". A needle edge that is
+/// itself punctuation ("#12", ".rs") needs no boundary there.
+fn contains_whole_words(haystack: &[u8], finder: &memchr::memmem::Finder) -> bool {
+    let needle = finder.needle();
+    let (Some(first), Some(last)) = (first_char(needle), last_char(needle)) else {
+        return false;
+    };
+    let check_left = is_word_char(first);
+    let check_right = is_word_char(last);
+    finder.find_iter(haystack).any(|idx| {
+        let left_ok = !check_left || last_char(&haystack[..idx]).is_none_or(|c| !is_word_char(c));
+        let right_ok = !check_right
+            || first_char(&haystack[idx + needle.len()..]).is_none_or(|c| !is_word_char(c));
+        left_ok && right_ok
+    })
 }
 
 fn starts_at_word_boundary(haystack: &[u8], needle: &[u8]) -> bool {
@@ -1130,6 +1235,132 @@ mod search_tests {
         app.search_query = "kerveros".into();
         app.apply_search();
         assert_eq!(app.sessions[app.filtered_indices[0]].id, "b");
+    }
+
+    fn ids(app: &App) -> Vec<&str> {
+        app.filtered_indices
+            .iter()
+            .map(|&i| app.sessions[i].id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn test_exact_phrase_beats_higher_scoring_partial() {
+        // "a" hits both tokens in name/title (higher score) but never as the
+        // phrase; "b" has the phrase in its project only.
+        let sessions = vec![
+            make_session("a", "kerveros", "encrypt files", "kerveros", "main", vec![]),
+            make_session("b", "", "", "kerveros encrypt", "main", vec![]),
+        ];
+        let mut app = App::new(sessions, false, HashSet::new(), empty_cache());
+        app.search_query = "kerveros   encrypt".into();
+        app.apply_search();
+        assert_eq!(ids(&app), vec!["b", "a"]);
+        assert!(app.is_exact_match(1));
+        assert!(!app.is_exact_match(0));
+        assert_eq!(app.exact_match_count(), 1);
+    }
+
+    #[test]
+    fn test_exact_needs_whole_words() {
+        let sessions = vec![
+            make_session("a", "redeployment notes", "", "p", "main", vec![]),
+            make_session("b", "", "", "deploy", "main", vec![]),
+            make_session("c", "deploy_script", "", "p", "main", vec![]),
+        ];
+        let mut app = App::new(sessions, false, HashSet::new(), empty_cache());
+        app.search_query = "deploy".into();
+        app.apply_search();
+        assert_eq!(ids(&app)[0], "b");
+        assert_eq!(app.exact_match_count(), 1);
+    }
+
+    #[test]
+    fn test_ticket_query_is_exact() {
+        let sessions = vec![
+            make_session("a", "", "", "p", "main", vec!["PROJ-12"]),
+            make_session("b", "proj-123", "", "p", "main", vec![]),
+        ];
+        let mut app = App::new(sessions, false, HashSet::new(), empty_cache());
+        app.search_query = "PROJ-12".into();
+        app.apply_search();
+        assert_eq!(ids(&app), vec!["a", "b"]);
+        assert_eq!(app.exact_match_count(), 1);
+    }
+
+    #[test]
+    fn test_exact_beats_bookmarked_partial() {
+        let sessions = vec![
+            make_session("a", "auth bug fix", "", "p", "main", vec![]),
+            make_session("b", "auth", "", "p", "bug-123", vec![]),
+        ];
+        let mut bookmarks = HashSet::new();
+        bookmarks.insert("b".to_string());
+        let mut app = App::new(sessions, false, bookmarks, empty_cache());
+        app.search_query = "auth bug".into();
+        app.apply_search();
+        assert_eq!(ids(&app), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_exact_tier_kept_under_sort() {
+        let mut a = make_session("a", "auth flow", "", "p", "main", vec![]);
+        a.timestamp = 1;
+        let mut b = make_session("b", "authentication", "", "p", "main", vec![]);
+        b.timestamp = 2;
+        let mut c = make_session("c", "auth", "", "p", "main", vec![]);
+        c.timestamp = 3;
+        let mut app = App::new(vec![a, b, c], false, HashSet::new(), empty_cache());
+        app.search_query = "auth".into();
+        app.apply_search();
+        app.cycle_sort(); // relevance → date
+        assert_eq!(app.sort_label(), SortMode::Date.label());
+        // Exact ("c", "a") by date, then the partial "b".
+        assert_eq!(ids(&app), vec!["c", "a", "b"]);
+    }
+
+    #[test]
+    fn test_clearing_search_drops_exact_flags() {
+        let sessions = vec![make_session("a", "auth", "", "p", "main", vec![])];
+        let mut app = App::new(sessions, false, HashSet::new(), empty_cache());
+        app.search_query = "auth".into();
+        app.apply_search();
+        assert_eq!(app.exact_match_count(), 1);
+        app.search_query.clear();
+        app.apply_search();
+        assert_eq!(app.exact_match_count(), 0);
+    }
+
+    #[test]
+    fn test_contains_whole_words() {
+        use memchr::memmem::Finder;
+        let whole = |hay: &str, needle: &str| {
+            contains_whole_words(hay.as_bytes(), &Finder::new(needle.as_bytes()))
+        };
+        assert!(whole("deploy the app", "deploy"));
+        assert!(whole("re-deploy", "deploy"));
+        assert!(!whole("redeploy", "deploy"));
+        assert!(!whole("deployment", "deploy"));
+        assert!(whole("deployment, then deploy", "deploy"));
+        assert!(!whole("deploy_all", "deploy"));
+        // Non-ASCII letters count as word chars on both sides.
+        assert!(!whole("λογαριασμός", "λογ"));
+        assert!(whole("ο λογαριασμός μου", "λογαριασμός"));
+        assert!(!whole("éauth", "auth"));
+        // Punctuation at the needle's edge needs no boundary.
+        assert!(whole("pr#12 merged", "#12"));
+        assert!(!whole("pr #123", "#12"));
+        assert!(!whole("anything", ""));
+        // A slash doesn't end a word: part of a URL or path is partial.
+        let url = "see https://github.com/pegiadise/sessy/pull/7.";
+        assert!(whole(url, "https://github.com/pegiadise/sessy/pull/7"));
+        assert!(!whole(url, "github.com/pegiadise"));
+        assert!(!whole(url, "pegiadise/sessy"));
+        assert!(!whole(url, "sessy"));
+        assert!(!whole("GET /api/users/123", "/api/users"));
+        assert!(whole("GET /api/users?page=2", "/api/users"));
+        assert!(whole("edit src/app.rs now", "src/app.rs"));
+        assert!(!whole("edit src/app.rs now", "/app.rs"));
     }
 
     #[test]
