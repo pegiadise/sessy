@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-pub const INDEX_VERSION: u32 = 8;
+pub const INDEX_VERSION: u32 = 9;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionIndex {
@@ -145,11 +145,13 @@ pub fn scan_session_file(path: &Path) -> Option<(SessionMeta, Vec<u8>)> {
         scan.head.branch.clone()
     };
 
-    let name_lc = name.to_lowercase();
-    let title_lc = scan.head.title.to_lowercase();
-    let project_lc = project.to_lowercase();
-    let branch_lc = branch.to_lowercase();
-    let changed_files_lc = scan.changed_files.join("\n").to_lowercase();
+    // Folded like the search text (`fold`: case and accents).
+    use crate::fold::fold;
+    let name_lc = fold(&name);
+    let title_lc = fold(&scan.head.title);
+    let project_lc = fold(&project);
+    let branch_lc = fold(&branch);
+    let changed_files_lc = fold(&scan.changed_files.join("\n"));
 
     let text_bytes = scan.search_text_lc.into_bytes();
 

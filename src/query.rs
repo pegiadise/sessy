@@ -48,7 +48,8 @@ impl Filter {
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Query {
-    /// The words left once filters are taken out: lowercased, single-spaced.
+    /// The words left once filters are taken out: folded (`fold`: case and
+    /// accents), single-spaced.
     pub text: String,
     pub filters: Vec<Filter>,
 }
@@ -62,7 +63,7 @@ pub fn parse(input: &str, now: i64) -> Query {
         match classify(token, now) {
             Token::Filter(f) => filters.push(f),
             Token::Pending => {}
-            Token::Text => words.push(token.to_lowercase()),
+            Token::Text => words.push(crate::fold::fold(token)),
         }
     }
     Query {
@@ -111,7 +112,7 @@ fn classify(token: &str, now: i64) -> Token {
     if value.starts_with(':') || value.starts_with("//") {
         return Token::Text;
     }
-    let v = value.to_lowercase();
+    let v = crate::fold::fold(value);
     let filter = match key.as_str() {
         "project" => Some(Filter::Project(v)),
         "branch" => Some(Filter::Branch(v)),

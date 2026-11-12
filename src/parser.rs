@@ -349,7 +349,7 @@ fn push_search_text(out: &mut String, text: &str) {
     if trimmed.is_empty() {
         return;
     }
-    out.push_str(&trimmed.to_lowercase());
+    out.push_str(&crate::fold::fold(trimmed));
     out.push('\n');
 }
 

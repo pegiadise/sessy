@@ -1738,15 +1738,6 @@ fn wrap_text_joined(text: &str, width: usize) -> Vec<(String, bool)> {
     result
 }
 
-/// Returns true for Unicode combining diacritical marks (U+0300–U+036F).
-/// These can appear as extra code points when lowercasing characters such as
-/// Turkish İ (U+0130) → i + U+0307. Skipping them keeps the lowercased text
-/// byte-for-byte matchable against a plain query like "istanbul".
-#[inline]
-fn is_combining_diacritic(c: char) -> bool {
-    ('\u{0300}'..='\u{036F}').contains(&c)
-}
-
 /// Split text into spans, highlighting occurrences of any of `terms`
 /// (lowercase; matched case-insensitively). Where two terms overlap, the
 /// earlier one wins, then the longer.
@@ -1768,25 +1759,9 @@ fn find_hits(text: &str, terms: &[&str]) -> Vec<(usize, usize)> {
         return Vec::new();
     }
 
-    // Build a lowercased copy of `text` alongside a mapping from every byte
-    // position in `text_lower` back to the corresponding byte position in
-    // `text`.  Combining diacritical marks introduced by `to_lowercase()` (e.g.
-    // İ → i + U+0307) are skipped so that a plain query like "istanbul" still
-    // finds a match.
-    let mut text_lower = String::with_capacity(text.len());
-    let mut lower_to_orig: Vec<usize> = Vec::with_capacity(text.len() + 1);
-    for (orig_idx, ch) in text.char_indices() {
-        for lc in ch.to_lowercase() {
-            if is_combining_diacritic(lc) {
-                continue;
-            }
-            for _ in 0..lc.len_utf8() {
-                lower_to_orig.push(orig_idx);
-            }
-            text_lower.push(lc);
-        }
-    }
-    lower_to_orig.push(text.len());
+    // Folded like the terms (case and accents), with the byte in `text`
+    // each folded byte came from.
+    let (text_lower, lower_to_orig) = crate::fold::fold_with_origin(text);
 
     let mut hits = Vec::new();
     let mut last_end = 0;
@@ -1967,6 +1942,15 @@ mod tests {
         // Separate lines of a message never join.
         let rows = message_rows_marked("deploy\ncaddy", 40, &["deploy caddy"]);
         assert!(rows.iter().all(|(_, marks)| marks.is_empty()));
+    }
+
+    #[test]
+    fn test_highlight_marks_accented_words_from_a_plain_query() {
+        let base = Style::default();
+        let hit = Style::default().fg(Color::Yellow);
+        let spans = highlight_spans("Στην Οδό, ΟΔΟΣ και café", &["οδο", "cafe"], base, hit);
+        let marked: Vec<&str> = spans.iter().filter(|s| s.style == hit).map(|s| s.content.as_ref()).collect();
+        assert_eq!(marked, ["Οδό", "ΟΔΟ", "café"]);
     }
 
     #[test]

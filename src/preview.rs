@@ -49,11 +49,11 @@ fn load(req: PreviewRequest) -> PreviewResult {
         .count() as u32;
     let mut lines: Vec<(String, String, Speaker)> = Vec::with_capacity(messages.len() + 1);
     if !req.recap.is_empty() {
-        let lower = req.recap.to_lowercase();
+        let lower = crate::fold::fold(&req.recap);
         lines.push((req.recap, lower, Speaker::Recap));
     }
     lines.extend(messages.into_iter().map(|(speaker, text)| {
-        let lower = text.to_lowercase();
+        let lower = crate::fold::fold(&text);
         (text, lower, speaker)
     }));
     PreviewResult {

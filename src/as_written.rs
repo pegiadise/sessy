@@ -79,7 +79,8 @@ const MAX_CANDIDATES: usize = 256;
 /// `None` when it can't be found or `live` turns false.
 pub fn as_written(path: &Path, piece: &Piece, at: f64, live: &dyn Fn() -> bool) -> Option<Piece> {
     let (from, to) = needle(piece)?;
-    let pattern = regex::escape(&piece.text[from..to]);
+    // Case and accents as written, whatever they were.
+    let pattern = crate::fold::unfolding_pattern(&piece.text[from..to]);
     let re = regex::bytes::RegexBuilder::new(&pattern)
         .case_insensitive(true)
         .build()
@@ -93,8 +94,9 @@ pub fn as_written(path: &Path, piece: &Piece, at: f64, live: &dyn Fn() -> bool) 
         if !live() {
             return None;
         }
-        // Overlap the next chunk so a match across the seam is found.
-        let data = read_range(&mut file, lo, hi + (to - from)).ok()?;
+        // Overlap the next chunk so a match across the seam is found (as
+        // written, accents can make it longer than the folded needle).
+        let data = read_range(&mut file, lo, hi + 4 * (to - from)).ok()?;
         for m in re.find_iter(&data) {
             let line = line_around(&mut file, &data, lo, m.start()).ok()?;
             if let Some(found) = in_line(&line, piece) {
@@ -256,23 +258,11 @@ fn in_line(line: &[u8], piece: &Piece) -> Option<Piece> {
     found
 }
 
-/// Where `piece` (lowercased) is in `written` once that's lowercased the
-/// way the search text is: that stretch of `written`, as written.
+/// Where `piece` (folded) is in `written` once that's folded the way the
+/// search text is: that stretch of `written`, as written.
 pub fn find_in(written: &str, piece: &Piece) -> Option<Piece> {
-    let lower = written.to_lowercase();
-    let at = lower.find(&piece.text)?;
-    // Byte offset in `written` of each byte of `lower`. `str::to_lowercase`
-    // turns each char into as many chars as `char::to_lowercase` does (its
-    // one special case, final sigma, is one char either way).
-    let mut origin = Vec::with_capacity(lower.len() + 1);
-    let mut lowered = lower.chars();
-    for (i, c) in written.char_indices() {
-        for _ in 0..c.to_lowercase().count() {
-            let l = lowered.next()?;
-            origin.extend(std::iter::repeat_n(i, l.len_utf8()));
-        }
-    }
-    origin.push(written.len());
+    let (folded, origin) = crate::fold::fold_with_origin(written);
+    let at = folded.find(&piece.text)?;
     let map = |offset: usize| origin.get(at + offset).copied();
     let from = map(0)?;
     let to = map(piece.text.len())?;
@@ -322,7 +312,7 @@ mod tests {
     fn keeps_offsets_right_across_case_changes_that_resize() {
         // 'İ' lowercases to two chars; Greek final sigma to one.
         let written = "İstanbul ΟΔΟΣ Flock";
-        let lower = written.to_lowercase();
+        let lower = crate::fold::fold(written);
         let p = piece(&lower, "flock");
         let found = find_in(written, &p).unwrap();
         assert_eq!(found.text, written);
@@ -393,6 +383,16 @@ mod tests {
         let line = line_around(&mut f, &data, mid, 5).unwrap();
         assert!(line.starts_with(b"{") && line.ends_with(b"}"), "a whole JSON line");
         assert!(in_line(&line, &p).is_some());
+    }
+
+    #[test]
+    fn finds_accented_text_from_its_folded_form() {
+        let file = transcript(&[serde_json::json!({"type": "user", "message": {"content": "Στην Οδό Πανεπιστημίου, café"}})]);
+        let folded = crate::fold::fold("Στην Οδό Πανεπιστημίου, café");
+        let p = piece(&folded, "πανεπιστημιου");
+        let found = as_written(file.path(), &p, 0.0, &|| true).unwrap();
+        assert_eq!(found.text, "Στην Οδό Πανεπιστημίου, café");
+        assert_eq!(&found.text[found.hit.0..found.hit.1], "Πανεπιστημίου");
     }
 
     #[test]

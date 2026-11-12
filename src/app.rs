@@ -1029,7 +1029,7 @@ impl App {
             Ok(()) => {
                 let open = self.live_status(&self.sessions[real]).is_some();
                 let session = &mut self.sessions[real];
-                session.name_lc = name.to_lowercase();
+                session.name_lc = crate::fold::fold(&name);
                 session.name = name.clone();
                 // Claude Code rewrites the title it has in memory after its
                 // turns, so a rename from outside may not last.
@@ -1110,7 +1110,7 @@ impl App {
     /// query when one is typed, otherwise the words of the session search, so
     /// a search result opens with its hits marked.
     pub fn preview_terms(&self) -> Vec<String> {
-        let find = self.preview_search_query.text().to_lowercase();
+        let find = crate::fold::fold(self.preview_search_query.text());
         if !find.is_empty() {
             return vec![find];
         }
@@ -1643,7 +1643,7 @@ impl App {
         let hidden = words.iter().filter(|w| !shown.contains(**w));
         hidden.chain(words.iter()).find_map(|word| {
             s.changed_files.iter().find_map(|f| {
-                let lower = f.to_lowercase();
+                let lower = crate::fold::fold(f);
                 let pos = lower.find(word)?;
                 // Paths are shown as written: the original is at hand.
                 let written = Piece {
@@ -2944,6 +2944,24 @@ mod search_tests {
         let (body, hit, _) = one_part(&app.snippet(0).unwrap());
         assert_eq!(body, "let x = flock(fd);");
         assert_eq!(&body[hit..hit + 5], "flock");
+    }
+
+    #[test]
+    fn test_search_ignores_accents_and_case() {
+        let text = crate::fold::fold("Ραντεβού στην Οδό Πανεπιστημίου\nmeet at the Café");
+        let (_dir, cache) = cache_with(&text);
+        let mut s = make_session("a", "Οδηγός", "", "p", "main", vec![]);
+        s.name_lc = crate::fold::fold("Οδηγός");
+        s.text_len = text.len() as u32;
+        let mut app = App::new(vec![s], false, HashSet::new(), cache);
+        for query in ["οδο πανεπιστημιου", "ΟΔΌ", "cafe", "CAFÉ", "οδηγος"] {
+            app.search_query = query.into();
+            app.apply_search();
+            assert_eq!(app.filtered_indices, vec![0], "{:?}", query);
+        }
+        app.search_query = "οδο πανεπιστημιου".into();
+        app.apply_search();
+        assert!(app.is_exact_match(0), "whole words, accents aside");
     }
 
     #[test]

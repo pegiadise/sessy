@@ -4,6 +4,7 @@ pub mod bookmarks;
 pub mod clipboard;
 pub mod config;
 pub mod export;
+pub mod fold;
 pub mod index;
 pub mod input;
 pub mod live;
