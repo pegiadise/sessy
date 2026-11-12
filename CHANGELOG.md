@@ -9,8 +9,8 @@ Each version's section doubles as its GitHub release notes (`scripts/release-not
 ### Added
 
 - Sessions open in a running Claude Code are marked `●` (yellow while Claude is working; macOS and Linux), and the preview title says so. Resuming one asks first, since two Claude Code processes on one session interleave their turns.
-- While searching, the preview marks the search words and opens at the first hit; `n`/`N` walk the hits. If the hits are only in text the preview doesn't show (tool output, thinking), its title says so.
-- Search results whose hit isn't visible in the row show it on the row's third line: `└ match: …text around the hit…`, or `└ file:` for a changed file's path.
+- While searching, the preview marks the search words and opens at the first message that has them all (past the pinned recap); `n`/`N` walk the hits. If the hits are only in text the preview doesn't show (tool output, thinking), its title says so.
+- Search results show where they matched on the row's third line: `└ match: …the text around it…`, as written (not lowercased), with the words marked. Words close together show as one piece, words far apart each get their own (`… · …`); a hit only in a changed file's path shows `└ file:` and the path.
 - `v` toggles compact rows, one line per session (config `density = "compact"`).
 - `F` resumes a session as a fork (`--fork-session`), leaving the original untouched.
 - `u` undoes the last delete. Deleted sessions are kept in sessy's cache folder for 7 days (when it's on another disk than the sessions, deletes are permanent as before).
@@ -18,7 +18,7 @@ Each version's section doubles as its GitHub release notes (`scripts/release-not
 - `z` zooms to one pane at a time, full width.
 - A progress line while the index builds (the first run reads every session).
 - Search filters alongside words: `project:`, `branch:`, `file:`, `is:open` / `is:pinned` / `is:pr`, `after:` / `before:` (`7d` or a date) and `on:` (`today`, `yesterday`, a date), e.g. `auth project:web is:open after:7d`. Filters are coloured in the search box.
-- The timeline is interactive: the arrows pick a day and `Enter` lists its sessions.
+- The timeline is interactive: the arrows pick a day and `Enter` lists its sessions, keeping the rest of the search.
 - Sessions that span several days get a date rule in the preview where each day starts.
 - Mouse support, opt-in with `--mouse` or `mouse = true`: the wheel scrolls, a click selects, a double-click resumes.
 
@@ -27,10 +27,30 @@ Each version's section doubles as its GitHub release notes (`scripts/release-not
 - Terminals narrower than 100 columns show one pane at a time, full width; `Tab` switches.
 - Timestamps read `today 14:32`, a weekday for the past week, then the date; older years show the year.
 - Launched in a directory with no sessions of its own, sessy shows all projects instead of an empty list.
+- Search covers the conversation only, not the system prompt, tool listings and CLAUDE.md that newer Claude Code also logs in each session; words like "docx" no longer match nearly every session. The search cache is about half the size.
+- "Last active" (the list's date, date sort, `--recent`, `on:`, the timeline) is the session's last timestamped entry, not the file's modification time, which Claude Code moves when it appends bookkeeping weeks later.
+- A config value sessy doesn't know, or an unknown key, is reported in the status bar; `enter` set to anything but `yolo` (a typo included) means the safe resume.
+- `--purge` keeps sessions open in Claude Code and says which projects the sessions it would delete are in.
+- `Esc` clears an active size filter before it quits.
 - Much faster start: the search cache is no longer rewritten on every launch. Unchanged sessions keep their place, changed ones are appended, and nothing is written when nothing changed (about 10 ms instead of 200 ms on a 4 GB history).
 
 ### Fixed
 
+- Prompts typed while Claude was still working were missing from the preview, the message count, "left off" and search (Claude Code stores them differently).
+- A delete or resume prompt, or a rename, could act on a different session than the one it named when the list changed under it (a session closing elsewhere while `is:open` was searched). They now stay on their session, and a `y` arriving before the prompt was even drawn (pasted text) doesn't confirm it.
+- Text pasted as keystrokes (Windows Terminal, terminals without bracketed paste) ran list commands; "study" could delete a session. It's searched for now. Pasted line breaks no longer glue words together.
+- On Windows, AltGr characters (`@`, `\`, `{`, `€` on European layouts) can be typed in the inputs.
+- The session name vanished from rows with a long project and branch in the two-pane layout.
+- In the preview, a phrase wrapped across two rows wasn't found by `n`/`N` or highlighted; resizing, `z` or `T` lost the reading position and `T` dropped an active find.
+- Clearing a search left its marks in the preview; unpinning under `is:pinned` left the preview on the unpinned session; a second load of the same preview reset the position.
+- Moving through huge sessions stalled for a fraction of a second each time (the cached conversation was copied and re-wrapped); the preview cache is also capped by size now.
+- The timeline's count ignored the size filter; list paging was off by one in comfortable rows.
+- A damaged index file crashed sessy on every start until `--rebuild-index`; now it's rebuilt. A config folder without a `projects/` folder no longer empties the cache.
+- A failed undo (the session came back meanwhile) no longer blocks undoing earlier deletes.
+- Pins are written atomically and merged with another running sessy's; a damaged pins file is set aside instead of overwritten.
+- Tickets at the start of a line were missed, and the system prompt's IDs were taken for tickets. Indexing big sessions is about twice as fast.
+- Editor context Claude Code adds to a prompt (an opened file, a selection) no longer becomes the session's title.
+- Keys typed while the index was building ran as commands once the list appeared; they're dropped now.
 - The help screen was cut off on short terminals; it scrolls now.
 - On narrow panes a session's stats line was clipped mid-word; it now drops the size tag, PR badge and message count, in that order, to fit.
 - List and preview text was set to white, which is unreadable on light terminal themes; it uses the terminal's own text color now.
