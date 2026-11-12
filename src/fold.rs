@@ -98,7 +98,9 @@ fn variants() -> &'static HashMap<char, Vec<char>> {
             let folded = fold(&c.to_string());
             let mut chars = folded.chars();
             if let (Some(f), None) = (chars.next(), chars.next()) {
-                if f != c && !c.is_uppercase() {
+                // Capitals too: case-insensitive matching doesn't take `i`
+                // to İ, or ϒ to ϓ and ϔ.
+                if f != c {
                     map.entry(f).or_default().push(c);
                 }
             }
@@ -142,5 +144,10 @@ mod tests {
             assert!(re.is_match(written), "{}", written);
         }
         assert!(!re.is_match("οδοι cafe"));
+        let re = regex::RegexBuilder::new(&unfolding_pattern(&fold("istanbul")))
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        assert!(re.is_match("İstanbul"), "capitals that don't lowercase to their letter");
     }
 }

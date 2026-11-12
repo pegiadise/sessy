@@ -18,6 +18,9 @@ pub struct SubagentFile {
     /// Nanoseconds since the epoch: a subagent often starts within the same
     /// second as the turn that launched it.
     pub mtime: i64,
+    /// Its `.meta.json` (the description): size and mtime hashed, 0 when
+    /// there's none. Can be written after the transcript.
+    pub meta: i64,
 }
 
 pub fn mtime_nanos(meta: &fs::Metadata) -> i64 {
@@ -48,10 +51,13 @@ pub fn list(transcript: &Path) -> (Vec<SubagentFile>, i64) {
                 return None;
             }
             let meta = e.metadata().ok()?;
+            let description = fs::metadata(path.with_extension("meta.json"))
+                .map_or(0, |m| (m.len() as i64).wrapping_mul(0x100000001b3) ^ mtime_nanos(&m));
             Some(SubagentFile {
                 path,
                 size: meta.len(),
                 mtime: mtime_nanos(&meta),
+                meta: description,
             })
         })
         .collect();
@@ -82,8 +88,16 @@ pub fn search_text(files: &[SubagentFile]) -> String {
         let Ok(f) = fs::File::open(&file.path) else {
             continue;
         };
-        for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
-            if let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) {
+        // Line by line, past any that isn't UTF-8 or JSON.
+        let mut reader = std::io::BufReader::new(f);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(n) if n > 0 => {}
+                _ => break,
+            }
+            if let Ok(entry) = serde_json::from_slice::<serde_json::Value>(&line) {
                 crate::parser::append_search_text(&entry, &mut out);
             }
         }
@@ -160,6 +174,35 @@ mod tests {
         let (path, written) = find(&transcript, "audit the index", 0).unwrap();
         assert!(path.ends_with("agent-b.jsonl"));
         assert_eq!(written, "Audit the Index");
+    }
+
+    #[test]
+    fn a_bad_line_skips_only_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("s1.jsonl");
+        agent(dir.path(), "a", "Audit", "before");
+        let path = dir.path().join("s1/subagents/agent-a.jsonl");
+        let after = serde_json::json!({"type": "assistant",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "after the bad line"}]}});
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"\xff\xfe\n");
+        bytes.extend_from_slice(format!("{}\n", after).as_bytes());
+        fs::write(&path, bytes).unwrap();
+        let text = search_text(&list(&transcript).0);
+        assert!(text.contains("before") && text.contains("after the bad line"), "{:?}", text);
+    }
+
+    #[test]
+    fn a_description_written_later_changes_the_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("s1.jsonl");
+        agent(dir.path(), "a", "Audit", "found it");
+        let meta = dir.path().join("s1/subagents/agent-a.meta.json");
+        fs::remove_file(&meta).unwrap();
+        let before = list(&transcript).0;
+        assert_eq!(before[0].meta, 0);
+        fs::write(&meta, r#"{"description":"Check the locks"}"#).unwrap();
+        assert_ne!(list(&transcript).0, before);
     }
 
     #[test]

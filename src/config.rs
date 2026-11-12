@@ -1,11 +1,9 @@
 use crate::app::{Density, SortMode};
-use serde::Deserialize;
 use std::path::PathBuf;
 
 /// User configuration loaded from `~/.config/sessy/config.toml`. Every field is
-/// optional; a missing or malformed file yields all defaults.
-#[derive(Debug, Deserialize)]
-#[serde(default)]
+/// optional; a missing file yields all defaults (see `load` for a bad one).
+#[derive(Debug)]
 pub struct Config {
     /// "current" (launch directory only) or "all" (every project).
     pub scope: String,
@@ -88,9 +86,49 @@ impl Config {
     }
 }
 
-/// Parse config from a TOML string, falling back to defaults on any error.
+impl Config {
+    /// The defaults, but with Enter resuming safely: for a config file that
+    /// can't be read, where an `enter = "safe"` may be what's lost.
+    fn safe_defaults() -> Self {
+        Self { enter: "safe".to_string(), ..Self::default() }
+    }
+}
+
+/// Parse a config file's text, key by key: a value of the wrong type is
+/// reported and left at its default instead of discarding the whole file
+/// (`enter = "safe"` with it). Text that isn't TOML at all gives the error.
+fn parse(text: &str) -> Result<(Config, Vec<String>), toml::de::Error> {
+    let table = toml::from_str::<toml::Table>(text)?;
+    let mut cfg = Config::default();
+    let mut problems = Vec::new();
+    let take_str = |key: &str, slot: &mut String, problems: &mut Vec<String>| match table.get(key) {
+        Some(toml::Value::String(s)) => *slot = s.clone(),
+        Some(other) => problems.push(format!("{} = {} isn't a quoted word", key, other)),
+        None => {}
+    };
+    take_str("scope", &mut cfg.scope, &mut problems);
+    take_str("sort", &mut cfg.sort, &mut problems);
+    take_str("density", &mut cfg.density, &mut problems);
+    take_str("enter", &mut cfg.enter, &mut problems);
+    if table.get("enter").is_some_and(|v| !v.is_str()) {
+        // Unreadable: it may have meant "safe".
+        cfg.enter = "safe".to_string();
+    }
+    let take_bool = |key: &str, slot: &mut bool, problems: &mut Vec<String>| match table.get(key) {
+        Some(toml::Value::Boolean(b)) => *slot = *b,
+        Some(other) => problems.push(format!("{} = {} isn't true or false", key, other)),
+        None => {}
+    };
+    take_bool("show_tool_activity", &mut cfg.show_tool_activity, &mut problems);
+    take_bool("mouse", &mut cfg.mouse, &mut problems);
+    problems.extend(cfg.problems(&table));
+    Ok((cfg, problems))
+}
+
+/// Parse config from a TOML string. Text that isn't TOML yields the
+/// defaults with the safe Enter.
 pub fn parse_config(s: &str) -> Config {
-    toml::from_str(s).unwrap_or_default()
+    parse(s).map(|(cfg, _)| cfg).unwrap_or_else(|_| Config::safe_defaults())
 }
 
 /// Where the config may live, in priority order: `$XDG_CONFIG_HOME/sessy`,
@@ -111,14 +149,12 @@ pub fn config_paths() -> Vec<PathBuf> {
     paths
 }
 
-/// Load the first config file found. A file that exists but doesn't parse
-/// yields defaults plus a message saying why, so a typo isn't silently
-/// ignored.
+/// Load the first config file found. A file that exists but can't be read
+/// or parsed yields defaults plus a message saying why, so a typo isn't
+/// silently ignored, and Enter resumes safely until it's fixed: the file
+/// may have said `enter = "safe"`.
 pub fn load() -> (Config, Option<String>) {
     for path in config_paths() {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
         let shown = match dirs::home_dir() {
             Some(home) => match path.strip_prefix(&home) {
                 Ok(rest) => format!("~/{}", rest.display()),
@@ -126,11 +162,16 @@ pub fn load() -> (Config, Option<String>) {
             },
             None => path.display().to_string(),
         };
-        return match toml::from_str::<Config>(&text) {
-            Ok(cfg) => {
-                let problems = toml::from_str::<toml::Table>(&text)
-                    .map(|table| cfg.problems(&table))
-                    .unwrap_or_default();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                let warning = format!("Config ignored, Enter resumes safely — can't read {}: {}", shown, e);
+                return (Config::safe_defaults(), Some(warning));
+            }
+        };
+        return match parse(&text) {
+            Ok((cfg, problems)) => {
                 let warning = (!problems.is_empty())
                     .then(|| format!("Config: {} in {}", problems.join(", "), shown));
                 (cfg, warning)
@@ -141,9 +182,9 @@ pub fn load() -> (Config, Option<String>) {
                     .map(|span| text[..span.start.min(text.len())].matches('\n').count() + 1);
                 let at = line.map(|l| format!(" (line {})", l)).unwrap_or_default();
                 (
-                    Config::default(),
+                    Config::safe_defaults(),
                     Some(format!(
-                        "Config ignored — {}{} in {}",
+                        "Config ignored, Enter resumes safely — {}{} in {}",
                         e.message().trim(),
                         at,
                         shown
@@ -183,8 +224,7 @@ mod tests {
     }
 
     fn problems(text: &str) -> Vec<String> {
-        let cfg: Config = toml::from_str(text).unwrap();
-        cfg.problems(&toml::from_str(text).unwrap())
+        parse(text).unwrap().1
     }
 
     #[test]
@@ -210,10 +250,31 @@ mod tests {
     }
 
     #[test]
-    fn test_config_malformed_falls_back_to_defaults() {
+    fn test_config_malformed_falls_back_to_defaults_with_the_safe_enter() {
         let c = parse_config("this is not ]][[ valid toml");
         assert!(!c.scope_is_all());
         assert_eq!(c.sort_mode(), SortMode::Date);
+        assert!(!c.enter_is_yolo(), "it may have said enter = \"safe\"");
+        // Bare words aren't TOML: the whole file is unreadable.
+        assert!(!parse_config("enter = \"safe\"\nmouse = yes\n").enter_is_yolo());
+    }
+
+    #[test]
+    fn test_a_wrong_type_drops_only_its_own_key() {
+        let (c, problems) = parse(
+            "enter = \"safe\"\nshow_tool_activity = \"true\"\nscope = \"all\"\nmouse = 1\n",
+        )
+        .unwrap();
+        assert!(!c.enter_is_yolo(), "enter = \"safe\" is kept");
+        assert!(c.scope_is_all());
+        assert!(!c.show_tool_activity && !c.mouse);
+        assert_eq!(
+            problems,
+            ["show_tool_activity = \"true\" isn't true or false", "mouse = 1 isn't true or false"]
+        );
+        let (c, problems) = parse("enter = 0\n").unwrap();
+        assert!(!c.enter_is_yolo(), "an enter that isn't a word may have meant safe");
+        assert_eq!(problems, ["enter = 0 isn't a quoted word"]);
     }
 }
 

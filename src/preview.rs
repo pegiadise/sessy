@@ -33,16 +33,7 @@ pub fn spawn_worker(results: mpsc::Sender<PreviewResult>) -> mpsc::Sender<Previe
             while let Ok(newer) = rx.try_recv() {
                 req = newer;
             }
-            // A transcript that trips a parser bug shows as empty rather than
-            // leaving the preview loading forever.
-            let empty = PreviewResult {
-                session_id: req.session_id.clone(),
-                lines: Vec::new(),
-                message_count: 0,
-                include_tools: req.include_tools,
-                tail: None,
-                more: None,
-            };
+            let empty = failed(&req);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load(req)))
                 .unwrap_or(empty);
             if results.send(result).is_err() {
@@ -51,6 +42,23 @@ pub fn spawn_worker(results: mpsc::Sender<PreviewResult>) -> mpsc::Sender<Previe
         }
     });
     tx
+}
+
+/// What a load that panicked gives. A transcript that trips a parser bug
+/// shows as empty rather than leaving the preview loading forever; reading
+/// on that trips one adds nothing, and isn't tried again until it grows.
+fn failed(req: &PreviewRequest) -> PreviewResult {
+    PreviewResult {
+        session_id: req.session_id.clone(),
+        lines: Vec::new(),
+        message_count: 0,
+        include_tools: req.include_tools,
+        tail: req.more.clone().map(|mut tail| {
+            tail.seen = std::fs::metadata(&req.file_path).map_or(tail.seen, |m| m.len());
+            tail
+        }),
+        more: req.more.as_ref().map(|tail| More { from: tail.scanned, first_rule: None }),
+    }
 }
 
 fn load(req: PreviewRequest) -> PreviewResult {
@@ -155,8 +163,7 @@ pub fn check_preview_updates(app: &mut App) -> bool {
             }
             let goes_on = app.preview_tail.as_ref().is_some_and(|t| t.scanned == more.from);
             if let (true, true, Some(tail)) = (shown, goes_on, result.tail) {
-                app.append_preview(result.lines, more.first_rule, tail, result.message_count);
-                changed = true;
+                changed |= app.append_preview(result.lines, more.first_rule, tail, result.message_count);
             }
             continue;
         }
@@ -198,21 +205,67 @@ pub fn follow_growth(app: &mut App) {
     let Some(tail) = &app.preview_tail else {
         return;
     };
-    let Some(session) = app.sessions.iter().find(|s| s.id == app.preview_session_id) else {
+    if !app.sessions.iter().any(|s| s.id == app.preview_session_id) {
         return;
-    };
-    let grown = std::fs::metadata(&session.file_path).is_ok_and(|m| m.len() > tail.scanned);
+    }
+    // The file the lines shown came from; grown since it was last read (a
+    // line still being written isn't read again until more comes).
+    let grown = std::fs::metadata(&tail.path).is_ok_and(|m| m.len() > tail.seen);
     if !grown {
         return;
     }
     let request = PreviewRequest {
-        session_id: session.id.clone(),
-        file_path: session.file_path.clone(),
+        session_id: app.preview_session_id.clone(),
+        file_path: tail.path.clone(),
         include_tools: tail.include_tools,
         recap: String::new(),
         more: Some(tail.clone()),
     };
     if app.preview_req_tx.send(request).is_ok() {
         app.preview_more_pending = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_read_on_that_fails_keeps_the_preview_and_its_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.jsonl");
+        let line = |text: &str| {
+            serde_json::json!({"type": "user", "message": {"content": text}}).to_string() + "\n"
+        };
+        std::fs::write(&path, line("one") + &line("two")).unwrap();
+        let mut app = App::new(Vec::new(), false, Default::default(), crate::text_cache::TextCache::open(&dir.path().join("none")));
+        let mut tail = ConversationTail::new(false);
+        let lines: Vec<_> = read_conversation(&path, &mut tail)
+            .lines
+            .into_iter()
+            .map(|(sp, t)| (t.clone(), t, sp))
+            .collect();
+        app.preview_session_id = "a".into();
+        app.preview_lines = std::sync::Arc::new(lines);
+        app.cache_preview("a".into(), app.preview_lines.clone(), Some(tail.clone()));
+        app.preview_tail = Some(tail.clone());
+        app.preview_more_pending = true;
+        std::fs::write(&path, line("one") + &line("two") + &line("three")).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.preview_rx = rx;
+        let req = PreviewRequest {
+            session_id: "a".into(),
+            file_path: path.clone(),
+            include_tools: false,
+            recap: String::new(),
+            more: Some(tail),
+        };
+        tx.send(failed(&req)).unwrap();
+        assert!(!check_preview_updates(&mut app));
+        assert!(!app.preview_more_pending, "following goes on");
+        assert_eq!(app.preview_lines.len(), 2);
+        assert_eq!(app.preview_cache.get("a").map(|c| c.lines.len()), Some(2), "the cache isn't emptied");
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(app.preview_tail.as_ref().map(|t| t.seen), Some(len), "not retried until it grows again");
     }
 }

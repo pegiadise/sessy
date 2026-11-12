@@ -29,9 +29,10 @@ sessy --project X  # Only projects whose name contains X (searches all projects)
 sessy --recent 7d  # Only show last 7 days (supports: 1h, 7d, 2w, 1m)
 sessy --print      # Pick a session and print its ID to stdout
 sessy --mouse      # Mouse support (also config `mouse = true`)
-sessy --purge      # Delete all sessions < 15 KB and older than 2 days
-                   # (pinned and open ones are kept; lists the projects it
-                   # affects and asks first; combines with --project / --recent)
+sessy --purge      # Delete all sessions < 15 KB (subagents included) and
+                   # older than 2 days (pinned and open ones are kept; lists
+                   # the projects it affects and asks first; combines with
+                   # --project / --recent)
 ```
 
 "The current project" is the enclosing git checkout (or the launch directory outside a repo) and everything below it, so launching from `repo/src` still finds sessions started at `repo/`, and a worktree under `repo/.worktrees/` counts too.
@@ -181,7 +182,7 @@ mouse = false              # wheel scrolls, click selects, double-click resumes
 
 Mouse support is off by default because capturing the mouse stops the terminal's own text selection (most terminals still select with `Shift` or `Option` held). With it on, the wheel moves through the list or scrolls the pane under the pointer, a click selects a session, focuses a pane or picks a timeline day, and a double-click resumes (asking first for a session that's open elsewhere).
 
-A missing file means defaults; a malformed one also falls back to defaults, with the parse error shown in the status bar at startup. Keys and values sessy doesn't know are named there too. `--all` and `--project` override `scope`. Launched in a directory with no sessions of its own, sessy shows all projects.
+A missing file means defaults. A value of the wrong type (`mouse = "yes"`) is named in the status bar at startup and only that key falls back to its default; a file that isn't valid TOML, or can't be read, falls back to defaults with the safe `enter` (it may have said `safe`), and the error is shown. Keys and values sessy doesn't know are named there too. `--all` and `--project` override `scope`. Launched in a directory with no sessions of its own, sessy shows all projects.
 
 ## Delete and undo
 

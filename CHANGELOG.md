@@ -32,8 +32,10 @@ Each version's section doubles as its GitHub release notes (`scripts/release-not
 - Launched in a directory with no sessions of its own, sessy shows all projects instead of an empty list.
 - Search covers the conversation only, not the system prompt, tool listings and CLAUDE.md that newer Claude Code also logs in each session; words like "docx" no longer match nearly every session. The search cache is about half the size.
 - "Last active" (the list's date, date sort, `--recent`, `on:`, the timeline) is the session's last timestamped entry, not the file's modification time, which Claude Code moves when it appends bookkeeping weeks later.
-- A config value sessy doesn't know, or an unknown key, is reported in the status bar; `enter` set to anything but `yolo` (a typo included) means the safe resume.
-- `--purge` keeps sessions open in Claude Code and says which projects the sessions it would delete are in.
+- A config value sessy doesn't know, or an unknown key, is reported in the status bar; `enter` set to anything but `yolo` (a typo included) means the safe resume. A value of the wrong type (`mouse = "yes"`) drops only that key instead of the whole file, and a file that isn't valid TOML or can't be read means the safe resume too, since it may have said `enter = "safe"`.
+- `--purge` keeps sessions open in Claude Code and says which projects the sessions it would delete are in. A session's subagent transcripts count toward its size, sessions opened, pinned or written to while it asks are kept, and it won't run when the pins file can't be read (pinned sessions could be lost).
+- Resuming hands the terminal over to `claude` (on macOS and Linux sessy replaces itself with it), so nothing of sessy's stays in memory while the session runs, and the shell sees claude's own exit status.
+- Less CPU while idle: the screen is only redrawn every few seconds when nothing changes (a huge message on screen made each redraw costly).
 - `Esc` clears an active size filter before it quits.
 - Much faster start: the search cache is no longer rewritten on every launch. Unchanged sessions keep their place, changed ones are appended, and nothing is written when nothing changed (about 10 ms instead of 200 ms on a 4 GB history). A session that has only grown since (the one you're working in) is read on from where the last scan stopped instead of from the start: milliseconds instead of seconds for a big one.
 
@@ -41,8 +43,8 @@ Each version's section doubles as its GitHub release notes (`scripts/release-not
 
 - Prompts typed while Claude was still working were missing from the preview, the message count, "left off" and search (Claude Code stores them differently).
 - A delete or resume prompt, or a rename, could act on a different session than the one it named when the list changed under it (a session closing elsewhere while `is:open` was searched). They now stay on their session, and a `y` arriving before the prompt was even drawn (pasted text) doesn't confirm it.
-- Text pasted as keystrokes (Windows Terminal, terminals without bracketed paste) ran list commands; "study" could delete a session. It's searched for now. Pasted line breaks no longer glue words together.
-- On Windows, AltGr characters (`@`, `\`, `{`, `€` on European layouts) can be typed in the inputs.
+- Text pasted as keystrokes (Windows Terminal, terminals without bracketed paste) ran list commands; "study" could delete a session, and "ok⏎" resumed one. It's searched for now. Pasted line breaks no longer glue words together.
+- On Windows, AltGr characters (`@`, `\`, `{`, `€` on European layouts) can be typed in the inputs, and AltGr `[` / `]` jump between prompts in the preview.
 - The session name vanished from rows with a long project and branch in the two-pane layout.
 - In the preview, a phrase wrapped across two rows wasn't found by `n`/`N` or highlighted; resizing, `z` or `T` lost the reading position and `T` dropped an active find.
 - Clearing a search left its marks in the preview; unpinning under `is:pinned` left the preview on the unpinned session; a second load of the same preview reset the position.
@@ -50,7 +52,8 @@ Each version's section doubles as its GitHub release notes (`scripts/release-not
 - The timeline's count ignored the size filter; list paging was off by one in comfortable rows.
 - A damaged index file crashed sessy on every start until `--rebuild-index`; now it's rebuilt. A config folder without a `projects/` folder no longer empties the cache.
 - A failed undo (the session came back meanwhile) no longer blocks undoing earlier deletes.
-- Pins are written atomically and merged with another running sessy's; a damaged pins file is set aside instead of overwritten.
+- Pins are written atomically and merged with another running sessy's; a damaged pins file is set aside instead of overwritten, and one that can't be read is left alone.
+- Emoji drawn two columns wide by a variation selector (`⚠️`) pushed the end of preview rows off screen.
 - Tickets at the start of a line were missed, and the system prompt's IDs were taken for tickets. Indexing big sessions is about twice as fast.
 - Editor context Claude Code adds to a prompt (an opened file, a selection) no longer becomes the session's title.
 - Keys typed while the index was building ran as commands once the list appeared; they're dropped now.

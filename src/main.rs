@@ -100,14 +100,14 @@ fn main() -> io::Result<()> {
         idx.sessions.retain(|s| s.timestamp >= cutoff);
     }
 
-    // Load bookmarks
-    let bookmarks = bookmarks::load_bookmarks();
-
     // Purge: delete tiny old sessions. Runs after the CLI filters so
     // `--project X --purge` only touches that project's sessions.
     if cli.purge {
-        return run_purge(&idx, &bookmarks);
+        return run_purge(&idx);
     }
+
+    // Load bookmarks
+    let bookmarks = bookmarks::load_bookmarks();
 
     // Run TUI
     let (cfg, cfg_warning) = config::load();
@@ -344,29 +344,62 @@ fn pop_keyboard_enhancement<W: io::Write>(out: &mut W, pushed: bool) {
     }
 }
 
-fn run_purge(
-    idx: &index::SessionIndex,
-    bookmarks: &std::collections::HashSet<String>,
-) -> io::Result<()> {
+/// `--purge` deletes sessions smaller than this, subagents and tool output
+/// included.
+const PURGE_SIZE: u64 = 15 * 1024;
+
+/// A session `--purge` may delete: under `PURGE_SIZE` with its companion
+/// folder (subagent transcripts, tool output), last active over two days
+/// ago, and neither pinned (an explicit "keep this") nor open in a running
+/// Claude Code.
+fn purgeable(
+    s: &session::SessionMeta,
+    pins: &std::collections::HashSet<String>,
+    open: &std::collections::HashMap<String, live::LiveSession>,
+    now: i64,
+) -> bool {
+    s.file_size < PURGE_SIZE
+        && s.timestamp < now - 2 * 86400
+        && !pins.contains(&s.id)
+        && !open.contains_key(&s.id)
+        && s.file_size + dir_size(&s.file_path.with_extension("")) < PURGE_SIZE
+}
+
+/// Bytes in the files under `dir` (0 when there's none); links not followed.
+fn dir_size(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|e| Some((e.path(), std::fs::symlink_metadata(e.path()).ok()?)))
+        .map(|(path, meta)| if meta.is_dir() { dir_size(&path) } else { meta.len() })
+        .sum()
+}
+
+/// The pins, for `--purge`: exits rather than take a pins file it can't
+/// read for "nothing pinned".
+fn purge_pins() -> std::collections::HashSet<String> {
+    bookmarks::load_strict(&bookmarks::bookmarks_path()).unwrap_or_else(|e| {
+        eprintln!(
+            "sessy: {}. Not purging: pinned sessions could be deleted. (Starting sessy once sets a damaged file aside.)",
+            e
+        );
+        std::process::exit(1);
+    })
+}
+
+fn run_purge(idx: &index::SessionIndex) -> io::Result<()> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    let two_days_ago = now - 2 * 86400;
-    let size_limit = 15 * 1024;
-
-    // Pinned sessions are kept no matter how small: pinning is an explicit
-    // "keep this". So are sessions open in a running Claude Code.
+    let pins = purge_pins();
     let open = live::scan(&live::sessions_dir());
     let to_purge: Vec<&session::SessionMeta> = idx
         .sessions
         .iter()
-        .filter(|s| {
-            s.file_size < size_limit
-                && s.timestamp < two_days_ago
-                && !bookmarks.contains(&s.id)
-                && !open.contains_key(&s.id)
-        })
+        .filter(|s| purgeable(s, &pins, &open, now))
         .collect();
 
     if to_purge.is_empty() {
@@ -388,6 +421,9 @@ fn run_purge(
         .iter()
         .map(|(p, n)| format!("{} in {}", n, if p.is_empty() { "(no project)" } else { p }))
         .collect();
+    if cfg!(windows) {
+        println!("Close Claude Code first: on Windows sessy can't tell which sessions are open.");
+    }
     println!(
         "Found {} sessions < 15 KB and older than 2 days ({}). Delete all permanently? [y/N]",
         to_purge.len(),
@@ -396,8 +432,18 @@ fn run_purge(
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
     if answer.trim().eq_ignore_ascii_case("y") {
+        // The question may have waited a while: sessions opened, pinned or
+        // written to since are kept.
+        let pins = purge_pins();
+        let open = live::scan(&live::sessions_dir());
         let mut deleted = 0;
+        let mut kept = 0;
         for s in &to_purge {
+            let unchanged = std::fs::metadata(&s.file_path).is_ok_and(|m| m.len() == s.file_size);
+            if !unchanged || !purgeable(s, &pins, &open, now) {
+                kept += 1;
+                continue;
+            }
             if std::fs::remove_file(&s.file_path).is_ok() {
                 let companion = s.file_path.with_extension("");
                 if companion.is_dir() {
@@ -409,7 +455,11 @@ fn run_purge(
         // No index save needed: the next launch simply won't find the deleted
         // files on disk, and stale cache entries keyed by missing paths are
         // ignored by the incremental rebuild.
-        println!("Purged {} sessions.", deleted);
+        if kept > 0 {
+            println!("Purged {} sessions; kept {} opened, pinned or written to meanwhile.", deleted, kept);
+        } else {
+            println!("Purged {} sessions.", deleted);
+        }
     } else {
         println!("Aborted.");
     }
@@ -452,16 +502,24 @@ fn handle_post_tui_action(app: &App) -> i32 {
             if yolo {
                 cmd.arg("--dangerously-skip-permissions");
             }
-            match cmd.status() {
-                Ok(status) => status.code().unwrap_or(1),
-                Err(e) => {
-                    eprintln!(
-                        "sessy: couldn't run `claude` ({}). Is Claude Code installed and on your PATH?",
-                        e
-                    );
-                    127
-                }
-            }
+            // Become claude: nothing of sessy's (its caches, threads) stays
+            // in memory while the session runs, and claude's exit status,
+            // a signal's included, is what the shell sees.
+            #[cfg(unix)]
+            let error = {
+                use std::os::unix::process::CommandExt;
+                cmd.exec()
+            };
+            #[cfg(not(unix))]
+            let error = match cmd.status() {
+                Ok(status) => return status.code().unwrap_or(1),
+                Err(e) => e,
+            };
+            eprintln!(
+                "sessy: couldn't run `claude` ({}). Is Claude Code installed and on your PATH?",
+                error
+            );
+            127
         }
         AppAction::Print(idx) => match resolve(idx) {
             Some(session) => {
@@ -506,9 +564,14 @@ fn run_event_loop<B: ratatui::backend::Backend<Error = io::Error>>(
             dirty = true;
         }
 
-        // Redraw on change, plus a slow tick so the loading indicator and
-        // status-message expiry still update when idle.
-        if dirty || last_draw.elapsed() >= Duration::from_millis(250) {
+        // Redraw on change, plus a tick while something changes on its own
+        // (the loading indicator, a status message expiring) and a slow one
+        // otherwise (dates): a redraw re-wraps the messages on screen, which
+        // costs real CPU for a huge one.
+        let animating = app.preview_loading
+            || app.status_message.as_ref().is_some_and(|(_, when)| when.elapsed() < Duration::from_secs(4));
+        let tick = Duration::from_millis(if animating { 250 } else { 5000 });
+        if dirty || last_draw.elapsed() >= tick {
             terminal.draw(|frame| ui::draw(frame, app))?;
             last_draw = Instant::now();
             dirty = false;
@@ -524,23 +587,7 @@ fn run_event_loop<B: ratatui::backend::Backend<Error = io::Error>>(
                     break;
                 }
             }
-            for event in coalesce_typed_pastes(burst) {
-                // Pointer motion arrives at mouse speed and changes nothing.
-                let moved = matches!(
-                    &event,
-                    Event::Mouse(m) if matches!(m.kind, MouseEventKind::Moved)
-                );
-                match event {
-                    Event::Key(key) if key.kind != KeyEventKind::Release => handle_key(app, key),
-                    Event::Paste(text) => handle_paste(app, &text),
-                    Event::Mouse(m) if app.mouse => handle_mouse(app, m),
-                    _ => {}
-                }
-                dirty |= !moved;
-                if app.action != AppAction::None {
-                    break;
-                }
-            }
+            dirty |= handle_burst(app, burst);
             if app.search_dirty {
                 app.apply_search();
                 preview::request_preview(app);
@@ -562,16 +609,47 @@ fn run_event_loop<B: ratatui::backend::Backend<Error = io::Error>>(
     Ok(())
 }
 
-/// Text that arrives as keystrokes, all at once: a paste from a terminal
-/// that types it out (Windows Terminal's Ctrl+V, no bracketed paste). Read
-/// as keys, its letters run list commands: "nobody" pins (`b`) and deletes
-/// (`d`, `y`). A run of at least `MIN` plain chars in one burst becomes one
-/// paste, Enters inside it line breaks. Not: a key held down (one char
-/// repeated), movement keys queued while the UI was busy, a leading `/`
-/// (opening the search), a trailing Enter.
-fn coalesce_typed_pastes(events: Vec<Event>) -> Vec<Event> {
-    const MIN: usize = 4;
-    let typed = |e: &Event| match e {
+/// Handle a burst of events read at once. Returns whether to redraw.
+fn handle_burst(app: &mut App, burst: Vec<Event>) -> bool {
+    let mut dirty = false;
+    let mut events = burst.into_iter().peekable();
+    while let Some(event) = events.next() {
+        // In the list or preview, text the terminal typed out (see
+        // `coalesce_typed_pastes`) arrives as a paste. In an input, keys are
+        // text anyway and stay keys: fast typing works as typed.
+        let run = if matches!(app.focus, Focus::List | Focus::Preview) && starts_typed_run(&event) {
+            let mut run = vec![event];
+            while let Some(next) = events.next_if(|e| typed_char(e).is_some() || is_release(e)) {
+                run.push(next);
+            }
+            coalesce_typed_pastes(run)
+        } else {
+            vec![event]
+        };
+        for event in run {
+            // Pointer motion arrives at mouse speed and changes nothing.
+            let moved = matches!(
+                &event,
+                Event::Mouse(m) if matches!(m.kind, MouseEventKind::Moved)
+            );
+            match event {
+                Event::Key(key) if key.kind != KeyEventKind::Release => handle_key(app, key),
+                Event::Paste(text) => handle_paste(app, &text),
+                Event::Mouse(m) if app.mouse => handle_mouse(app, m),
+                _ => {}
+            }
+            dirty |= !moved;
+            if app.action != AppAction::None {
+                return dirty;
+            }
+        }
+    }
+    dirty
+}
+
+/// A plain key press that's text: a char, Enter (`\n`) or Tab (`\t`).
+fn typed_char(e: &Event) -> Option<char> {
+    match e {
         Event::Key(k)
             if k.kind != KeyEventKind::Release
                 && !k.modifiers.intersects(
@@ -581,33 +659,54 @@ fn coalesce_typed_pastes(events: Vec<Event>) -> Vec<Event> {
             match k.code {
                 KeyCode::Char(c) => Some(c),
                 KeyCode::Enter => Some('\n'),
+                KeyCode::Tab => Some('\t'),
                 _ => None,
             }
         }
         _ => None,
-    };
-    let release = |e: &Event| matches!(e, Event::Key(k) if k.kind == KeyEventKind::Release);
+    }
+}
+
+fn is_release(e: &Event) -> bool {
+    matches!(e, Event::Key(k) if k.kind == KeyEventKind::Release)
+}
+
+/// A key that can start typed-out text: a char other than `/` (which
+/// opens the search).
+fn starts_typed_run(e: &Event) -> bool {
+    typed_char(e).is_some_and(|c| !matches!(c, '\n' | '\t' | '/'))
+}
+
+/// Text that arrives as keystrokes, all at once: a paste from a terminal
+/// that types it out (Windows Terminal's Ctrl+V, no bracketed paste). Read
+/// as keys, its letters run list commands: "nobody" pins (`b`) and deletes
+/// (`d`, `y`), "ok⏎" resumes. A run of at least `MIN` plain chars in one
+/// burst becomes one paste (Enters and Tabs inside it are text), and so does
+/// a shorter one that ends in Enter. Not: a key held down (one char
+/// repeated), movement keys queued while the UI was busy, a leading `/`
+/// (opening the search). A trailing Enter stays a key, landing in the
+/// search box the paste opens.
+fn coalesce_typed_pastes(events: Vec<Event>) -> Vec<Event> {
+    const MIN: usize = 4;
+    let typed = typed_char;
+    let release = is_release;
     let mut out = Vec::with_capacity(events.len());
     let mut events = events.into_iter().peekable();
     while let Some(event) = events.next() {
-        let Some(first) = typed(&event).filter(|c| *c != '\n') else {
-            out.push(event);
-            continue;
-        };
-        if first == '/' {
+        if !starts_typed_run(&event) {
             out.push(event);
             continue;
         }
+        let Some(first) = typed(&event) else {
+            out.push(event);
+            continue;
+        };
         let mut run = vec![event];
         let mut text = String::from(first);
-        while let Some(next) = events.peek() {
-            if release(next) {
-                events.next();
-            } else if let Some(c) = typed(next) {
+        while let Some(next) = events.next_if(|e| release(e) || typed(e).is_some()) {
+            if let Some(c) = typed(&next) {
                 text.push(c);
-                run.push(events.next().unwrap());
-            } else {
-                break;
+                run.push(next);
             }
         }
         // A trailing Enter is a key (say, a query typed fast, then Enter).
@@ -619,8 +718,9 @@ fn coalesce_typed_pastes(events: Vec<Event>) -> Vec<Event> {
         };
         let chars: Vec<char> = text.chars().collect();
         let held_down = chars.iter().all(|&c| c == chars[0]);
-        let moving = chars.iter().all(|c| "jkgGnN[] ".contains(*c));
-        if chars.len() >= MIN && !held_down && !moving {
+        let moving = chars.iter().all(|c| "jkgGnN[] \t".contains(*c));
+        let long_enough = chars.len() >= MIN || (enter.is_some() && chars.len() >= 2);
+        if long_enough && !held_down && !moving {
             out.push(Event::Paste(text));
         } else {
             out.extend(run);
@@ -788,14 +888,19 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
         }
         return;
     }
-    if let Some(&(_, visual)) = app.list_rows.iter().find(|&&(ry, _)| ry == y) {
+    if let Some(&(_, real)) = app.list_rows.iter().find(|&&(ry, _)| ry == y) {
         if !contains(app.list_area, x, y) {
             return;
         }
+        // The session drawn there, wherever it is now: a key in the same
+        // burst may have reordered the list (a pin, a sort).
+        let Some(visual) = app.filtered_indices.iter().position(|&r| r == real) else {
+            return;
+        };
         app.focus = Focus::List;
         let again = app
             .last_click
-            .is_some_and(|(t, v)| v == visual && t.elapsed() < DOUBLE_CLICK);
+            .is_some_and(|(t, r)| r == real && t.elapsed() < DOUBLE_CLICK);
         if visual != app.selected {
             app.selected = visual;
             app.preview_scroll = 0;
@@ -805,7 +910,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
             app.last_click = None;
             pick_selected(app, KeyCode::Enter);
         } else {
-            app.last_click = Some((Instant::now(), visual));
+            app.last_click = Some((Instant::now(), real));
         }
     } else if contains(app.list_area, x, y) {
         app.focus = Focus::List;
@@ -968,10 +1073,13 @@ fn edit_text_input(input: &mut sessy::input::TextInput, key: KeyEvent) {
 }
 
 /// Modifier combos other than Shift. Keys are bound on their bare letter; a
-/// stray Ctrl+D must not reach the `d` (delete) binding.
+/// stray Ctrl+D must not reach the `d` (delete) binding. AltGr, which
+/// Windows reports as Ctrl+Alt, types a char that isn't a letter (`[`, `]`
+/// on European layouts): that's the char.
 fn has_command_modifier(key: &KeyEvent) -> bool {
-    key.modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    let altgr = matches!(key.code, KeyCode::Char(c) if !c.is_ascii_alphabetic())
+        && key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    !altgr && key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
 }
 
 fn handle_preview_key(app: &mut App, key: KeyEvent) {
@@ -1234,6 +1342,29 @@ mod tests {
         app
     }
 
+    #[test]
+    fn purge_counts_a_session_s_subagents_and_never_takes_pins_or_open_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = app_with(&["a"]).sessions.remove(0);
+        s.file_path = dir.path().join("a.jsonl");
+        std::fs::write(&s.file_path, "x".repeat(1300)).unwrap();
+        s.file_size = 1300;
+        s.timestamp = 0; // long ago
+        let none = std::collections::HashMap::new();
+        assert!(purgeable(&s, &HashSet::new(), &none, 1_000_000));
+        assert!(!purgeable(&s, &HashSet::from(["a".to_string()]), &none, 1_000_000), "pinned");
+        let open = live::LiveSession { pid: 1, busy: false };
+        let open = std::collections::HashMap::from([("a".to_string(), open)]);
+        assert!(!purgeable(&s, &HashSet::new(), &open, 1_000_000), "open in Claude Code");
+        assert!(!purgeable(&s, &HashSet::new(), &none, 2 * 86400 - 1), "active in the last two days");
+        // Its subagents did 2 MB of work: not a tiny session.
+        let sub = dir.path().join("a/subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("agent-1.jsonl"), vec![b'x'; 2 << 20]).unwrap();
+        assert_eq!(dir_size(&dir.path().join("a")), 2 << 20);
+        assert!(!purgeable(&s, &HashSet::new(), &none, 1_000_000));
+    }
+
     fn press(app: &mut App, code: KeyCode) {
         handle_key(app, key(code, KeyModifiers::NONE));
     }
@@ -1363,6 +1494,43 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, Event::Paste(t) if t == "deploy")));
     }
 
+    /// Keys a busy UI queued, as macOS and Linux send them (no releases).
+    fn queued(s: &str) -> Vec<Event> {
+        typed(s).into_iter().filter(|e| !is_release(e)).collect()
+    }
+
+    #[test]
+    fn a_short_pasted_line_searches_instead_of_resuming() {
+        for pasted in ["ok\n", "fix\tbar\n", "lol\n"] {
+            let mut app = app_with(&["a", "b"]);
+            app.enter_yolo = true;
+            handle_burst(&mut app, typed(pasted));
+            assert_eq!(app.action, AppAction::None, "{:?} resumed", pasted);
+            let text = pasted.trim_end().replace('\t', " ");
+            assert_eq!(app.search_query.text(), text);
+        }
+        // Moving down and resuming, queued while the UI was busy: keys.
+        let mut app = app_with(&["a", "b", "c"]);
+        app.enter_yolo = true;
+        handle_burst(&mut app, queued("jj\n"));
+        assert_eq!(app.action, AppAction::LaunchDangerously(2));
+    }
+
+    #[test]
+    fn fast_typing_in_an_input_is_kept_as_typed() {
+        let mut app = app_with(&["a", "b"]);
+        app.focus = Focus::Search;
+        handle_burst(&mut app, queued("ploy "));
+        handle_burst(&mut app, queued("caddy"));
+        assert_eq!(app.search_query.text(), "ploy caddy", "the space between bursts stays");
+        // Enter leaves the search; what follows moves in the list.
+        let mut app = app_with(&["a", "b"]);
+        app.focus = Focus::Search;
+        handle_burst(&mut app, queued("session\njj"));
+        assert_eq!(app.search_query.text(), "session");
+        assert_eq!(app.focus, Focus::List);
+    }
+
     #[test]
     fn a_pasted_word_in_the_list_searches_instead_of_running_commands() {
         let mut app = app_with(&["a", "b"]);
@@ -1429,7 +1597,7 @@ mod tests {
     fn rename_writes_to_the_session_it_was_opened_for() {
         let mut app = app_with(&["a", "b"]);
         press(&mut app, KeyCode::Char('r'));
-        assert_eq!(app.prompt_target.as_deref(), Some("a"));
+        assert_eq!(app.prompt_target.as_ref(), Some(&app.sessions[0].file_path));
         app.sessions.remove(0); // a is gone (deleted elsewhere); b is now row 0
         app.rebuild_view();
         press(&mut app, KeyCode::Char('x'));
@@ -1564,6 +1732,19 @@ mod tests {
             mouse(&mut app, MouseEventKind::ScrollUp, 10, y);
         }
         assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn a_double_click_after_a_reordering_key_resumes_the_session_drawn_there() {
+        let mut app = drawn(&["a", "b", "c"]);
+        app.enter_yolo = false;
+        let b_row = app.list_rows.iter().find(|&&(_, real)| real == 1).unwrap().0;
+        app.selected = 2;
+        press(&mut app, KeyCode::Char('b')); // pins c: it floats to the top
+        assert_eq!(app.filtered_indices[0], 2);
+        click(&mut app, 10, b_row);
+        click(&mut app, 10, b_row);
+        assert_eq!(app.action, AppAction::Launch(1), "b, as drawn");
     }
 
     #[test]

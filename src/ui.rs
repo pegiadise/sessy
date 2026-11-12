@@ -7,6 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Width of the speaker column ("USER: ", "ASST: ", …) in the preview.
@@ -476,7 +477,7 @@ fn draw_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .into_iter()
         .take(height)
         .enumerate()
-        .map(|(i, visual)| (inner.y + i as u16, visual))
+        .filter_map(|(i, visual)| Some((inner.y + i as u16, *app.filtered_indices.get(visual)?)))
         .collect();
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner);
@@ -1584,12 +1585,12 @@ pub fn truncate_width(s: &str, max_cols: usize) -> String {
     }
     let mut out = String::new();
     let mut used = 0;
-    for c in s.chars() {
-        let w = c.width().unwrap_or(0);
+    for g in s.graphemes(true) {
+        let w = g.width();
         if used + w > max_cols - 1 {
             break;
         }
-        out.push(c);
+        out.push_str(g);
         used += w;
     }
     out.push('…');
@@ -1715,13 +1716,15 @@ fn wrap_text_joined(text: &str, width: usize) -> Vec<(String, bool)> {
         let mut cut = None;
         let mut last_space = None;
         let mut seen_word = false;
-        for (i, c) in remaining.char_indices() {
-            let w = c.width().unwrap_or(0);
+        // By grapheme, as the terminal draws them: "⚠\u{FE0F}" is two
+        // columns though its chars add up to one.
+        for (i, g) in remaining.grapheme_indices(true) {
+            let w = g.width();
             if used + w > width {
                 cut = Some(i);
                 break;
             }
-            if c == ' ' {
+            if g == " " {
                 if seen_word {
                     last_space = Some(i);
                 }
@@ -1737,7 +1740,7 @@ fn wrap_text_joined(text: &str, width: usize) -> Vec<(String, bool)> {
         let split = match last_space {
             Some(s) if s > 0 => s,
             // A single character wider than the row still has to go somewhere.
-            _ if cut == 0 => remaining.chars().next().map_or(remaining.len(), char::len_utf8),
+            _ if cut == 0 => remaining.graphemes(true).next().map_or(remaining.len(), str::len),
             _ => cut,
         };
         let row = remaining[..split].trim_end();
@@ -1869,6 +1872,12 @@ mod tests {
         let rows = wrap_text("    let x = compute_something(a, b);", 20);
         assert!(rows[0].starts_with("    let"), "got {:?}", rows);
         assert!(rows.iter().all(|r| r.width() <= 20), "got {:?}", rows);
+        // Emoji drawn two columns wide by a variation selector.
+        let warned: String = (0..40).map(|i| format!("\u{26a0}\u{fe0f}w{:02} ", i)).collect();
+        let rows = wrap_text(&warned, 20);
+        assert!(rows.iter().all(|r| r.width() <= 20), "got {:?}", rows);
+        assert!(rows.concat().contains("w39"));
+        assert!(truncate_width(&warned, 9).width() <= 9);
     }
 
     #[test]

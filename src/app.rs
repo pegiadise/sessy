@@ -185,8 +185,9 @@ const PREVIEW_CACHE_BYTES: usize = 256 << 20;
 /// Where to put the preview when its session's lines load again (`T`).
 pub struct PreviewKeep {
     pub session: String,
-    /// The message that was at the top.
-    pub top: Option<(String, Speaker)>,
+    /// The message that was at the top, and how many before it were the
+    /// same (a "continue" typed thirty times).
+    pub top: Option<(String, Speaker, usize)>,
 }
 
 pub struct PreviewResult {
@@ -237,9 +238,11 @@ pub struct App {
     pub preview_cache: std::collections::HashMap<String, CachedPreview>,
     pub preview_cache_order: VecDeque<String>,
     pub confirm_delete: bool,
-    /// The session (ID) an open delete prompt or rename is for. Checked when
-    /// it's confirmed, so a list that changed meanwhile can't redirect it.
-    pub prompt_target: Option<String>,
+    /// The session an open delete prompt or rename is for, by transcript
+    /// (IDs can repeat: a project folder copied after a repo moved). Checked
+    /// when it's confirmed, so a list that changed meanwhile can't redirect
+    /// it.
+    pub prompt_target: Option<PathBuf>,
     /// The open prompt has been drawn. A `y` that arrives before (in the
     /// same burst of keys as the `d`, e.g. pasted text) doesn't confirm it.
     pub prompt_seen: bool,
@@ -322,7 +325,7 @@ pub struct App {
     /// Mouse support is on (config `mouse`, `--mouse`).
     pub mouse: bool,
     /// Where the panes were drawn last frame (empty when not shown), and
-    /// which session each list row belongs to: (y, visual index).
+    /// which session each list row belongs to: (y, index into `sessions`).
     pub search_area: ratatui::layout::Rect,
     pub list_area: ratatui::layout::Rect,
     pub list_rows: Vec<(u16, usize)>,
@@ -419,10 +422,11 @@ impl App {
         // The same conversation comes back with tool lines added or gone:
         // return to the same message, with the same find.
         let top = self.preview_place().and_then(|(line, _)| {
-            self.preview_lines[line..]
-                .iter()
-                .find(|(_, _, sp)| !matches!(sp, Speaker::Tool | Speaker::Day))
-                .map(|(text, _, sp)| (text.clone(), *sp))
+            let lines = &self.preview_lines;
+            let at = (line..lines.len()).find(|&i| !matches!(lines[i].2, Speaker::Tool | Speaker::Day))?;
+            let (text, _, speaker) = &lines[at];
+            let before = lines[..at].iter().filter(|(t, _, sp)| sp == speaker && t == text).count();
+            Some((text.clone(), *speaker, before))
         });
         self.preview_keep = Some(PreviewKeep {
             session: self.preview_session_id.clone(),
@@ -701,10 +705,16 @@ impl App {
         !self.query().text.is_empty()
     }
 
-    fn apply_search_inner(&mut self) {
-        self.exact_matches.clear();
+    /// Drop the match lines, and the original-case lookups still out for
+    /// them: they're keyed by index into `sessions`, which may change.
+    fn forget_snippets(&mut self) {
         self.snippets.clear();
         self.snippet_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn apply_search_inner(&mut self) {
+        self.exact_matches.clear();
+        self.forget_snippets();
         let query = self.query();
         self.apply_text_search(&query.text);
         if !query.filters.is_empty() {
@@ -1025,7 +1035,7 @@ impl App {
         let Some(name) = self.selected_session().map(|s| s.name.clone()) else {
             return;
         };
-        self.prompt_target = self.selected_id();
+        self.prompt_target = self.selected_session().map(|s| s.file_path.clone());
         self.rename_input = TextInput::from(name.as_str());
         self.focus = Focus::Rename;
     }
@@ -1042,7 +1052,7 @@ impl App {
         let name = crate::parser::one_line(self.rename_input.text(), 200);
         self.rename_input.clear();
         let target = self.prompt_target.take();
-        let Some(real) = target.and_then(|id| self.sessions.iter().position(|s| s.id == id)) else {
+        let Some(real) = target.and_then(|path| self.sessions.iter().position(|s| s.file_path == path)) else {
             self.set_status("That session is gone; nothing renamed".to_string());
             return;
         };
@@ -1216,13 +1226,22 @@ impl App {
     /// Add what's new in the session shown (`lines`, read on from where it
     /// ended) without reloading it: new rows laid out, matches and the
     /// current one kept, the view kept, or at the bottom if it was there.
+    /// Returns whether anything shown changed.
     pub fn append_preview(
         &mut self,
         lines: Vec<(String, String, Speaker)>,
         first_rule: Option<(usize, String)>,
         tail: crate::parser::ConversationTail,
         new_prompts: u32,
-    ) {
+    ) -> bool {
+        if lines.is_empty() && first_rule.is_none() {
+            // Only part of a line so far: just where reading got to.
+            if let Some(cached) = self.preview_cache.get_mut(&self.preview_session_id) {
+                cached.tail = Some(tail.clone());
+            }
+            self.preview_tail = Some(tail);
+            return false;
+        }
         let at_bottom = self.preview_scroll >= self.max_preview_scroll();
         let place = self.preview_place();
         let current = self.preview_search_matches.get(self.preview_search_current).copied();
@@ -1264,6 +1283,7 @@ impl App {
         if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
             s.message_count += new_prompts;
         }
+        true
     }
 
     /// Rows a preview line takes at `width` (its gap row not included).
@@ -1377,10 +1397,14 @@ impl App {
             self.refresh_preview_matches(true);
             return;
         };
-        let line = keep.top.and_then(|(text, speaker)| {
-            self.preview_lines
+        let line = keep.top.and_then(|(text, speaker, before)| {
+            let mut same = self
+                .preview_lines
                 .iter()
-                .position(|(t, _, sp)| *sp == speaker && *t == text)
+                .enumerate()
+                .filter(|(_, (t, _, sp))| *sp == speaker && *t == text)
+                .map(|(i, _)| i);
+            same.nth(before)
         });
         self.refresh_preview_matches(false);
         if let Some(line) = line {
@@ -1529,7 +1553,7 @@ impl App {
     pub fn open_delete_prompt(&mut self) {
         if self.selected_session().is_some() {
             self.confirm_delete = true;
-            self.prompt_target = self.selected_id();
+            self.prompt_target = self.selected_session().map(|s| s.file_path.clone());
             self.prompt_seen = false;
         }
     }
@@ -1542,7 +1566,7 @@ impl App {
         if !self.prompt_seen {
             return;
         }
-        if target.is_some() && target == self.selected_id() {
+        if target.is_some() && target.as_ref() == self.selected_session().map(|s| &s.file_path) {
             self.delete_selected();
         } else {
             self.set_status("The list changed; nothing deleted".to_string());
@@ -1582,7 +1606,7 @@ impl App {
         if let Some(slot) = slot {
             self.undo_stack.push(DeletedSession { meta, pinned, slot });
         }
-        self.snippets.clear();
+        self.forget_snippets();
         if real_idx < self.exact_matches.len() {
             self.exact_matches.remove(real_idx);
         }
@@ -1733,6 +1757,8 @@ impl App {
         if words.is_empty() {
             return None;
         }
+        // One word, however often typed ("caddy caddy"): that word.
+        let phrase: &str = if words.len() == 1 { words[0] } else { &phrase };
         // Words the row already shows; when the words are far apart, the
         // others get the room.
         let shown = [
@@ -1754,7 +1780,7 @@ impl App {
             &[Together::Phrase]
         };
         for &together in levels {
-            if let Some(parts) = text_snippet_parts(&text[..split], &phrase, &words, &shown, together) {
+            if let Some(parts) = text_snippet_parts(&text[..split], phrase, &words, &shown, together) {
                 return Some(Snippet { in_file: false, subagent: None, parts });
             }
             if together == *levels.last().unwrap_or(&Together::Apart) {
@@ -1763,7 +1789,7 @@ impl App {
                 }
             }
             let sub = &text[split..];
-            if let Some(snippet) = self.subagent_snippet(s, sub, &phrase, &words, &shown, together) {
+            if let Some(snippet) = self.subagent_snippet(s, sub, phrase, &words, &shown, together) {
                 return Some(snippet);
             }
         }
@@ -1892,7 +1918,10 @@ impl App {
     fn change_bookmarks(&mut self, change: impl Fn(&mut HashSet<String>)) {
         change(&mut self.bookmarks);
         if let Some(path) = &self.bookmarks_file {
-            self.bookmarks = crate::bookmarks::update(path, change);
+            match crate::bookmarks::update(path, change) {
+                Some(saved) => self.bookmarks = saved,
+                None => self.set_status("Couldn't read the pins file; this change isn't saved".to_string()),
+            }
         }
     }
 
@@ -2728,6 +2757,36 @@ mod search_tests {
     }
 
     #[test]
+    fn test_rename_of_a_copied_session_writes_the_copy_selected() {
+        // The same session ID in two project folders (one copied after a
+        // repo moved): the rename goes into the transcript selected.
+        let dir = tempfile::tempdir().unwrap();
+        let line = "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n";
+        let mut copies = Vec::new();
+        for folder in ["old", "new"] {
+            std::fs::create_dir_all(dir.path().join(folder)).unwrap();
+            let path = dir.path().join(folder).join("same-id.jsonl");
+            std::fs::write(&path, line).unwrap();
+            let mut s = make_session("same-id", "name", "", folder, "main", vec![]);
+            s.file_path = path;
+            copies.push(s);
+        }
+        let mut app = App::new(copies, false, HashSet::new(), empty_cache());
+        app.rebuild_view();
+        let new = app.filtered_indices.iter().position(|&i| app.sessions[i].project == "new").unwrap();
+        app.selected = new;
+        app.start_rename();
+        app.rename_input = "renamed".into();
+        app.commit_rename();
+        let old = std::fs::read_to_string(dir.path().join("old/same-id.jsonl")).unwrap();
+        let renamed = std::fs::read_to_string(dir.path().join("new/same-id.jsonl")).unwrap();
+        assert!(!old.contains("renamed") && renamed.contains("renamed"));
+        let names: Vec<(&str, &str)> =
+            app.sessions.iter().map(|s| (s.project.as_str(), s.name.as_str())).collect();
+        assert!(names.contains(&("new", "renamed")) && names.contains(&("old", "name")));
+    }
+
+    #[test]
     fn test_rename_to_blank_is_a_no_op() {
         let mut s = make_session("abc", "keep", "", "p", "main", vec![]);
         s.file_path = PathBuf::from("/does/not/exist.jsonl");
@@ -2924,6 +2983,33 @@ mod search_tests {
     }
 
     #[test]
+    fn test_toggling_tools_returns_to_the_same_one_of_repeated_messages() {
+        let mut app = three_sessions();
+        let id = app.selected_session().unwrap().id.clone();
+        let lines: Vec<_> = (0..30)
+            .flat_map(|i| {
+                let answer = format!("answer {} {}", i, "word ".repeat(30));
+                [
+                    ("continue".to_string(), "continue".to_string(), Speaker::User),
+                    (answer.clone(), answer, Speaker::Assistant),
+                ]
+            })
+            .collect();
+        app.preview_lines = lines.clone().into();
+        app.preview_session_id = id;
+        app.preview_inner_width = 40;
+        app.preview_viewport_height = 10;
+        app.recompute_preview_offsets();
+        app.preview_scroll = app.preview_line_offsets[50]; // the 26th "continue"
+        app.toggle_tools();
+        crate::preview::request_preview(&mut app);
+        app.preview_lines = lines.into();
+        app.preview_loading = false;
+        app.preview_loaded();
+        assert_eq!(app.preview_place().unwrap().0, 50);
+    }
+
+    #[test]
     fn test_session_search_opens_where_all_words_are_past_the_recap() {
         let mut app = three_sessions();
         preview_of(
@@ -3046,6 +3132,33 @@ mod search_tests {
         app.search_query = query.into();
         app.apply_search();
         (dir, app)
+    }
+
+    #[test]
+    fn test_a_word_typed_twice_still_gets_a_match_line() {
+        let (_dir, mut app) = searched("we reload caddy nightly\n", "x", "caddy caddy");
+        let snip = app.snippet(0).expect("a match line");
+        assert!(one_part(&snip).0.contains("caddy"));
+    }
+
+    #[test]
+    fn test_a_delete_invalidates_lookups_still_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sessions = Vec::new();
+        for id in ["a", "b"] {
+            let path = dir.path().join(format!("{}.jsonl", id));
+            std::fs::write(&path, "{}\n").unwrap();
+            let mut s = make_session(id, id, "", "p", "main", vec![]);
+            s.file_path = path;
+            sessions.push(s);
+        }
+        let mut app = App::new(sessions, false, HashSet::new(), empty_cache());
+        app.rebuild_view();
+        let before = app.snippet_generation.load(Ordering::Relaxed);
+        app.delete_selected();
+        assert_eq!(app.sessions.len(), 1);
+        // A lookup for the old index 1 would land on whatever is there now.
+        assert_ne!(app.snippet_generation.load(Ordering::Relaxed), before);
     }
 
     #[test]
@@ -3392,13 +3505,38 @@ mod search_tests {
         app.recompute_preview_offsets();
     }
 
-    /// What reading on from the preview's tail finds, applied.
-    fn read_on(app: &mut App, path: &Path) {
+    /// What reading on from the preview's tail finds, applied: whether the
+    /// preview changed.
+    fn read_on(app: &mut App, path: &Path) -> bool {
         let mut tail = app.preview_tail.clone().unwrap();
         let more = crate::parser::read_conversation(path, &mut tail);
         let users = more.lines.iter().filter(|(sp, _)| *sp == Speaker::User).count() as u32;
         let lines = more.lines.into_iter().map(|(sp, t)| (t.clone(), crate::fold::fold(&t), sp)).collect();
-        app.append_preview(lines, more.first_rule, tail, users);
+        app.append_preview(lines, more.first_rule, tail, users)
+    }
+
+    #[test]
+    fn test_a_line_still_being_written_is_read_once_until_it_grows() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.jsonl");
+        let mut app = three_sessions();
+        shown_transcript(&mut app, &path, &["one"]);
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(f, "{{\"type\":\"user\",\"message\":{{\"content\":\"tw").unwrap();
+        crate::preview::follow_growth(&mut app);
+        assert!(app.preview_more_pending, "it grew: read on");
+        app.preview_more_pending = false;
+        assert!(!read_on(&mut app, &path), "half a line adds nothing");
+        crate::preview::follow_growth(&mut app);
+        assert!(!app.preview_more_pending, "and isn't read again every second");
+        writeln!(f, "o\"}}}}").unwrap();
+        crate::preview::follow_growth(&mut app);
+        assert!(app.preview_more_pending, "until it's written");
+        app.preview_more_pending = false;
+        assert!(read_on(&mut app, &path));
+        let texts: Vec<&str> = app.preview_lines.iter().map(|l| l.0.as_str()).collect();
+        assert_eq!(texts, ["one", "two"]);
     }
 
     fn append_prompt(path: &Path, prompt: &str, ts: &str) {

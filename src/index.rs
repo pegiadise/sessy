@@ -101,7 +101,8 @@ struct FileStats {
     mtime: i64,
     /// What `SessionMeta::file_mtime` holds, compared to notice a change: a
     /// hash of the transcript's and the subagents' mtimes (to the
-    /// nanosecond) and the subagents' names and sizes.
+    /// nanosecond), the subagents' names and sizes, and their descriptions'
+    /// stamps.
     changed: i64,
     subagents: Vec<crate::subagents::SubagentFile>,
 }
@@ -122,6 +123,7 @@ fn file_stats(path: &Path) -> Option<FileStats> {
         h.add(f.path.file_name().map_or(&[][..], |n| n.as_encoded_bytes()));
         h.add(&f.size.to_le_bytes());
         h.add(&f.mtime.to_le_bytes());
+        h.add(&f.meta.to_le_bytes());
     }
     Some(FileStats {
         size: metadata.len(),
@@ -148,13 +150,14 @@ impl Fnv {
     }
 }
 
-/// The subagent files a text was built from: name, size, mtime.
-fn fingerprint(files: &[crate::subagents::SubagentFile]) -> Vec<(String, u64, i64)> {
+/// The subagent files a text was built from: name, size, mtime, and its
+/// description file's stamp.
+fn fingerprint(files: &[crate::subagents::SubagentFile]) -> Vec<(String, u64, i64, i64)> {
     files
         .iter()
         .map(|f| {
             let name = f.path.file_name().map(|n| n.to_string_lossy().into_owned());
-            (name.unwrap_or_default(), f.size, f.mtime)
+            (name.unwrap_or_default(), f.size, f.mtime, f.meta)
         })
         .collect()
 }
@@ -175,11 +178,11 @@ struct Resume {
     /// Bytes of the text that come from those lines.
     main_len: u32,
     /// The subagent files its subagent text was built from.
-    subagents: Vec<(String, u64, i64)>,
+    subagents: Vec<(String, u64, i64, i64)>,
     scanner: crate::parser::Scanner,
 }
 
-const RESUME_VERSION: u32 = 1;
+const RESUME_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 struct ResumeFile {
@@ -738,9 +741,14 @@ pub fn lock_cache() -> CacheLock {
     #[cfg(unix)]
     if let Some(f) = &file {
         use std::os::unix::io::AsRawFd;
-        // Blocks until another instance finishes its build (usually ms).
+        // Waits for another instance to finish its build (usually ms). One
+        // that's suspended (Ctrl+Z) or stuck would hold it indefinitely:
+        // say what's being waited for.
         unsafe {
-            libc::flock(f.as_raw_fd(), libc::LOCK_EX);
+            if libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 {
+                eprintln!("sessy: waiting for another sessy to finish indexing…");
+                libc::flock(f.as_raw_fd(), libc::LOCK_EX);
+            }
         }
     }
     CacheLock { _file: file }
@@ -1191,6 +1199,16 @@ mod tests {
             "audit the index\nthanks\n\u{1}check the locks\nfound a flock race\n"
         );
         assert_eq!(session(&idx, "a").message_count, 2, "subagents' turns aren't the person's");
+
+        // Its description is rewritten, nothing else: read again.
+        fs::write(sub.join("agent-x.meta.json"), r#"{"description":"Check the flock calls"}"#).unwrap();
+        let (idx, changed) = build_index_at(&projects, &text, Some(idx), false, None);
+        assert!(changed);
+        let cache = TextCache::open(&text);
+        assert_eq!(
+            text_of(&cache, &idx, "a"),
+            "audit the index\nthanks\n\u{1}check the flock calls\nfound a flock race\n"
+        );
     }
 
     #[test]

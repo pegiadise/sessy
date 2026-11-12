@@ -1683,6 +1683,7 @@ dependencies = [
  "tempfile",
  "toml",
  "unicode-normalization",
+ "unicode-segmentation",
  "unicode-width",
 ]
 

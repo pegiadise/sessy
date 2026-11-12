@@ -2,7 +2,7 @@ use regex::Regex;
 use serde_json::Value;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 fn ticket_regex() -> &'static Regex {
@@ -833,8 +833,14 @@ pub fn extract_conversation_ext(path: &Path, include_tools: bool) -> Vec<(Speake
 /// on as one whole read would.
 #[derive(Debug, Clone)]
 pub struct ConversationTail {
+    /// The transcript read (session IDs can repeat across project folders,
+    /// so this, not the ID, says which file to read on).
+    pub path: PathBuf,
     /// Bytes read: whole lines only.
     pub scanned: u64,
+    /// The file's size when last read: past `scanned` when it ends in a
+    /// line still being written, which isn't read again until it grows.
+    pub seen: u64,
     pub include_tools: bool,
     queued: QueuedPrompts,
     /// Lines given out so far (day rules included).
@@ -850,7 +856,9 @@ pub struct ConversationTail {
 impl ConversationTail {
     pub fn new(include_tools: bool) -> Self {
         Self {
+            path: PathBuf::new(),
             scanned: 0,
+            seen: 0,
             include_tools,
             queued: QueuedPrompts::default(),
             emitted: 0,
@@ -876,9 +884,11 @@ pub struct MoreConversation {
 pub fn read_conversation(path: &Path, tail: &mut ConversationTail) -> MoreConversation {
     use std::io::{Seek, SeekFrom};
     let mut more = MoreConversation { lines: Vec::new(), first_rule: None };
+    tail.path = path.to_path_buf();
     let Ok(mut file) = File::open(path) else {
         return more;
     };
+    tail.seen = file.metadata().map_or(0, |m| m.len());
     if file.seek(SeekFrom::Start(tail.scanned)).is_err() {
         return more;
     }
@@ -939,6 +949,7 @@ pub fn read_conversation(path: &Path, tail: &mut ConversationTail) -> MoreConver
         tail.emitted += messages.len();
         more.lines.append(&mut messages);
     }
+    tail.seen = tail.seen.max(tail.scanned);
     more
 }
 
