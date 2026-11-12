@@ -56,7 +56,7 @@ Press `?` in the app for the full list.
 | `F` | Resume as a fork (`--fork-session`: a new session ID, the original stays as it was; permissions follow `Enter`) |
 | `c` | Copy a ready-to-run `cd <dir> && claude --resume <id>` command (stays open) |
 | `p` | Print session ID to stdout and exit |
-| `/` | Search (title, name, project, branch, changed files, tickets/PR numbers, the whole conversation: what you typed, Claude's replies and thinking, tool input and output). Exact matches (the whole query as whole words; a `/` doesn't end a word, so part of a longer URL or path is partial) come first with the match highlighted; partial matches follow below a divider |
+| `/` | Search (title, name, project, branch, changed files, tickets/PR numbers, the whole conversation: what you typed, Claude's replies and thinking, tool input and output, and what its subagents did). Case and accents don't matter: `οδος` finds `Οδός`, `cafe` finds `Café`. Exact matches (the whole query as whole words; a `/` doesn't end a word, so part of a longer URL or path is partial) come first with the match highlighted; partial matches follow below a divider |
 | `⌘V` / `Ctrl+V` | Search for the pasted text right away (replaces the current query) |
 | `s` | Cycle sort: date → size → duration → messages (while searching: relevance → date → …) |
 | `1` `2` `3` `4` | Filter by size: quick / medium / deep / massive (`0` clears) |
@@ -128,7 +128,7 @@ Each session shows three lines:
 
 - **Line 1**: Selection, pin and live indicators, when it was last active (`today 14:32`, a weekday for the past week, then the date), project, branch, session name
 - **Line 2**: Duration, file size with color-coded category, message count, linked PR, first message
-- **Line 3**: Last message you sent — where you left off. While searching, it shows where the search matched instead: `└ match: …the text around it…`, as it was written, with the words marked. When the words are far apart in the conversation, each gets its own piece (`… · …`); a hit only in a changed file's path shows `└ file:` and the path
+- **Line 3**: Last message you sent — where you left off. While searching, it shows where the search matched instead: `└ match: …the text around it…`, as it was written, with the words marked. When the words are far apart in the conversation, each gets its own piece (`… · …`); a hit only in a changed file's path shows `└ file:` and the path, and one in a subagent's work says which: `└ subagent "Review the auth PR": …`
 
 `●` marks a session that's open in a running Claude Code right now (yellow while Claude is working; macOS and Linux). Resuming one asks first: two Claude Code processes on one session interleave their turns. `F` (fork) never asks.
 
@@ -159,6 +159,7 @@ Scrollable conversation showing `USER:` and `ASST:` messages with their paragrap
 - Press `f` to list the files the session changed.
 - While a session search is active, the preview marks its words and opens at the first message that has them all (past the recap); `n`/`N` walk the hits. When the hits are only in text the preview doesn't show (tool output, thinking), the pane says so.
 - Press `[` / `]` to jump between the messages you wrote.
+- A session that's being worked on in Claude Code grows in the preview as it goes: at the bottom it follows along, scrolled up it stays where you are.
 - Press `/` while in the preview pane to search within the conversation. Matching messages are highlighted; `Enter` commits the search so `n`/`N` jump between matches, `Esc` clears it.
 
 ## Export
@@ -188,14 +189,14 @@ A missing file means defaults; a malformed one also falls back to defaults, with
 
 ## Performance
 
-- **Warm start** (cached index): ~10 ms with nothing changed; only changed sessions are re-read otherwise
-- **Cold start** (first run, or after an upgrade that changes the index): a few seconds for a few thousand files, with a progress line while it indexes
+- **Warm start** (cached index): ~10 ms with nothing changed. A session that has only grown since (one in use) is read on from where it was left, not again from the start, so even a session of hundreds of MB costs milliseconds
+- **Cold start** (first run, or after an upgrade that changes the index): a few seconds for a few thousand files (subagent transcripts included), with a progress line while it indexes
 - Incremental index updates — only changed files are re-scanned, and only their text is appended to the search cache; it's compacted when more than half of it is stale
 - Parallel scanning with rayon; the preview renders only the rows on screen, so huge sessions stay smooth
 
 ## How It Works
 
-Reads JSONL session files from `~/.claude/projects/`. A single-pass scanner extracts per-session metadata — title, branch, slug, cwd, custom and AI titles, permission mode, skills, changed files, linked PRs, recap, tickets, message count, the "left off" message, and the full conversation text used for search (user + assistant messages, thinking, tool inputs and outputs; not the system prompt and tool listings Claude Code also logs) — into a cached index (`~/.cache/sessy/index.bin`), with the searchable text stored in an mmap'd companion (`~/.cache/sessy/text.bin`). Full conversations are only parsed when you open a preview. The search text is lowercased; a match line looks its piece up in the transcript, in the background, to show it as written. "Last active" is the session's last timestamped entry, not the file's modification time (Claude Code appends bookkeeping long after a conversation ends).
+Reads JSONL session files from `~/.claude/projects/`. A single-pass scanner extracts per-session metadata — title, branch, slug, cwd, custom and AI titles, permission mode, skills, changed files, linked PRs, recap, tickets, message count, the "left off" message, and the full conversation text used for search (user + assistant messages, thinking, tool inputs and outputs; not the system prompt and tool listings Claude Code also logs) — into a cached index (`~/.cache/sessy/index.bin`), with the searchable text stored in an mmap'd companion (`~/.cache/sessy/text.bin`). Subagent transcripts (`<session>/subagents/`) are indexed with their session, after its own text, each marked with the task it was given. Where each session's scan stopped is kept in `resume.bin`, so a grown session is read on from there. Full conversations are only parsed when you open a preview. The search text is folded (lowercased, accents dropped); a match line looks its piece up in the transcript, in the background, to show it as written. "Last active" is the session's last timestamped entry, not the file's modification time (Claude Code appends bookkeeping long after a conversation ends).
 
 Bookmarks are persisted at `~/.cache/sessy/bookmarks.json`. On macOS the cache folder is `~/Library/Caches/sessy/`.
 

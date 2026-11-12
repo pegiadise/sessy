@@ -21,6 +21,9 @@ Each version's section doubles as its GitHub release notes (`scripts/release-not
 - The timeline is interactive: the arrows pick a day and `Enter` lists its sessions, keeping the rest of the search.
 - Sessions that span several days get a date rule in the preview where each day starts.
 - Mouse support, opt-in with `--mouse` or `mouse = true`: the wheel scrolls, a click selects, a double-click resumes.
+- Search ignores accents as well as case: `οδος` finds `Οδός`, `cafe` finds `Café` (Latin and Greek letters; other scripts are only lowercased, since there an accent can make a different letter).
+- What a session's subagents did is searched too. Hits there rank below the session's own and say so on the match line: `└ subagent "Review the auth PR": …`.
+- The preview of a session in use in Claude Code grows as it does: at the bottom it follows along, scrolled up it stays put.
 
 ### Changed
 
@@ -32,7 +35,7 @@ Each version's section doubles as its GitHub release notes (`scripts/release-not
 - A config value sessy doesn't know, or an unknown key, is reported in the status bar; `enter` set to anything but `yolo` (a typo included) means the safe resume.
 - `--purge` keeps sessions open in Claude Code and says which projects the sessions it would delete are in.
 - `Esc` clears an active size filter before it quits.
-- Much faster start: the search cache is no longer rewritten on every launch. Unchanged sessions keep their place, changed ones are appended, and nothing is written when nothing changed (about 10 ms instead of 200 ms on a 4 GB history).
+- Much faster start: the search cache is no longer rewritten on every launch. Unchanged sessions keep their place, changed ones are appended, and nothing is written when nothing changed (about 10 ms instead of 200 ms on a 4 GB history). A session that has only grown since (the one you're working in) is read on from where the last scan stopped instead of from the start: milliseconds instead of seconds for a big one.
 
 ### Fixed
 
