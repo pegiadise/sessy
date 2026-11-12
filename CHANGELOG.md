@@ -4,7 +4,7 @@ All notable changes to sessy. The format follows [Keep a Changelog](https://keep
 
 Each version's section doubles as its GitHub release notes (`scripts/release-notes.sh vX.Y.Z`).
 
-## [Unreleased]
+## [1.6.0] - 2026-11-12
 
 ### Added
 
@@ -223,7 +223,7 @@ Covers 0.2.0 – 0.2.3.
 
 First release (0.1.0 – 0.1.10): a two-pane TUI to browse, search, preview, and resume Claude Code sessions.
 
-[Unreleased]: https://github.com/pegiadise/sessy/compare/v1.5.0...HEAD
+[1.6.0]: https://github.com/pegiadise/sessy/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/pegiadise/sessy/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/pegiadise/sessy/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/pegiadise/sessy/compare/v1.2.0...v1.3.0
