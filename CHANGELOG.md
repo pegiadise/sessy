@@ -17,12 +17,17 @@ Each version's section doubles as its GitHub release notes (`scripts/release-not
 - `[` / `]` jump between the messages you wrote in the preview; `Enter`, `l`, `F` and `p` work from the preview as in the list (while a find is active, `Enter` goes to the next hit).
 - `z` zooms to one pane at a time, full width.
 - A progress line while the index builds (the first run reads every session).
+- Search filters alongside words: `project:`, `branch:`, `file:`, `is:open` / `is:pinned` / `is:pr`, `after:` / `before:` (`7d` or a date) and `on:` (`today`, `yesterday`, a date), e.g. `auth project:web is:open after:7d`. Filters are coloured in the search box.
+- The timeline is interactive: the arrows pick a day and `Enter` lists its sessions.
+- Sessions that span several days get a date rule in the preview where each day starts.
+- Mouse support, opt-in with `--mouse` or `mouse = true`: the wheel scrolls, a click selects, a double-click resumes.
 
 ### Changed
 
 - Terminals narrower than 100 columns show one pane at a time, full width; `Tab` switches.
 - Timestamps read `today 14:32`, a weekday for the past week, then the date; older years show the year.
 - Launched in a directory with no sessions of its own, sessy shows all projects instead of an empty list.
+- Much faster start: the search cache is no longer rewritten on every launch. Unchanged sessions keep their place, changed ones are appended, and nothing is written when nothing changed (about 10 ms instead of 200 ms on a 4 GB history).
 
 ### Fixed
 

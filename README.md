@@ -28,6 +28,7 @@ sessy --all        # Browse all sessions across all projects
 sessy --project X  # Only projects whose name contains X (searches all projects)
 sessy --recent 7d  # Only show last 7 days (supports: 1h, 7d, 2w, 1m)
 sessy --print      # Pick a session and print its ID to stdout
+sessy --mouse      # Mouse support (also config `mouse = true`)
 sessy --purge      # Delete all sessions < 15 KB and older than 2 days
                    # (pinned sessions are kept; combines with --project / --recent)
 ```
@@ -83,6 +84,23 @@ Type to filter; `↑` / `↓` move through the results without leaving the input
 | `←`/`→`, `⌥←`/`⌥→`, `Home`/`End`/`⌘←`/`⌘→` | Move the cursor (char / word / line) |
 | `⌫`, `⌥⌫`, `⌘⌫` | Delete char / word / to line start (also `Ctrl+W`, `Ctrl+U`, `Ctrl+K` to line end) |
 
+### Search filters
+
+Filters narrow the list and combine with search words: `auth bug project:web is:open after:7d`. They're coloured in the search box; anything else (including unknown `key:value` text like a URL or `on:click`) is searched for as text.
+
+| Filter | Keeps sessions |
+|--------|----------------|
+| `project:web` | whose project name contains `web` |
+| `branch:feat` | whose branch contains `feat` |
+| `file:auth.rs` | that changed a file whose path contains `auth.rs` |
+| `is:open` | open in a running Claude Code right now |
+| `is:pinned` / `is:pr` | pinned / with a linked pull request |
+| `after:7d` (or `since:`) | active in the last 7 days (`h`, `d`, `w`, `m`), or since a date: `after:2026-10-01`, `after:today` |
+| `before:2w` | last active before then (same forms) |
+| `on:yesterday` | last active that day (`today`, `yesterday`, `2026-11-10`) |
+
+With only filters (no words), the list keeps its date/size/… sort.
+
 ### Preview pane
 
 | Key | Action |
@@ -130,11 +148,11 @@ The session name prefers an explicit `/rename` value, falling back to Claude Cod
 
 ## Timeline
 
-Press `t` to see a GitHub-style contribution heatmap of your Claude Code activity over the past weeks. Shows total sessions, active days, and peak day.
+Press `t` to see a GitHub-style contribution heatmap of your Claude Code activity over the past weeks. Shows total sessions, active days, and peak day. The arrows (or `h` `j` `k` `l`) move between days — left/right by week, up/down by day — with the selected day's session count below; `Enter` lists that day's sessions (an `on:` search).
 
 ## Preview Pane
 
-Scrollable conversation showing `USER:` and `ASST:` messages with their paragraphs and code intact. Claude Code's latest "while you were away" recap, when there is one, is pinned at the top. Sidechain (subagent) entries are filtered out. Loaded in the background with a 10-entry cache. The pane title shows the session's permission mode (`plan` / `accept` / `yolo`), skills it used, and linked PRs; the scroll position is on the right.
+Scrollable conversation showing `USER:` and `ASST:` messages with their paragraphs and code intact. Claude Code's latest "while you were away" recap, when there is one, is pinned at the top. Sessions that span several days get a `── Tue Nov 10, 2026 ──` rule where each day starts. Sidechain (subagent) entries are filtered out. Loaded in the background with a 10-entry cache. The pane title shows the session's permission mode (`plan` / `accept` / `yolo`), skills it used, and linked PRs; the scroll position is on the right.
 
 - Press `T` to fold tool-use activity into the preview (`TOOL:` lines summarising each Edit/Bash/etc. call).
 - Press `f` to list the files the session changed.
@@ -156,7 +174,10 @@ sort = "date"              # date | size | duration | messages
 show_tool_activity = false # start with tool-use lines shown in the preview
 enter = "yolo"             # "yolo" (--dangerously-skip-permissions) or "safe"
 density = "comfortable"    # "comfortable" (three lines per session) or "compact" (one)
+mouse = false              # wheel scrolls, click selects, double-click resumes
 ```
+
+Mouse support is off by default because capturing the mouse stops the terminal's own text selection (most terminals still select with `Shift` or `Option` held). With it on, the wheel moves through the list or scrolls the pane under the pointer, a click selects a session, focuses a pane or picks a timeline day, and a double-click resumes (asking first for a session that's open elsewhere).
 
 A missing file means defaults; a malformed one also falls back to defaults, with the parse error shown in the status bar at startup. `--all` and `--project` override `scope`. Launched in a directory with no sessions of its own, sessy shows all projects.
 
@@ -166,9 +187,9 @@ A missing file means defaults; a malformed one also falls back to defaults, with
 
 ## Performance
 
-- **Warm start** (cached index): < 100 ms
+- **Warm start** (cached index): ~10 ms with nothing changed; only changed sessions are re-read otherwise
 - **Cold start** (first run): a few seconds for a few thousand files, with a progress line while it indexes
-- Incremental index updates — only changed files are re-scanned; unchanged sessions reuse their cached text
+- Incremental index updates — only changed files are re-scanned, and only their text is appended to the search cache; it's compacted when more than half of it is stale
 - Parallel scanning with rayon; the preview renders only the rows on screen, so huge sessions stay smooth
 
 ## How It Works
