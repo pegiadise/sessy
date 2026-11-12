@@ -958,8 +958,9 @@ impl App {
             .preview_lines
             .iter()
             .enumerate()
-            .filter(|(_, (_orig, lower, _speaker))| {
-                finders.iter().any(|f| f.find(lower.as_bytes()).is_some())
+            .filter(|(_, (_orig, lower, speaker))| {
+                *speaker != Speaker::Day
+                    && finders.iter().any(|f| f.find(lower.as_bytes()).is_some())
             })
             .map(|(i, _)| i)
             .collect();
@@ -1002,9 +1003,14 @@ impl App {
         self.preview_line_offsets.clear();
         self.preview_line_offsets.reserve(self.preview_lines.len());
         let mut cursor: usize = 0;
-        for (text, _lower, _speaker) in self.preview_lines.iter() {
+        for (text, _lower, speaker) in self.preview_lines.iter() {
             self.preview_line_offsets.push(cursor);
-            let rows = crate::ui::message_rows(text, width).len();
+            // A day rule is always one row, however narrow the pane.
+            let rows = if *speaker == Speaker::Day {
+                1
+            } else {
+                crate::ui::message_rows(text, width).len()
+            };
             cursor += rows + 1; // +1 blank separator
         }
         self.preview_total_rows = cursor;

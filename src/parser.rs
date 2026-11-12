@@ -35,6 +35,9 @@ pub enum Speaker {
     Assistant,
     Tool,
     Recap,
+    /// A date rule ("Tue Nov 10, 2026") where a multi-day session moves on
+    /// to the next day. Not a message: never searched, counted or exported.
+    Day,
 }
 
 impl Speaker {
@@ -45,6 +48,7 @@ impl Speaker {
             Speaker::Assistant => "ASST: ",
             Speaker::Tool => "TOOL: ",
             Speaker::Recap => "RECAP ",
+            Speaker::Day => "      ",
         }
     }
 }
@@ -638,7 +642,7 @@ pub fn extract_conversation(path: &Path) -> Vec<ConversationMessage> {
             let role = match speaker {
                 Speaker::User => Role::User,
                 Speaker::Assistant => Role::Assistant,
-                Speaker::Tool | Speaker::Recap => return None,
+                Speaker::Tool | Speaker::Recap | Speaker::Day => return None,
             };
             Some(ConversationMessage { role, text })
         })
@@ -655,6 +659,8 @@ pub fn extract_conversation_ext(path: &Path, include_tools: bool) -> Vec<(Speake
     };
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
+    // Local day of each message (index-aligned with `messages`).
+    let mut days: Vec<Option<chrono::NaiveDate>> = Vec::new();
 
     for line in reader.lines() {
         let line = match line {
@@ -673,6 +679,7 @@ pub fn extract_conversation_ext(path: &Path, include_tools: bool) -> Vec<(Speake
             continue;
         }
 
+        let before = messages.len();
         match entry.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "user" => {
                 if let Some(text) = human_text(&entry) {
@@ -706,8 +713,45 @@ pub fn extract_conversation_ext(path: &Path, include_tools: bool) -> Vec<(Speake
             }
             _ => {}
         }
+        if messages.len() > before {
+            let day = entry_day(&entry);
+            days.resize(messages.len(), day);
+        }
     }
-    messages
+    with_day_rules(messages, &days)
+}
+
+/// Local day an entry was written, from its `timestamp`.
+fn entry_day(entry: &Value) -> Option<chrono::NaiveDate> {
+    let ts = entry.get("timestamp")?.as_str()?;
+    let dt = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
+    Some(dt.with_timezone(&chrono::Local).date_naive())
+}
+
+/// Put a `Speaker::Day` rule before the first message of each day, when the
+/// conversation spans more than one. Messages without a timestamp belong to
+/// the day before them.
+fn with_day_rules(
+    messages: Vec<(Speaker, String)>,
+    days: &[Option<chrono::NaiveDate>],
+) -> Vec<(Speaker, String)> {
+    let mut distinct: Vec<chrono::NaiveDate> = days.iter().flatten().copied().collect();
+    distinct.dedup();
+    if distinct.len() < 2 {
+        return messages;
+    }
+    let mut out = Vec::with_capacity(messages.len() + distinct.len());
+    let mut current: Option<chrono::NaiveDate> = None;
+    for (message, day) in messages.into_iter().zip(days) {
+        if let Some(day) = day {
+            if current != Some(*day) {
+                current = Some(*day);
+                out.push((Speaker::Day, day.format("%a %b %-d, %Y").to_string()));
+            }
+        }
+        out.push(message);
+    }
+    out
 }
 
 /// Build a one-line summary of a tool call: the tool name plus its most telling
@@ -761,6 +805,38 @@ mod tests {
         assert_eq!(messages[2].text, "looks good, ship it");
         assert_eq!(messages[3].role, Role::Assistant);
         assert_eq!(messages[3].text, "Done! Everything is deployed.");
+    }
+
+    #[test]
+    fn test_multi_day_sessions_get_day_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let line = |ts: &str, text: &str| {
+            serde_json::json!({"type": "user", "timestamp": ts, "message": {"content": text}})
+                .to_string()
+        };
+        // Midday UTC keeps the local day the same in any timezone.
+        let body = [
+            line("2026-11-09T12:00:00Z", "first"),
+            line("2026-11-09T12:30:00Z", "same day"),
+            line("2026-11-11T12:00:00Z", "two days later"),
+        ]
+        .join("\n");
+        std::fs::write(&path, body).unwrap();
+        let got = extract_conversation_ext(&path, false);
+        let speakers: Vec<Speaker> = got.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            speakers,
+            vec![Speaker::Day, Speaker::User, Speaker::User, Speaker::Day, Speaker::User]
+        );
+        assert_eq!(got[0].1, "Mon Nov 9, 2026");
+        assert_eq!(got[3].1, "Wed Nov 11, 2026");
+        // Export leaves the rules out.
+        assert_eq!(extract_conversation(&path).len(), 3);
+
+        // One day: no rules at all.
+        std::fs::write(&path, line("2026-11-09T12:00:00Z", "only")).unwrap();
+        assert_eq!(extract_conversation_ext(&path, false).len(), 1);
     }
 
     #[test]

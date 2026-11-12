@@ -800,6 +800,7 @@ fn speaker_style(speaker: Speaker) -> Style {
         Speaker::Recap => Style::default()
             .fg(Color::Rgb(215, 175, 95))
             .add_modifier(Modifier::ITALIC),
+        Speaker::Day => Style::default().fg(Color::DarkGray),
     }
 }
 
@@ -1026,7 +1027,26 @@ fn visible_preview_lines(app: &App, viewport: usize) -> Vec<Line<'static>> {
         let highlight_terms: &[&str] = if is_match { &terms } else { &[] };
         let match_style = if is_current { match_style_current } else { match_style_other };
 
-        for (row_idx, row) in message_rows(text, width).into_iter().enumerate() {
+        // A day rule is one row, drawn across the pane.
+        if *speaker == Speaker::Day {
+            if skip > 0 {
+                skip -= 1;
+            } else if lines.len() < viewport {
+                let full = width + PREFIX_WIDTH;
+                let head = format!("── {} ", text);
+                let rule = format!("{}{}", head, "─".repeat(full.saturating_sub(head.width())));
+                lines.push(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(truncate_width(&rule, full), base_style),
+                ]));
+            }
+        }
+        let rows = if *speaker == Speaker::Day {
+            Vec::new()
+        } else {
+            message_rows(text, width)
+        };
+        for (row_idx, row) in rows.into_iter().enumerate() {
             if skip > 0 {
                 skip -= 1;
                 continue;
@@ -1916,6 +1936,26 @@ mod tests {
 
         app.timeline_move(-10_000);
         assert_eq!(app.timeline_selected(), app.timeline_start.unwrap(), "clamped to the grid");
+    }
+
+    #[test]
+    fn test_day_rules_render_as_one_row_and_are_never_matched() {
+        let mut app = sessions(1);
+        app.focus = Focus::Preview;
+        app.preview_lines = vec![
+            ("Mon Nov 9, 2026".into(), "mon nov 9, 2026".into(), Speaker::Day),
+            ("first".into(), "first".into(), Speaker::User),
+            ("Wed Nov 11, 2026".into(), "wed nov 11, 2026".into(), Speaker::Day),
+            ("nov plans".into(), "nov plans".into(), Speaker::User),
+        ];
+        app.preview_session_id = "id0".into();
+        let screen = render(&mut app, 60, 20);
+        let rule = screen.lines().find(|l| l.contains("Mon Nov 9, 2026")).unwrap();
+        assert!(rule.contains("── Mon Nov 9, 2026 ────"), "{:?}", rule);
+        assert_eq!(app.preview_line_offsets, vec![0, 2, 4, 6]);
+        app.search_query = "nov".into();
+        app.refresh_preview_matches(false);
+        assert_eq!(app.preview_search_matches, vec![3], "only the message, not the rules");
     }
 
     #[test]
