@@ -31,12 +31,14 @@ impl TextInput {
         self.cursor += c.len_utf8();
     }
 
-    /// Insert pasted text at the cursor. Newlines and tabs become spaces:
-    /// the inputs are single-line.
+    /// Insert pasted text at the cursor. Line breaks (`\n`, and the `\r`
+    /// most terminals paste them as) and tabs become spaces: the inputs are
+    /// single-line.
     pub fn insert_str(&mut self, s: &str) {
         let clean: String = s
+            .replace("\r\n", "\n")
             .chars()
-            .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
+            .map(|c| if matches!(c, '\n' | '\r' | '\t') { ' ' } else { c })
             .filter(|c| !c.is_control())
             .collect();
         let clean = clean.trim_end_matches(' ');
@@ -267,6 +269,10 @@ mod tests {
         input.insert_str("x\ny\r\n");
         assert_eq!(input.text(), "ax yb");
         assert_eq!(input.cursor_chars(), 4);
+        // Terminals paste line breaks as a bare `\r`.
+        let mut input = TextInput::default();
+        input.insert_str("beta\rlogin");
+        assert_eq!(input.text(), "beta login");
     }
 
     #[test]
