@@ -116,6 +116,7 @@ fn main() -> io::Result<()> {
     app.trash_dir = Some(trash::trash_dir());
     trash::prune(&trash::trash_dir());
     app.live_dir = Some(live::sessions_dir());
+    app.enable_as_written();
     app.refresh_live();
     app.density = cfg.density();
     app.mouse = cli.mouse || cfg.mouse;
@@ -135,6 +136,8 @@ fn main() -> io::Result<()> {
     if let Some(warning) = cfg_warning {
         app.set_status(warning);
     }
+
+    discard_type_ahead();
 
     // In --print mode stdout is typically captured by a command substitution
     // (`claude --resume $(sessy --print)`), so the TUI must render on stderr,
@@ -236,6 +239,20 @@ fn project_root(cwd: &Path) -> PathBuf {
     cwd.to_path_buf()
 }
 
+/// Drop keys typed before the TUI is up (say, while the index builds):
+/// otherwise a search typed early arrives as list commands, and the `r` of
+/// "release" opens a rename, an `l` resumes a session.
+fn discard_type_ahead() {
+    #[cfg(unix)]
+    if let Ok(tty) = std::fs::File::open("/dev/tty") {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a plain ioctl on a descriptor we own for this call.
+        unsafe {
+            libc::tcflush(tty.as_raw_fd(), libc::TCIFLUSH);
+        }
+    }
+}
+
 /// Set up and tear down a terminal on stderr (mirror of `ratatui::init()`/
 /// `restore()`, which are hardwired to stdout).
 fn run_tui_on_stderr(app: &mut App) -> io::Result<()> {
@@ -276,6 +293,12 @@ fn restore_terminal_on_panic(on_stderr: bool) {
     use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // A background worker's panic is caught there (the preview shows
+        // nothing, a match line stays lowercase); the TUI carries on, so
+        // leave the terminal, and the screen, alone.
+        if std::thread::current().name() != Some("main") {
+            return;
+        }
         if on_stderr {
             let _ = crossterm::execute!(
                 io::stderr(),
@@ -333,12 +356,16 @@ fn run_purge(
     let size_limit = 15 * 1024;
 
     // Pinned sessions are kept no matter how small: pinning is an explicit
-    // "keep this".
+    // "keep this". So are sessions open in a running Claude Code.
+    let open = live::scan(&live::sessions_dir());
     let to_purge: Vec<&session::SessionMeta> = idx
         .sessions
         .iter()
         .filter(|s| {
-            s.file_size < size_limit && s.timestamp < two_days_ago && !bookmarks.contains(&s.id)
+            s.file_size < size_limit
+                && s.timestamp < two_days_ago
+                && !bookmarks.contains(&s.id)
+                && !open.contains_key(&s.id)
         })
         .collect();
 
@@ -347,9 +374,24 @@ fn run_purge(
         return Ok(());
     }
 
+    // Which projects they're in, most first, so a purge run from inside one
+    // repo doesn't surprise anyone.
+    let mut per_project: Vec<(&str, usize)> = Vec::new();
+    for s in &to_purge {
+        match per_project.iter_mut().find(|(p, _)| *p == s.project) {
+            Some((_, n)) => *n += 1,
+            None => per_project.push((&s.project, 1)),
+        }
+    }
+    per_project.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let projects: Vec<String> = per_project
+        .iter()
+        .map(|(p, n)| format!("{} in {}", n, if p.is_empty() { "(no project)" } else { p }))
+        .collect();
     println!(
-        "Found {} sessions < 15 KB and older than 2 days. Delete all? [y/N]",
-        to_purge.len()
+        "Found {} sessions < 15 KB and older than 2 days ({}). Delete all permanently? [y/N]",
+        to_purge.len(),
+        projects.join(", ")
     );
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
@@ -378,11 +420,7 @@ fn run_purge(
 /// own when resuming, 1 when `--print` ends without a selection (so
 /// `id=$(sessy --print) && claude --resume "$id"` stops cleanly).
 fn handle_post_tui_action(app: &App) -> i32 {
-    let resolve = |idx: usize| -> Option<&session::SessionMeta> {
-        app.filtered_indices
-            .get(idx)
-            .and_then(|&real| app.sessions.get(real))
-    };
+    let resolve = |idx: usize| app.sessions.get(idx);
 
     match app.action {
         AppAction::Launch(idx) | AppAction::LaunchDangerously(idx) | AppAction::Fork(idx) => {
@@ -451,10 +489,15 @@ fn run_event_loop<B: ratatui::backend::Backend<Error = io::Error>>(
         if last_live_scan.elapsed() >= Duration::from_secs(2) {
             last_live_scan = Instant::now();
             if app.refresh_live() {
-                app.live_changed();
-                preview::request_preview(app);
+                app.live_stale = true;
                 dirty = true;
             }
+        }
+        // `is:open` follows, once no prompt is aimed at the selection.
+        if app.live_stale && !app.view_frozen() {
+            app.live_changed();
+            preview::request_preview(app);
+            dirty = true;
         }
 
         // Redraw on change, plus a slow tick so the loading indicator and
@@ -468,8 +511,14 @@ fn run_event_loop<B: ratatui::backend::Backend<Error = io::Error>>(
         if event::poll(Duration::from_millis(50))? {
             // Drain everything already queued (fast typing, key repeat) before
             // searching and redrawing once.
+            let mut burst = Vec::new();
             loop {
-                let event = event::read()?;
+                burst.push(event::read()?);
+                if burst.len() >= 4096 || !event::poll(Duration::ZERO)? {
+                    break;
+                }
+            }
+            for event in coalesce_typed_pastes(burst) {
                 // Pointer motion arrives at mouse speed and changes nothing.
                 let moved = matches!(
                     &event,
@@ -482,7 +531,7 @@ fn run_event_loop<B: ratatui::backend::Backend<Error = io::Error>>(
                     _ => {}
                 }
                 dirty |= !moved;
-                if app.action != AppAction::None || !event::poll(Duration::ZERO)? {
+                if app.action != AppAction::None {
                     break;
                 }
             }
@@ -495,6 +544,9 @@ fn run_event_loop<B: ratatui::backend::Backend<Error = io::Error>>(
         if preview::check_preview_updates(app) {
             dirty = true;
         }
+        if app.apply_as_written() {
+            dirty = true;
+        }
 
         if app.action != AppAction::None {
             break;
@@ -504,6 +556,74 @@ fn run_event_loop<B: ratatui::backend::Backend<Error = io::Error>>(
     Ok(())
 }
 
+/// Text that arrives as keystrokes, all at once: a paste from a terminal
+/// that types it out (Windows Terminal's Ctrl+V, no bracketed paste). Read
+/// as keys, its letters run list commands: "nobody" pins (`b`) and deletes
+/// (`d`, `y`). A run of at least `MIN` plain chars in one burst becomes one
+/// paste, Enters inside it line breaks. Not: a key held down (one char
+/// repeated), movement keys queued while the UI was busy, a leading `/`
+/// (opening the search), a trailing Enter.
+fn coalesce_typed_pastes(events: Vec<Event>) -> Vec<Event> {
+    const MIN: usize = 4;
+    let typed = |e: &Event| match e {
+        Event::Key(k)
+            if k.kind != KeyEventKind::Release
+                && !k.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+        {
+            match k.code {
+                KeyCode::Char(c) => Some(c),
+                KeyCode::Enter => Some('\n'),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let release = |e: &Event| matches!(e, Event::Key(k) if k.kind == KeyEventKind::Release);
+    let mut out = Vec::with_capacity(events.len());
+    let mut events = events.into_iter().peekable();
+    while let Some(event) = events.next() {
+        let Some(first) = typed(&event).filter(|c| *c != '\n') else {
+            out.push(event);
+            continue;
+        };
+        if first == '/' {
+            out.push(event);
+            continue;
+        }
+        let mut run = vec![event];
+        let mut text = String::from(first);
+        while let Some(next) = events.peek() {
+            if release(next) {
+                events.next();
+            } else if let Some(c) = typed(next) {
+                text.push(c);
+                run.push(events.next().unwrap());
+            } else {
+                break;
+            }
+        }
+        // A trailing Enter is a key (say, a query typed fast, then Enter).
+        let enter = if text.ends_with('\n') {
+            text.pop();
+            run.pop()
+        } else {
+            None
+        };
+        let chars: Vec<char> = text.chars().collect();
+        let held_down = chars.iter().all(|&c| c == chars[0]);
+        let moving = chars.iter().all(|c| "jkgGnN[] ".contains(*c));
+        if chars.len() >= MIN && !held_down && !moving {
+            out.push(Event::Paste(text));
+        } else {
+            out.extend(run);
+        }
+        out.extend(enter);
+    }
+    out
+}
+
 fn handle_key(app: &mut App, key: KeyEvent) {
     // Ctrl+C quits from anywhere, as in every other terminal program.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -511,19 +631,22 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // Delete confirmation: only an explicit `y` deletes.
+    // Delete confirmation: only an explicit `y`, once the prompt is on
+    // screen, deletes.
     if app.confirm_delete {
-        app.confirm_delete = false;
         if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-            app.delete_selected();
+            app.confirm_delete_prompt();
             preview::request_preview(app);
+        } else {
+            app.confirm_delete = false;
+            app.prompt_target = None;
         }
         return;
     }
 
     // Resuming a session that's open elsewhere: only `y` goes ahead.
     if let Some(action) = app.confirm_resume.take() {
-        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) && app.prompt_seen {
             app.action = action;
         }
         return;
@@ -831,6 +954,9 @@ fn edit_text_input(input: &mut sessy::input::TextInput, key: KeyEvent) {
         KeyCode::Char('a') if ctrl => input.move_home(),
         KeyCode::Char('e') if ctrl => input.move_end(),
         KeyCode::Char(c) if !ctrl && !alt && !cmd => input.insert(c),
+        // AltGr arrives as Ctrl+Alt on Windows: `@`, `\`, `{`, `€` on
+        // European layouts. (Ctrl+Alt+letter has no binding of its own.)
+        KeyCode::Char(c) if ctrl && alt && !c.is_ascii_alphabetic() => input.insert(c),
         _ => {}
     }
 }
@@ -896,10 +1022,9 @@ fn handle_preview_key(app: &mut App, key: KeyEvent) {
 /// prints the ID. In --print mode every one of them prints: launching
 /// claude inside `$(sessy --print)` would capture its output.
 fn pick_selected(app: &mut App, code: KeyCode) {
-    if app.selected_session().is_none() {
+    let Some(&idx) = app.filtered_indices.get(app.selected) else {
         return;
-    }
-    let idx = app.selected;
+    };
     let action = match code {
         _ if app.print_mode => AppAction::Print(idx),
         KeyCode::Enter if app.enter_yolo => AppAction::LaunchDangerously(idx),
@@ -1015,6 +1140,8 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('b') => {
             app.toggle_bookmark();
+            // Under `is:pinned`, unpinning drops the row and moves the selection.
+            preview::request_preview(app);
         }
         KeyCode::Char('t') => {
             app.toggle_timeline();
@@ -1027,7 +1154,7 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
             app.toggle_files();
         }
         KeyCode::Char('d') if has_selection => {
-            app.confirm_delete = true;
+            app.open_delete_prompt();
         }
         KeyCode::Char(c @ '1'..='4') => {
             let category = match c {
@@ -1159,7 +1286,7 @@ mod tests {
         press(&mut app, KeyCode::Char('c'));
         press(&mut app, KeyCode::Enter); // back to the list, search still pending
         press(&mut app, KeyCode::Char('p'));
-        assert_eq!(app.action, AppAction::Print(0));
+        assert_eq!(app.action, AppAction::Print(2), "the session's index, not its row");
         assert_eq!(app.selected_session().map(|s| s.id.as_str()), Some("c"));
     }
 
@@ -1191,8 +1318,118 @@ mod tests {
         assert_eq!(app.action, AppAction::None);
 
         press(&mut app, KeyCode::Enter);
+        app.prompt_seen = true; // drawn
         press(&mut app, KeyCode::Char('y'));
         assert_eq!(app.action, AppAction::LaunchDangerously(0));
+    }
+
+    fn typed(s: &str) -> Vec<Event> {
+        s.chars()
+            .flat_map(|c| {
+                let code = if c == '\n' { KeyCode::Enter } else { KeyCode::Char(c) };
+                let press = key(code, KeyModifiers::NONE);
+                let mut release = press;
+                release.kind = KeyEventKind::Release; // Windows reports both
+                [Event::Key(press), Event::Key(release)]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn text_typed_out_by_the_terminal_arrives_as_one_paste() {
+        let events = coalesce_typed_pastes(typed("nobody"));
+        assert!(matches!(events.as_slice(), [Event::Paste(t)] if t == "nobody"));
+        // Lines of a pasted block: one paste; the final Enter stays a key.
+        let events = coalesce_typed_pastes(typed("beta\nlogin\n"));
+        assert!(matches!(&events[0], Event::Paste(t) if t == "beta\nlogin"));
+        assert!(matches!(&events[1], Event::Key(k) if k.code == KeyCode::Enter));
+        // Keys, not text.
+        for keys in ["jjjjjj", "jjkkjjk", "dy"] {
+            let events = coalesce_typed_pastes(typed(keys));
+            assert!(
+                events.iter().all(|e| matches!(e, Event::Key(_))),
+                "{:?} must stay keys",
+                keys
+            );
+        }
+        let events = coalesce_typed_pastes(typed("/deploy"));
+        assert!(matches!(&events[0], Event::Key(k) if k.code == KeyCode::Char('/')), "/ opens the search");
+        assert!(events.iter().any(|e| matches!(e, Event::Paste(t) if t == "deploy")));
+    }
+
+    #[test]
+    fn a_pasted_word_in_the_list_searches_instead_of_running_commands() {
+        let mut app = app_with(&["a", "b"]);
+        for event in coalesce_typed_pastes(typed("nobody")) {
+            match event {
+                Event::Key(k) if k.kind != KeyEventKind::Release => handle_key(&mut app, k),
+                Event::Paste(t) => handle_paste(&mut app, &t),
+                _ => {}
+            }
+        }
+        assert_eq!(app.sessions.len(), 2, "nothing deleted");
+        assert!(app.bookmarks.is_empty(), "nothing pinned");
+        assert_eq!(app.search_query.text(), "nobody");
+    }
+
+    #[test]
+    fn a_y_typed_before_the_prompt_shows_does_not_confirm() {
+        // "study" pasted as keystrokes: the `d` opens the prompt and the `y`
+        // arrives in the same burst, before it's drawn.
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.sessions.len(), 2, "nothing deleted");
+        assert!(!app.confirm_delete);
+
+        app.live.insert("a".into(), sessy::live::LiveSession { pid: 7, busy: false });
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.action, AppAction::None, "nothing resumed");
+    }
+
+    #[test]
+    fn prompts_stay_on_their_session_while_the_list_changes() {
+        // `is:open` lists a, b, c; the prompt is for b, which then closes.
+        let mut app = app_with(&["a", "b", "c"]);
+        for id in ["a", "b", "c"] {
+            app.live.insert(id.into(), sessy::live::LiveSession { pid: 7, busy: false });
+        }
+        app.search_query = "is:open".into();
+        app.apply_search();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.confirm_resume.is_some());
+        app.live.remove("b");
+        app.live_changed();
+        assert_eq!(app.filtered_indices.len(), 3, "the list holds still under the prompt");
+        app.prompt_seen = true;
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.action, AppAction::LaunchDangerously(1), "b, as the prompt said");
+        assert!(app.live_stale, "is:open catches up afterwards");
+
+        // Delete: the list moving under the prompt cancels it.
+        let mut app = app_with(&["a", "b", "c"]);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('d'));
+        app.prompt_seen = true;
+        app.selected = 2; // what a reshuffle would do
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.sessions.len(), 3, "c is not deleted in b's place");
+        assert!(app.active_status().is_some_and(|m| m.contains("nothing deleted")));
+    }
+
+    #[test]
+    fn rename_writes_to_the_session_it_was_opened_for() {
+        let mut app = app_with(&["a", "b"]);
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.prompt_target.as_deref(), Some("a"));
+        app.sessions.remove(0); // a is gone (deleted elsewhere); b is now row 0
+        app.rebuild_view();
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.sessions[0].name, "session b", "b keeps its name");
+        assert!(app.active_status().is_some_and(|m| m.contains("nothing renamed")));
     }
 
     #[test]
@@ -1220,7 +1457,7 @@ mod tests {
         app.preview_lines = vec![
             ("hit".into(), "hit".into(), sessy::parser::Speaker::User),
             ("hit".into(), "hit".into(), sessy::parser::Speaker::User),
-        ];
+        ].into();
         press(&mut app, KeyCode::Char('/'));
         for c in "hit".chars() {
             press(&mut app, KeyCode::Char(c));

@@ -77,6 +77,14 @@ pub fn is_filter_token(token: &str) -> bool {
     !matches!(classify(token, now_secs()), Token::Text)
 }
 
+/// Whether `token` is a date filter (`on:`, `after:`, `since:`, `before:`).
+pub fn is_date_filter(token: &str) -> bool {
+    matches!(
+        classify(token, now_secs()),
+        Token::Filter(Filter::On(_) | Filter::After(_) | Filter::Before(_))
+    )
+}
+
 /// The keys `classify` knows, for the search box's hint and the help screen.
 pub const KEYS: &[&str] = &["project", "branch", "file", "is", "after", "before", "on"];
 

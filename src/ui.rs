@@ -1,4 +1,4 @@
-use crate::app::{App, Density, Focus, Scope, Snippet, ViewMode};
+use crate::app::{App, Density, Focus, Scope, Snippet, SnippetPart, ViewMode};
 use crate::input::TextInput;
 use crate::parser::Speaker;
 use crate::session::{format_duration, format_file_size, size_category, SessionMeta};
@@ -233,7 +233,9 @@ fn draw_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let usable = if compact && split_tiers { height.saturating_sub(1) } else { height };
 
     // Keep the selection inside the window, scrolling only when it would leave it.
-    let per_page = (usable / app.density.rows()).max(1);
+    // The last session on the page needs no gap row after it.
+    let gap = usize::from(app.density.rows() > 1);
+    let per_page = ((usable + gap) / app.density.rows()).max(1);
     app.list_page_size = per_page;
     if app.selected < app.list_offset {
         app.list_offset = app.selected;
@@ -421,7 +423,7 @@ fn draw_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
             if let Some(snippet) = snippets.get(&real_idx) {
                 let label = if snippet.in_file { "└ file: " } else { "└ match: " };
                 let room = max_width.saturating_sub(INDENT.width() + label.width());
-                let body = window_around(&snippet.text, snippet.hit, room);
+                let body = snippet_body(&snippet.parts, room);
                 let mut spans = vec![Span::styled(format!("{}{}", INDENT, label), quiet)];
                 spans.extend(highlight_spans(&body, &words, quiet, match_style));
                 lines.push(Line::from(spans));
@@ -517,9 +519,49 @@ pub fn when_label(timestamp: i64, now: chrono::DateTime<chrono::Local>) -> Strin
     format!("{:<12}", label)
 }
 
-/// `width` columns of `text` around the char at `hit`: a little context
-/// before it, `…` where the text was cut.
-fn window_around(text: &str, hit: usize, width: usize) -> String {
+/// The match line's text in `room` columns: each part windowed around its
+/// hit, short parts whole and the rest sharing what's left.
+fn snippet_body(parts: &[SnippetPart], room: usize) -> String {
+    const SEP: &str = " · ";
+    let n = parts.len();
+    if n == 0 {
+        return String::new();
+    }
+    let mut left = room.saturating_sub(SEP.width() * (n - 1));
+    let natural: Vec<usize> = parts.iter().map(|p| p.text.trim_end().width()).collect();
+    let mut widths = vec![0; n];
+    let mut open: Vec<usize> = (0..n).collect();
+    while !open.is_empty() {
+        let share = left / open.len();
+        let (fit, rest): (Vec<usize>, Vec<usize>) =
+            open.iter().partition(|&&i| natural[i] <= share);
+        if fit.is_empty() {
+            for &i in &rest {
+                widths[i] = share;
+            }
+            break;
+        }
+        for &i in &fit {
+            widths[i] = natural[i];
+            left -= natural[i];
+        }
+        open = rest;
+    }
+    parts
+        .iter()
+        .zip(widths)
+        .map(|(p, w)| window_around(&p.text, p.hit, p.span, w))
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(SEP)
+}
+
+/// `width` columns of `text` around the `span` chars at `hit`: a little
+/// context before them, `…` where the text was cut, and cuts at word
+/// boundaries where that keeps the hit in view.
+fn window_around(text: &str, hit: usize, span: usize, width: usize) -> String {
+    /// Most chars dropped to cut at a word boundary instead of mid-word.
+    const WORD_SLACK: usize = 15;
     let text = text.trim_end();
     if text.width() <= width {
         return text.to_string();
@@ -528,35 +570,54 @@ fn window_around(text: &str, hit: usize, width: usize) -> String {
         return String::new();
     }
     let chars: Vec<char> = text.chars().collect();
-    let hit = hit.min(chars.len());
+    let len = chars.len();
+    let hit = hit.min(len);
+    let span_end = (hit + span).min(len);
     let cw = |c: char| c.width().unwrap_or(0);
-    // Up to a quarter of the room shows what came before the hit.
-    let lead_room = width / 4;
+    let span_width: usize = chars[hit..span_end].iter().map(|&c| cw(c)).sum();
+    // Up to a quarter of the room shows what came before the hit; less when
+    // the words found with it need the room.
+    let lead_room = (width / 4).min(width.saturating_sub(span_width + 2));
     let mut start = hit;
     let mut lead = 0;
     while start > 0 && lead + cw(chars[start - 1]) <= lead_room {
         start -= 1;
         lead += cw(chars[start]);
     }
-    let mut out = String::new();
-    let mut used = 0;
-    if start > 0 {
-        out.push('…');
-        used += 1;
+    if start > 0 && !chars[start - 1].is_whitespace() {
+        if let Some(i) = chars[start..hit].iter().position(|c| c.is_whitespace()) {
+            start += i + 1;
+        }
     }
+    // Room for the text between the ellipses.
+    let budget = width - usize::from(start > 0);
     let mut end = start;
-    while end < chars.len() && used + cw(chars[end]) <= width {
-        out.push(chars[end]);
+    let mut used = 0;
+    while end < len && used + cw(chars[end]) <= budget {
         used += cw(chars[end]);
         end += 1;
     }
-    if end < chars.len() {
-        while used + 1 > width {
-            match out.pop() {
-                Some(c) => used -= cw(c),
-                None => break,
+    if end < len {
+        while used + 1 > budget && end > start {
+            end -= 1;
+            used -= cw(chars[end]);
+        }
+        let keep = span_end.clamp(start, end);
+        if !chars[end].is_whitespace() {
+            if let Some(i) = chars[keep..end].iter().rposition(|c| c.is_whitespace()) {
+                if end - (keep + i) <= WORD_SLACK {
+                    end = keep + i;
+                }
             }
         }
+    }
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.extend(&chars[start..end]);
+    if end < len {
+        out.truncate(out.trim_end().len());
         out.push('…');
     }
     out
@@ -601,21 +662,34 @@ fn empty_list_message(app: &App) -> String {
 /// Shrink project/branch/name to fit `avail` columns (with two-space gaps),
 /// sacrificing the branch, then the project, before the name.
 fn fit_line1(project: &str, branch: &str, name: &str, avail: usize) -> (String, String, String) {
+    /// A branch cut narrower than this is dropped instead.
+    const MIN_BRANCH: usize = 6;
     let total = |p: &str, b: &str, n: &str| {
         p.width()
             + if b.is_empty() { 0 } else { 2 + b.width() }
             + if n.is_empty() { 0 } else { 2 + n.width() }
     };
     let (mut p, mut b, mut n) = (project.to_string(), branch.to_string(), name.to_string());
-    if total(&p, &b, &n) > avail {
-        b = truncate_width(&b, 20);
+    if total(&p, &b, &n) <= avail {
+        return (p, b, n);
     }
-    if total(&p, &b, &n) > avail {
-        p = truncate_width(&p, 20);
+    // The name says the most, so it keeps up to two thirds of the row (all
+    // of it when shorter); project and branch share the rest, branch first
+    // to give way.
+    let name_keeps = if n.is_empty() { 0 } else { 2 + n.width().min((avail * 2 / 3).max(10)) };
+    let room = avail.saturating_sub(name_keeps);
+    b = truncate_width(&b, 20);
+    p = truncate_width(&p, 20);
+    if total(&p, &b, "") > room {
+        let branch_room = room.saturating_sub(p.width() + 2);
+        b = if branch_room >= MIN_BRANCH { truncate_width(&b, branch_room) } else { String::new() };
     }
-    if total(&p, &b, &n) > avail && !n.is_empty() {
-        let room = avail.saturating_sub(total(&p, &b, "") + 2);
-        n = truncate_width(&n, room);
+    if total(&p, &b, "") > room {
+        p = truncate_width(&p, room);
+    }
+    if !n.is_empty() {
+        let name_room = avail.saturating_sub(total(&p, &b, "") + 2);
+        n = truncate_width(&n, name_room);
     }
     (p, b, n)
 }
@@ -655,10 +729,11 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
     let selected = app.timeline_selected();
     app.timeline_cells.clear();
 
-    // Count sessions per date, honoring the current scope so the heatmap
-    // matches the list.
+    // Count sessions per date, honoring the scope and size filter so the
+    // heatmap matches the list Enter opens.
     let mut counts: std::collections::HashMap<NaiveDate, u32> = std::collections::HashMap::new();
-    for s in app.sessions.iter().filter(|s| app.in_scope(s)) {
+    let sized = |s: &SessionMeta| app.size_filter.is_none_or(|c| size_category(s.file_size) == c);
+    for s in app.sessions.iter().filter(|s| app.in_scope(s) && sized(s)) {
         if let chrono::LocalResult::Single(dt) = Local.timestamp_opt(s.timestamp, 0) {
             let date = dt.date_naive();
             if date >= start_date && date <= today {
@@ -736,7 +811,11 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
             n => format!(" · {} sessions", n),
         }),
         Span::styled(
-            if picked > 0 { "  Enter lists them" } else { "" },
+            match picked {
+                0 => "",
+                1 => "  Enter lists it",
+                _ => "  Enter lists them",
+            },
             Style::default().fg(Color::DarkGray),
         ),
     ]));
@@ -753,7 +832,10 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
 
     lines.push(Line::from(vec![
         Span::styled("  Total: ", Style::default().fg(Color::DarkGray)),
-        Span::raw(format!("{} sessions", total_sessions)),
+        Span::raw(match total_sessions {
+            1 => "1 session".to_string(),
+            n => format!("{} sessions", n),
+        }),
         Span::styled("  Active days: ", Style::default().fg(Color::DarkGray)),
         Span::raw(format!("{}", active_days)),
     ]));
@@ -993,7 +1075,7 @@ fn sync_preview_geometry(app: &mut App, area: Rect) -> usize {
     let inner_width = area.width.saturating_sub(2);
     if app.preview_inner_width != inner_width {
         app.preview_inner_width = inner_width;
-        app.recompute_preview_offsets();
+        app.rewrap_preview();
     }
     let inner_height = area.height.saturating_sub(2) as usize;
     let viewport = if app.focus == Focus::PreviewSearch {
@@ -1065,9 +1147,9 @@ fn visible_preview_lines(app: &App, viewport: usize) -> Vec<Line<'static>> {
         let rows = if *speaker == Speaker::Day {
             Vec::new()
         } else {
-            message_rows(text, width)
+            message_rows_marked(text, width, highlight_terms)
         };
-        for (row_idx, row) in rows.into_iter().enumerate() {
+        for (row_idx, (row, marks)) in rows.into_iter().enumerate() {
             if skip > 0 {
                 skip -= 1;
                 continue;
@@ -1081,7 +1163,7 @@ fn visible_preview_lines(app: &App, viewport: usize) -> Vec<Line<'static>> {
                 Span::raw(" ".repeat(PREFIX_WIDTH))
             };
             let mut spans = vec![marker.clone(), lead];
-            spans.extend(highlight_spans(&row, highlight_terms, base_style, match_style));
+            spans.extend(spans_for_hits(&row, &marks, base_style, match_style));
             lines.push(Line::from(spans));
         }
         // Blank separator row between messages.
@@ -1094,10 +1176,15 @@ fn visible_preview_lines(app: &App, viewport: usize) -> Vec<Line<'static>> {
     lines
 }
 
-fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_status_bar(frame: &mut Frame, app: &mut App, area: Rect) {
     let bar_bg = Color::Rgb(40, 40, 40);
 
-    // A pending prompt outranks everything: it's waiting for the next key.
+    // A pending prompt outranks everything: it's waiting for the next key,
+    // and only counts a `y` once it's been seen.
+    if app.confirm_delete || app.confirm_resume.is_some() {
+        app.prompt_seen = true;
+    }
+    let app: &App = app;
     if app.confirm_delete {
         let warn = Style::default()
             .fg(Color::White)
@@ -1106,21 +1193,25 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         let hint = Style::default()
             .fg(Color::Rgb(200, 200, 200))
             .bg(Color::Red);
-        let session_name = app
-            .selected_session()
-            .map(|s| truncate_width(s.display_name(), 40))
-            .unwrap_or_default();
         let open = app.selected_session().and_then(|s| app.live_status(s)).is_some();
+        // Keys first: on a narrow terminal the name is what gets cut.
         let mut spans = vec![
             Span::styled(" DELETE ", warn),
-            Span::styled(format!("\"{}\"? ", session_name), hint),
-            Span::styled("y ", warn),
+            Span::styled(" y ", warn),
             Span::styled("confirm  ", hint),
             Span::styled("any other key ", warn),
-            Span::styled("cancel ", hint),
+            Span::styled("cancel  ", hint),
         ];
         if open {
-            spans.insert(2, Span::styled("(open in Claude Code right now) ", warn));
+            spans.push(Span::styled("open in Claude Code right now  ", warn));
+        }
+        if let Some(s) = app.selected_session() {
+            let used: usize = spans.iter().map(|s| s.content.width()).sum();
+            let room = (area.width as usize).saturating_sub(used + 3);
+            spans.push(Span::styled(
+                format!("\"{}\"", truncate_width(s.display_name(), room.max(8))),
+                hint,
+            ));
         }
         let line = Line::from(spans);
         let paragraph = Paragraph::new(line).style(Style::default().bg(Color::Red));
@@ -1136,6 +1227,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         let hint = Style::default().fg(Color::Black).bg(Color::Yellow);
         let verb = match action {
             crate::app::AppAction::LaunchDangerously(_) => "resume (yolo) anyway",
+            crate::app::AppAction::Print(_) => "pick anyway",
             _ => "resume anyway",
         };
         // Keys first: on a narrow terminal the explanation is what gets cut.
@@ -1146,7 +1238,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("any other key ", warn),
             Span::styled("cancel  ", hint),
         ];
-        if let Some(s) = app.selected_session() {
+        if let Some(s) = app.action_target(action) {
             let state = match app.live_status(s) {
                 Some(l) if l.busy => format!("working in Claude Code pid {}", l.pid),
                 Some(l) => format!("open in Claude Code pid {}", l.pid),
@@ -1521,6 +1613,12 @@ fn truncate_left(s: &str, max_cols: usize) -> String {
 /// code keep their shape), each line word-wrapped to `width` display columns.
 /// Runs of blank lines collapse to one. Always at least one row.
 pub fn message_rows(text: &str, width: usize) -> Vec<String> {
+    message_rows_joined(text, width).into_iter().map(|(row, _)| row).collect()
+}
+
+/// `message_rows`, with how each row joins the one before: `None` where a
+/// line of the message starts, else whether a space was between them.
+fn message_rows_joined(text: &str, width: usize) -> Vec<(String, Option<bool>)> {
     let mut rows = Vec::new();
     let mut prev_blank = true; // also drops leading blank lines
     for line in text.split('\n') {
@@ -1528,31 +1626,79 @@ pub fn message_rows(text: &str, width: usize) -> Vec<String> {
         let line = line.trim_end();
         if line.is_empty() {
             if !prev_blank {
-                rows.push(String::new());
+                rows.push((String::new(), None));
             }
             prev_blank = true;
             continue;
         }
         prev_blank = false;
-        rows.extend(wrap_text(line, width));
+        for (i, (row, after_space)) in wrap_text_joined(line, width).into_iter().enumerate() {
+            rows.push((row, (i > 0).then_some(after_space)));
+        }
     }
-    while rows.len() > 1 && rows.last().is_some_and(|r| r.is_empty()) {
+    while rows.len() > 1 && rows.last().is_some_and(|(r, _)| r.is_empty()) {
         rows.pop();
     }
     if rows.is_empty() {
-        rows.push(String::new());
+        rows.push((String::new(), None));
     }
     rows
+}
+
+/// A message's rows, each with the byte ranges in it where the terms
+/// occur, found across row breaks: a phrase wrapped onto the next row is
+/// marked on both.
+pub fn message_rows_marked(text: &str, width: usize, terms: &[&str]) -> Vec<(String, Vec<(usize, usize)>)> {
+    let rows = message_rows_joined(text, width);
+    let mut out = Vec::with_capacity(rows.len());
+    let mut i = 0;
+    while i < rows.len() {
+        // The rows of one line of the message, rejoined.
+        let mut j = i + 1;
+        while j < rows.len() && rows[j].1.is_some() {
+            j += 1;
+        }
+        let mut joined = String::new();
+        let mut starts = Vec::with_capacity(j - i);
+        for (k, (row, join)) in rows[i..j].iter().enumerate() {
+            if k > 0 && *join == Some(true) {
+                joined.push(' ');
+            }
+            starts.push(joined.len());
+            joined.push_str(row);
+        }
+        let hits = find_hits(&joined, terms);
+        for (k, (row, _)) in rows[i..j].iter().enumerate() {
+            let (from, to) = (starts[k], starts[k] + row.len());
+            let marks = hits
+                .iter()
+                .filter_map(|&(a, b)| {
+                    let (a, b) = (a.max(from), b.min(to));
+                    (a < b).then(|| (a - from, b - from))
+                })
+                .collect();
+            out.push((row.clone(), marks));
+        }
+        i = j;
+    }
+    out
 }
 
 /// Word-wrap one line to `width` display columns. Breaks at the last space
 /// that fits (after any indentation), or mid-word when a word is too long.
 pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    wrap_text_joined(text, width).into_iter().map(|(row, _)| row).collect()
+}
+
+/// `wrap_text`, with whether each row went on from the previous one after
+/// a space (`false` for the first row, and where a word was cut).
+fn wrap_text_joined(text: &str, width: usize) -> Vec<(String, bool)> {
     if width == 0 {
-        return vec![text.to_string()];
+        return vec![(text.to_string(), false)];
     }
     let mut result = Vec::new();
     let mut remaining = text;
+    let mut after_space = false;
     while !remaining.is_empty() {
         let mut used = 0;
         let mut cut = None;
@@ -1574,7 +1720,7 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
             used += w;
         }
         let Some(cut) = cut else {
-            result.push(remaining.to_string());
+            result.push((remaining.to_string(), after_space));
             break;
         };
         let split = match last_space {
@@ -1583,8 +1729,11 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
             _ if cut == 0 => remaining.chars().next().map_or(remaining.len(), char::len_utf8),
             _ => cut,
         };
-        result.push(remaining[..split].trim_end().to_string());
-        remaining = remaining[split..].trim_start_matches(' ');
+        let row = remaining[..split].trim_end();
+        let rest = &remaining[split..];
+        result.push((row.to_string(), after_space));
+        after_space = row.len() < split || rest.starts_with(' ');
+        remaining = rest.trim_start_matches(' ');
     }
     result
 }
@@ -1607,9 +1756,16 @@ fn highlight_spans(
     base_style: Style,
     match_style: Style,
 ) -> Vec<Span<'static>> {
+    spans_for_hits(text, &find_hits(text, terms), base_style, match_style)
+}
+
+/// Byte ranges of `text` where the terms (lowercase) occur, ignoring case;
+/// the earliest first, the longest where two start together, none
+/// overlapping.
+fn find_hits(text: &str, terms: &[&str]) -> Vec<(usize, usize)> {
     let terms: Vec<&str> = terms.iter().copied().filter(|t| !t.is_empty()).collect();
     if terms.is_empty() {
-        return vec![Span::styled(text.to_string(), base_style)];
+        return Vec::new();
     }
 
     // Build a lowercased copy of `text` alongside a mapping from every byte
@@ -1624,10 +1780,7 @@ fn highlight_spans(
             if is_combining_diacritic(lc) {
                 continue;
             }
-            let mut buf = [0u8; 4];
-            let s = lc.encode_utf8(&mut buf);
-            let len = s.len();
-            for _ in 0..len {
+            for _ in 0..lc.len_utf8() {
                 lower_to_orig.push(orig_idx);
             }
             text_lower.push(lc);
@@ -1635,11 +1788,10 @@ fn highlight_spans(
     }
     lower_to_orig.push(text.len());
 
-    let mut spans = Vec::new();
+    let mut hits = Vec::new();
     let mut last_end = 0;
     let mut search_from = 0;
-
-    loop {
+    while search_from < text_lower.len() {
         let next = terms
             .iter()
             .filter_map(|t| text_lower[search_from..].find(t).map(|p| (search_from + p, t.len())))
@@ -1650,31 +1802,37 @@ fn highlight_spans(
         let end_lower = start_lower + len;
         let start_orig = lower_to_orig[start_lower];
         let end_orig = lower_to_orig[end_lower];
-        if start_orig < last_end {
-            search_from = end_lower;
+        search_from = end_lower;
+        if start_orig < last_end || start_orig == end_orig {
             continue;
         }
-
-        if start_orig > last_end {
-            spans.push(Span::styled(text[last_end..start_orig].to_string(), base_style));
-        }
-        spans.push(Span::styled(text[start_orig..end_orig].to_string(), match_style));
+        hits.push((start_orig, end_orig));
         last_end = end_orig;
-        search_from = end_lower;
-        if search_from >= text_lower.len() {
-            break;
-        }
     }
+    hits
+}
 
-    if last_end < text.len() {
+/// `text` as spans, the byte ranges `hits` (sorted, not overlapping) in
+/// `match_style`.
+fn spans_for_hits(
+    text: &str,
+    hits: &[(usize, usize)],
+    base_style: Style,
+    match_style: Style,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut last_end = 0;
+    for &(start, end) in hits {
+        if start > last_end {
+            spans.push(Span::styled(text[last_end..start].to_string(), base_style));
+        }
+        spans.push(Span::styled(text[start..end].to_string(), match_style));
+        last_end = end;
+    }
+    if last_end < text.len() || spans.is_empty() {
         spans.push(Span::styled(text[last_end..].to_string(), base_style));
     }
-
-    if spans.is_empty() {
-        vec![Span::styled(text.to_string(), base_style)]
-    } else {
-        spans
-    }
+    spans
 }
 
 #[cfg(test)]
@@ -1770,6 +1928,48 @@ mod tests {
     }
 
     #[test]
+    fn test_fit_line1_gives_the_name_room_next_to_a_long_project_and_branch() {
+        let total = |p: &str, b: &str, n: &str| {
+            p.width() + if b.is_empty() { 0 } else { 2 + b.width() } + 2 + n.width()
+        };
+        // The two-pane list at 100–130 columns has about 40–55 columns here.
+        for avail in [30, 40, 47, 55] {
+            let (p, b, n) =
+                fit_line1("acme-platform-api", "feature/PROJ-1234-login", "Fix login redirect", avail);
+            assert!(n.starts_with("Fix login"), "{}: {:?}", avail, (p, b, n));
+            assert!(total(&p, &b, &n) <= avail, "{}: {:?} overflows", avail, (p, b, n));
+        }
+        let (_, b, n) = fit_line1("acme-platform-api", "feature/PROJ-1234-login", "Fix login redirect", 30);
+        assert!(b.is_empty(), "a branch with no room left is dropped, not cut to a stub");
+        assert_eq!(n, "Fix login redirect");
+        // Everything fits: untouched.
+        assert_eq!(
+            fit_line1("p", "main", "name", 80),
+            ("p".into(), "main".into(), "name".into())
+        );
+    }
+
+    #[test]
+    fn test_a_phrase_wrapped_onto_the_next_row_is_marked_on_both() {
+        // Width 12: "then deploy" fills row 1, "caddy now" is row 2.
+        let rows = message_rows_marked("then deploy caddy now", 12, &["deploy caddy"]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "then deploy");
+        assert_eq!(&rows[0].0[rows[0].1[0].0..rows[0].1[0].1], "deploy");
+        assert_eq!(&rows[1].0[rows[1].1[0].0..rows[1].1[0].1], "caddy");
+        // Cut mid-word (no spaces, as in CJK): the halves join without one.
+        let rows = message_rows_marked("日本語のテキスト", 8, &["語のテ"]);
+        let marked: String = rows
+            .iter()
+            .flat_map(|(row, marks)| marks.iter().map(move |&(a, b)| row[a..b].to_string()))
+            .collect();
+        assert_eq!(marked, "語のテ");
+        // Separate lines of a message never join.
+        let rows = message_rows_marked("deploy\ncaddy", 40, &["deploy caddy"]);
+        assert!(rows.iter().all(|(_, marks)| marks.is_empty()));
+    }
+
+    #[test]
     fn test_when_label() {
         use chrono::{Local, TimeZone};
         let at = |y, mo, d, h, mi| Local.with_ymd_and_hms(y, mo, d, h, mi, 0).single().unwrap();
@@ -1786,12 +1986,16 @@ mod tests {
     #[test]
     fn test_window_around_keeps_the_hit_visible() {
         let text = format!("{}needle{}", "a".repeat(100), "b".repeat(100));
-        let w = window_around(&text, 100, 40);
+        let w = window_around(&text, 100, 6, 40);
         assert_eq!(w.width(), 40);
         assert!(w.starts_with('…') && w.ends_with('…'));
         assert!(w.contains("needle"));
-        assert_eq!(window_around("short", 0, 40), "short");
-        assert_eq!(window_around("needle at the start of a long line", 0, 12), "needle at t…");
+        assert_eq!(window_around("short", 0, 5, 40), "short");
+        assert_eq!(
+            window_around("needle at the start of a long line", 0, 6, 12),
+            "needle at…",
+            "cut between words"
+        );
     }
 
     #[test]
@@ -1811,6 +2015,65 @@ mod tests {
         let spans = highlight_spans("caddyfile", &["caddy", "caddyfile"], base, hit);
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "caddyfile");
+    }
+
+    fn part(text: &str, hit: &str) -> SnippetPart {
+        let at = text.find(hit).unwrap();
+        SnippetPart {
+            text: text.into(),
+            hit: text[..at].chars().count(),
+            span: hit.chars().count(),
+            source: crate::as_written::Piece { text: text.into(), hit: (at, at + hit.len()) },
+            at: 0.0,
+            as_written: false,
+        }
+    }
+
+    #[test]
+    fn test_snippet_body_shares_the_room_between_parts() {
+        let short = part("tokio runtime", "tokio");
+        let long = part(&format!("{} we tag the release here {}", "x ".repeat(40), "y ".repeat(40)), "release");
+        let body = snippet_body(&[short.clone(), long.clone()], 50);
+        assert!(body.starts_with("tokio runtime · …"), "{}", body);
+        assert!(body.contains("release"), "{}", body);
+        assert!(body.width() <= 50, "{}", body.width());
+        // Too narrow for both in full: each keeps its hit.
+        let body = snippet_body(&[long.clone(), long], 40);
+        assert_eq!(body.matches("release").count(), 2, "{}", body);
+        assert!(body.width() <= 40);
+        assert_eq!(snippet_body(&[], 40), "");
+    }
+
+    #[test]
+    fn test_window_around_keeps_the_words_found_together_in_view() {
+        let text = format!("{}crates.io releases and more text after it", "lead ".repeat(30));
+        let hit = text.find("crates").unwrap();
+        let span = "crates.io releases".len();
+        let w = window_around(&text, hit, span, 24);
+        assert!(w.contains("crates.io releases"), "{}", w);
+        assert!(w.width() <= 24);
+    }
+
+    #[test]
+    fn test_search_row_shows_where_each_word_matched() {
+        let filler = "x".repeat(300);
+        let text = format!("tokio runtime here\n{}\nwe tag the release\n", filler);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("text.bin");
+        std::fs::write(&path, &text).unwrap();
+        let mut app = sessions(1);
+        app.text_cache = crate::text_cache::TextCache::open(&path);
+        app.sessions[0].text_len = text.len() as u32;
+        app.search_query = "release tokio".into();
+        app.apply_search();
+        app.zoom = true;
+        let screen = render(&mut app, 100, 12);
+        assert!(
+            screen.contains("└ match: tokio runtime here · we tag the release"),
+            "{}",
+            screen
+        );
+        assert!(!screen.contains("left off"), "the match line takes its place");
     }
 
     fn render(app: &mut App, w: u16, h: u16) -> String {
@@ -1956,6 +2219,27 @@ mod tests {
             .collect();
         assert_eq!(shown, vec!["id2", "id1"], "that day only, newest first");
 
+        // Picking again keeps the words and other filters, swaps the date.
+        app.search_query = format!("deploy is:pinned after:7d on:{}", yesterday).as_str().into();
+        app.view_mode = ViewMode::Timeline;
+        app.timeline_day = Some(today);
+        app.pick_timeline_day();
+        assert_eq!(
+            app.search_query.text(),
+            format!("deploy is:pinned on:{}", today.format("%Y-%m-%d"))
+        );
+
+        // The count follows the size filter, as the list does.
+        app.search_query.clear();
+        app.apply_search();
+        app.view_mode = ViewMode::Timeline;
+        app.timeline_day = Some(yesterday);
+        app.sessions[1].file_size = 50 << 20;
+        app.size_filter = Some("massive");
+        let screen = render(&mut app, 140, 30);
+        assert!(screen.contains("1 session  Enter lists it"), "{}", screen);
+        app.size_filter = None;
+
         app.timeline_move(-10_000);
         assert_eq!(app.timeline_selected(), app.timeline_start.unwrap(), "clamped to the grid");
     }
@@ -1969,7 +2253,7 @@ mod tests {
             ("first".into(), "first".into(), Speaker::User),
             ("Wed Nov 11, 2026".into(), "wed nov 11, 2026".into(), Speaker::Day),
             ("nov plans".into(), "nov plans".into(), Speaker::User),
-        ];
+        ].into();
         app.preview_session_id = "id0".into();
         let screen = render(&mut app, 60, 20);
         let rule = screen.lines().find(|l| l.contains("Mon Nov 9, 2026")).unwrap();

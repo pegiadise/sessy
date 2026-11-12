@@ -1,4 +1,5 @@
 pub mod app;
+pub mod as_written;
 pub mod bookmarks;
 pub mod clipboard;
 pub mod config;

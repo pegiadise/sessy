@@ -23,7 +23,17 @@ pub fn spawn_worker(results: mpsc::Sender<PreviewResult>) -> mpsc::Sender<Previe
             while let Ok(newer) = rx.try_recv() {
                 req = newer;
             }
-            if results.send(load(req)).is_err() {
+            // A transcript that trips a parser bug shows as empty rather than
+            // leaving the preview loading forever.
+            let empty = PreviewResult {
+                session_id: req.session_id.clone(),
+                lines: Vec::new(),
+                message_count: 0,
+                include_tools: req.include_tools,
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load(req)))
+                .unwrap_or(empty);
+            if results.send(result).is_err() {
                 break;
             }
         }
@@ -57,7 +67,7 @@ fn load(req: PreviewRequest) -> PreviewResult {
 /// Request a preview for the currently selected session.
 pub fn request_preview(app: &mut App) {
     let Some(session) = app.selected_session() else {
-        app.preview_lines.clear();
+        app.preview_lines = Default::default();
         app.preview_search_matches.clear();
         app.preview_session_id.clear();
         app.preview_loading = false;
@@ -81,22 +91,24 @@ pub fn request_preview(app: &mut App) {
 
     // Loading a different session: a find-in-conversation query (and its
     // match indices and scroll position) belonged to the old conversation.
-    app.preview_search_query.clear();
+    // A reload of the same one (`T`) keeps them.
+    if app.preview_keep.as_ref().is_none_or(|k| k.session != session_id) {
+        app.preview_keep = None;
+        app.preview_search_query.clear();
+    }
     app.preview_scroll = 0;
 
     if let Some(cached) = app.preview_cache.get(&session_id) {
-        app.preview_lines = cached.clone();
+        app.preview_lines = cached.lines.clone();
         app.preview_session_id = session_id;
         app.preview_loading = false;
-        app.recompute_preview_offsets();
-        // While searching, open at the first hit.
-        app.refresh_preview_matches(true);
+        app.preview_loaded();
         return;
     }
 
     app.preview_loading = true;
     app.preview_session_id = session_id;
-    app.preview_lines.clear();
+    app.preview_lines = Default::default();
     app.preview_search_matches.clear();
     app.recompute_preview_offsets();
     let _ = app.preview_req_tx.send(request);
@@ -112,14 +124,16 @@ pub fn check_preview_updates(app: &mut App) -> bool {
         if result.include_tools != app.show_tools {
             continue;
         }
-        app.cache_preview(result.session_id.clone(), result.lines.clone());
+        let loaded_any = !result.lines.is_empty();
+        let lines: crate::app::PreviewLines = std::sync::Arc::new(result.lines);
+        app.cache_preview(result.session_id.clone(), lines.clone());
 
-        if app.preview_session_id == result.session_id {
-            app.preview_lines = result.lines;
+        // A second load of what's already shown (j then k over it queues
+        // two) would reset where you are reading; the first one counts.
+        if app.preview_session_id == result.session_id && app.preview_loading {
+            app.preview_lines = lines;
             app.preview_loading = false;
-            app.recompute_preview_offsets();
-            // While searching, open at the first hit.
-            app.refresh_preview_matches(true);
+            app.preview_loaded();
             changed = true;
         }
 
@@ -128,7 +142,8 @@ pub fn check_preview_updates(app: &mut App) -> bool {
             .iter_mut()
             .find(|s| s.id == result.session_id)
         {
-            if session.message_count != result.message_count {
+            // (An empty result, from an unreadable transcript, says nothing.)
+            if loaded_any && session.message_count != result.message_count {
                 session.message_count = result.message_count;
                 changed = true;
             }
