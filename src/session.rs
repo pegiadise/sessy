@@ -12,6 +12,9 @@ pub struct SessionMeta {
     pub duration_secs: u64,
     pub timestamp: i64,
     pub file_size: u64,
+    /// Not a time any more (the name is kept so the cache stays readable by
+    /// older versions): a fingerprint of the transcript's and its
+    /// subagents' mtimes and sizes, compared to notice a change.
     pub file_mtime: i64,
     pub file_path: PathBuf,
     pub cwd: String,

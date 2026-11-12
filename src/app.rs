@@ -108,6 +108,9 @@ pub enum AppAction {
 pub struct Snippet {
     /// The hit is in a changed file's path rather than the conversation.
     pub in_file: bool,
+    /// The hit is in a subagent's transcript: what it was asked to do, and
+    /// its transcript (`None` when it can't be told apart).
+    pub subagent: Option<(String, Option<PathBuf>)>,
     /// The places shown: one when the search words occur together, up to
     /// `MAX_SNIPPET_PARTS` when they're far apart.
     pub parts: Vec<SnippetPart>,
@@ -170,6 +173,8 @@ pub struct CachedPreview {
     pub lines: PreviewLines,
     /// (body width, first row of each message, total rows).
     layout: Option<(usize, Vec<usize>, usize)>,
+    /// Where reading the transcript stopped, to read on when it grows.
+    pub tail: Option<crate::parser::ConversationTail>,
 }
 
 /// The preview cache's budget: this many conversations, or this many bytes
@@ -187,7 +192,12 @@ pub struct PreviewKeep {
 pub struct PreviewResult {
     pub session_id: String,
     pub lines: Vec<(String, String, Speaker)>,
+    /// Messages you wrote among `lines`.
     pub message_count: u32,
+    /// Where the read stopped (`None` when it failed).
+    pub tail: Option<crate::parser::ConversationTail>,
+    /// Set when it read on from where the preview shown ends.
+    pub more: Option<crate::preview::More>,
     /// Tool-activity setting the lines were extracted under; results from a
     /// stale setting are dropped instead of cached.
     pub include_tools: bool,
@@ -260,6 +270,10 @@ pub struct App {
     pub scope_root: Option<PathBuf>,
     /// Set by `T`: the reload of this session keeps its find and place.
     pub preview_keep: Option<PreviewKeep>,
+    /// Where reading the shown session's transcript stopped.
+    pub preview_tail: Option<crate::parser::ConversationTail>,
+    /// A read of what's new in it is on its way.
+    pub preview_more_pending: bool,
     /// Total wrapped rows of the current preview (set by `recompute_preview_offsets`).
     pub preview_total_rows: usize,
     /// Height of the preview viewport (set by the renderer each frame).
@@ -370,6 +384,8 @@ impl App {
             scope: Scope::Current,
             scope_root: None,
             preview_keep: None,
+            preview_tail: None,
+            preview_more_pending: false,
             preview_total_rows: 0,
             preview_viewport_height: 0,
             show_tools: false,
@@ -419,6 +435,8 @@ impl App {
         self.preview_lines = Default::default();
         self.preview_search_matches.clear();
         self.preview_session_id.clear();
+        self.preview_tail = None;
+        self.preview_more_pending = false;
         self.preview_loading = false;
         self.preview_scroll = 0;
         self.recompute_preview_offsets();
@@ -777,12 +795,19 @@ impl App {
                         score += 200;
                         true
                     } else {
+                        // The session's own conversation, then its
+                        // subagents' (after the first mark; worth less).
                         let slice = text_cache.slice(s.text_offset, s.text_len);
-                        if finder.find(slice).is_some() {
-                            score += 100;
-                            true
-                        } else {
-                            false
+                        match finder.find(slice) {
+                            Some(pos) if memchr::memchr(crate::subagents::MARK, &slice[..pos]).is_none() => {
+                                score += 100;
+                                true
+                            }
+                            Some(_) => {
+                                score += 40;
+                                true
+                            }
+                            None => false,
                         }
                     };
                     if !hit {
@@ -1188,6 +1213,83 @@ impl App {
             .max(10)
     }
 
+    /// Add what's new in the session shown (`lines`, read on from where it
+    /// ended) without reloading it: new rows laid out, matches and the
+    /// current one kept, the view kept, or at the bottom if it was there.
+    pub fn append_preview(
+        &mut self,
+        lines: Vec<(String, String, Speaker)>,
+        first_rule: Option<(usize, String)>,
+        tail: crate::parser::ConversationTail,
+        new_prompts: u32,
+    ) {
+        let at_bottom = self.preview_scroll >= self.max_preview_scroll();
+        let place = self.preview_place();
+        let current = self.preview_search_matches.get(self.preview_search_current).copied();
+        let id = self.preview_session_id.clone();
+        // Not shared with the cache while it changes: no copy.
+        self.preview_cache.remove(&id);
+        let recap = usize::from(self.preview_lines.first().is_some_and(|l| l.2 == Speaker::Recap));
+        let old_len = self.preview_lines.len();
+        let shown = Arc::make_mut(&mut self.preview_lines);
+        let ruled = first_rule.map(|(at, rule)| {
+            let at = (recap + at).min(shown.len());
+            let lower = crate::fold::fold(&rule);
+            shown.insert(at, (rule, lower, Speaker::Day));
+            at
+        });
+        shown.extend(lines);
+        self.cache_preview(id.clone(), self.preview_lines.clone(), Some(tail.clone()));
+        self.preview_tail = Some(tail);
+        match ruled {
+            Some(_) => self.recompute_preview_offsets(),
+            None => self.lay_out_preview_from(old_len),
+        }
+        self.refresh_preview_matches(false);
+        if let Some(line) = current {
+            let line = line + usize::from(ruled.is_some_and(|at| at <= line));
+            if let Some(i) = self.preview_search_matches.iter().position(|&m| m == line) {
+                self.preview_search_current = i;
+            }
+        }
+        if at_bottom {
+            self.preview_scroll = self.max_preview_scroll();
+        } else if let (Some(at), Some((line, into)), true) = (ruled, place, self.preview_scroll > 0) {
+            // The same message at the top as before the rule went in above
+            // it. (At the very top, the top it stays: the rule shows.)
+            if at <= line {
+                self.restore_preview_place((line + 1, into));
+            }
+        }
+        if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
+            s.message_count += new_prompts;
+        }
+    }
+
+    /// Rows a preview line takes at `width` (its gap row not included).
+    fn preview_line_height(text: &str, speaker: Speaker, width: usize) -> usize {
+        // A day rule is always one row, however narrow the pane.
+        if speaker == Speaker::Day {
+            1
+        } else {
+            crate::ui::message_rows(text, width).len()
+        }
+    }
+
+    /// Lay out preview lines `from..` after the ones already laid out
+    /// (each message's rows plus a blank one between messages).
+    fn lay_out_preview_from(&mut self, from: usize) {
+        let width = self.preview_body_width();
+        self.preview_line_offsets.truncate(from);
+        let mut cursor = if from == 0 { 0 } else { self.preview_total_rows };
+        for (text, _, speaker) in &self.preview_lines[from..] {
+            self.preview_line_offsets.push(cursor);
+            cursor += Self::preview_line_height(text, *speaker, width) + 1;
+        }
+        self.preview_total_rows = cursor;
+        self.remember_preview_layout();
+    }
+
     pub fn recompute_preview_offsets(&mut self) {
         let width = self.preview_body_width();
         // Laid out at this width before (selected again): no re-wrapping,
@@ -1201,23 +1303,15 @@ impl App {
             self.preview_total_rows = *total;
             return;
         }
-        self.preview_line_offsets.clear();
-        self.preview_line_offsets.reserve(self.preview_lines.len());
-        let mut cursor: usize = 0;
-        for (text, _lower, speaker) in self.preview_lines.iter() {
-            self.preview_line_offsets.push(cursor);
-            // A day rule is always one row, however narrow the pane.
-            let rows = if *speaker == Speaker::Day {
-                1
-            } else {
-                crate::ui::message_rows(text, width).len()
-            };
-            cursor += rows + 1; // +1 blank separator
-        }
-        self.preview_total_rows = cursor;
+        self.lay_out_preview_from(0);
+    }
+
+    /// Keep the layout just computed with the cached lines it's for.
+    fn remember_preview_layout(&mut self) {
+        let width = self.preview_body_width();
         if let Some(c) = self.preview_cache.get_mut(&self.preview_session_id) {
             if Arc::ptr_eq(&c.lines, &self.preview_lines) {
-                c.layout = Some((width, self.preview_line_offsets.clone(), cursor));
+                c.layout = Some((width, self.preview_line_offsets.clone(), self.preview_total_rows));
             }
         }
     }
@@ -1402,10 +1496,15 @@ impl App {
 
     // Cache management (FIFO eviction)
 
-    pub fn cache_preview(&mut self, session_id: String, lines: PreviewLines) {
+    pub fn cache_preview(
+        &mut self,
+        session_id: String,
+        lines: PreviewLines,
+        tail: Option<crate::parser::ConversationTail>,
+    ) {
         self.preview_cache_order.retain(|id| *id != session_id);
         self.preview_cache_order.push_back(session_id.clone());
-        self.preview_cache.insert(session_id, CachedPreview { lines, layout: None });
+        self.preview_cache.insert(session_id, CachedPreview { lines, layout: None, tail });
         self.trim_preview_cache(PREVIEW_CACHE_ENTRIES, PREVIEW_CACHE_BYTES);
     }
 
@@ -1500,6 +1599,8 @@ impl App {
         self.preview_lines = Default::default();
         self.preview_search_matches.clear();
         self.preview_session_id.clear();
+        self.preview_tail = None;
+        self.preview_more_pending = false;
         self.preview_loading = false;
         self.recompute_preview_offsets();
         self.preview_cache.remove(&id);
@@ -1567,14 +1668,19 @@ impl App {
         if let (Some(snip), Some((tx, _)), Some(s)) =
             (&snippet, &self.as_written, self.sessions.get(real_idx))
         {
-            if !snip.in_file {
+            // A subagent's text is in its own transcript.
+            let path = match &snip.subagent {
+                None => Some(s.file_path.clone()),
+                Some((_, path)) => path.clone(),
+            };
+            if let (false, Some(path)) = (snip.in_file, path) {
                 let generation = self.snippet_generation.load(Ordering::Relaxed);
                 for (part, p) in snip.parts.iter().enumerate() {
                     let _ = tx.send(crate::as_written::Request {
                         generation,
                         session: real_idx,
                         part,
-                        path: s.file_path.clone(),
+                        path: path.clone(),
                         piece: p.source.clone(),
                         at: p.at,
                     });
@@ -1637,9 +1743,61 @@ impl App {
         ]
         .join("\n");
         let text = self.text_cache.slice(s.text_offset, s.text_len);
-        if let Some(parts) = text_snippet_parts(text, &phrase, &words, &shown) {
-            return Some(Snippet { in_file: false, parts });
+        let split = crate::subagents::split(text);
+        // The best placing first, wherever it is: the session's own
+        // conversation, then its changed files' paths, then its subagents'
+        // work. (Words apart in the conversation lose to the whole phrase in
+        // a subagent.)
+        let levels: &[Together] = if words.len() > 1 {
+            &[Together::Phrase, Together::Near, Together::Apart]
+        } else {
+            &[Together::Phrase]
+        };
+        for &together in levels {
+            if let Some(parts) = text_snippet_parts(&text[..split], &phrase, &words, &shown, together) {
+                return Some(Snippet { in_file: false, subagent: None, parts });
+            }
+            if together == *levels.last().unwrap_or(&Together::Apart) {
+                if let Some(snippet) = self.file_snippet(s, &words, &shown) {
+                    return Some(snippet);
+                }
+            }
+            let sub = &text[split..];
+            if let Some(snippet) = self.subagent_snippet(s, sub, &phrase, &words, &shown, together) {
+                return Some(snippet);
+            }
         }
+        None
+    }
+
+    /// Where the words are in the session's subagents' text (`sub`): the
+    /// first subagent with them.
+    fn subagent_snippet(
+        &self,
+        s: &SessionMeta,
+        sub: &[u8],
+        phrase: &str,
+        words: &[&str],
+        shown: &str,
+        together: Together,
+    ) -> Option<Snippet> {
+        let subagents = crate::subagents::parts(sub);
+        subagents.iter().enumerate().find_map(|(i, (description, range))| {
+            let parts = text_snippet_parts(&sub[range.clone()], phrase, words, shown, together)?;
+            // Descriptions can repeat: which one of those it is.
+            let nth = subagents[..i].iter().filter(|(d, _)| d == description).count();
+            let found = crate::subagents::find(&s.file_path, description, nth);
+            let label = found.as_ref().map_or_else(|| description.clone(), |(_, d)| d.clone());
+            Some(Snippet {
+                in_file: false,
+                subagent: Some((label, found.map(|(path, _)| path))),
+                parts,
+            })
+        })
+    }
+
+    /// Where the words are in the session's changed files' paths.
+    fn file_snippet(&self, s: &SessionMeta, words: &[&str], shown: &str) -> Option<Snippet> {
         let hidden = words.iter().filter(|w| !shown.contains(**w));
         hidden.chain(words.iter()).find_map(|word| {
             s.changed_files.iter().find_map(|f| {
@@ -1653,6 +1811,7 @@ impl App {
                 let written = crate::as_written::find_in(f, &written).unwrap_or(written);
                 Some(Snippet {
                     in_file: true,
+                    subagent: None,
                     parts: vec![SnippetPart::new(written, 0.0, true)],
                 })
             })
@@ -1811,35 +1970,50 @@ pub fn shell_quote(s: &str) -> String {
     }
 }
 
+/// How the search words are placed in a piece of text, best first.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Together {
+    /// The whole phrase (or the one word).
+    Phrase,
+    /// The words that occur, close together.
+    Near,
+    /// Each word wherever it is.
+    Apart,
+}
+
 /// The places in a session's search text (`text`) to show for the search
-/// words: where the whole phrase occurs, else where all the words that
-/// occur at all are close together, else the first hit of each, the words
-/// the row doesn't already show (`shown`) first. `None` when no word occurs.
+/// words, if they're placed there as `together` says (for `Apart`, the
+/// first hit of each, the words the row doesn't already show (`shown`)
+/// first). `None` when not.
 fn text_snippet_parts(
     text: &[u8],
     phrase: &str,
     words: &[&str],
     shown: &str,
+    together: Together,
 ) -> Option<Vec<SnippetPart>> {
     /// How close (in bytes) words must be to count as together.
     const NEAR: usize = 60;
-    if words.len() > 1 {
-        if let Some(pos) = find_preferring_whole_words(text, phrase) {
-            return Some(vec![snippet_part(text, pos, pos + phrase.len())]);
-        }
+    if together == Together::Phrase {
+        let pos = find_preferring_whole_words(text, phrase)?;
+        return Some(vec![snippet_part(text, pos, pos + phrase.len())]);
     }
     let found: Vec<(&str, usize)> = words
         .iter()
         .filter_map(|w| find_preferring_whole_words(text, w).map(|pos| (*w, pos)))
         .collect();
+    if together == Together::Near {
+        let present: Vec<&str> = found.iter().map(|(w, _)| *w).collect();
+        if present.len() < 2 {
+            return None;
+        }
+        let (start, end) = find_cluster(text, &present, NEAR)?;
+        return Some(vec![snippet_part(text, start, end)]);
+    }
     match found.as_slice() {
         [] => return None,
         [(word, pos)] => return Some(vec![snippet_part(text, *pos, pos + word.len())]),
         _ => {}
-    }
-    let present: Vec<&str> = found.iter().map(|(w, _)| *w).collect();
-    if let Some((start, end)) = find_cluster(text, &present, NEAR) {
-        return Some(vec![snippet_part(text, start, end)]);
     }
     let mut picked: Vec<(&str, usize)> = found
         .iter()
@@ -2965,6 +3139,58 @@ mod search_tests {
     }
 
     #[test]
+    fn test_hits_in_subagents_are_labelled_and_rank_below_the_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        // Session b's transcript, with one subagent.
+        let sub = dir.path().join("b/subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("agent-x.jsonl"), "{}\n").unwrap();
+        std::fs::write(sub.join("agent-x.meta.json"), r#"{"description":"Check the Locks"}"#).unwrap();
+        let a_text = "we found a flock race\n";
+        let b_text = "audit the index\n\u{1}check the locks\nfound a flock race\n";
+        let (_cache_dir, cache) = cache_with(&format!("{}{}", a_text, b_text));
+        let mut a = make_session("a", "x", "", "p", "main", vec![]);
+        a.text_len = a_text.len() as u32;
+        a.timestamp = 1; // older: only relevance can put it first
+        let mut b = make_session("b", "y", "", "p", "main", vec![]);
+        b.text_offset = a_text.len() as u64;
+        b.text_len = b_text.len() as u32;
+        b.timestamp = 2;
+        b.file_path = dir.path().join("b.jsonl");
+        let mut app = App::new(vec![a, b], false, HashSet::new(), cache);
+        app.search_query = "flock".into();
+        app.apply_search();
+        assert_eq!(ids(&app), ["a", "b"], "the conversation's own hit first");
+
+        let snip = app.snippet(1).unwrap();
+        let (task, path) = snip.subagent.clone().unwrap();
+        assert_eq!(task, "Check the Locks", "as written in its meta file");
+        assert!(path.unwrap().ends_with("agent-x.jsonl"));
+        let (body, _, _) = one_part(&snip);
+        assert_eq!(body, "found a flock race");
+        assert_eq!(app.snippet(0).unwrap().subagent, None);
+
+        // The description is searchable too.
+        app.search_query = "locks".into();
+        app.apply_search();
+        assert_eq!(ids(&app), ["b"]);
+    }
+
+    #[test]
+    fn test_the_whole_phrase_in_a_subagent_beats_scattered_words() {
+        let text = format!(
+            "the cap semantics are odd\n{}\nthis change affects few\n{}review\nthe semantics change affects routing\n",
+            "x".repeat(300),
+            crate::subagents::MARK as char
+        );
+        let (_dir, mut app) = searched(&text, "x", "semantics change affects");
+        let snip = app.snippet(0).unwrap();
+        assert!(snip.subagent.is_some(), "{:?}", snip);
+        let (body, _, _) = one_part(&snip);
+        assert_eq!(body, "the semantics change affects routing");
+    }
+
+    #[test]
     fn test_snippet_falls_back_to_changed_files() {
         let mut s = make_session("a", "x", "", "p", "main", vec![]);
         s.changed_files = vec!["/repo/src/Auth.rs".into()];
@@ -3139,6 +3365,98 @@ mod search_tests {
         );
     }
 
+    /// A transcript `path` with these user prompts, shown in the preview of
+    /// session "a" as a whole load would.
+    fn shown_transcript(app: &mut App, path: &Path, prompts: &[&str]) {
+        let body: String = prompts
+            .iter()
+            .map(|p| {
+                serde_json::json!({"type": "user", "timestamp": "2026-11-10T12:00:00Z",
+                                   "message": {"content": p}})
+                .to_string()
+                    + "\n"
+            })
+            .collect();
+        std::fs::write(path, body).unwrap();
+        let mut tail = crate::parser::ConversationTail::new(false);
+        let lines: Vec<_> = crate::parser::read_conversation(path, &mut tail)
+            .lines
+            .into_iter()
+            .map(|(sp, t)| (t.clone(), crate::fold::fold(&t), sp))
+            .collect();
+        app.preview_session_id = "a".into();
+        app.preview_lines = Arc::new(lines);
+        app.preview_tail = Some(tail);
+        app.preview_inner_width = 40;
+        app.preview_viewport_height = 4;
+        app.recompute_preview_offsets();
+    }
+
+    /// What reading on from the preview's tail finds, applied.
+    fn read_on(app: &mut App, path: &Path) {
+        let mut tail = app.preview_tail.clone().unwrap();
+        let more = crate::parser::read_conversation(path, &mut tail);
+        let users = more.lines.iter().filter(|(sp, _)| *sp == Speaker::User).count() as u32;
+        let lines = more.lines.into_iter().map(|(sp, t)| (t.clone(), crate::fold::fold(&t), sp)).collect();
+        app.append_preview(lines, more.first_rule, tail, users);
+    }
+
+    fn append_prompt(path: &Path, prompt: &str, ts: &str) {
+        use std::io::Write;
+        let line = serde_json::json!({"type": "user", "timestamp": ts, "message": {"content": prompt}});
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(f, "{}", line).unwrap();
+    }
+
+    #[test]
+    fn test_a_growing_session_s_preview_follows_at_the_bottom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.jsonl");
+        let mut app = three_sessions();
+        shown_transcript(&mut app, &path, &["one", "two", "three"]);
+        app.preview_scroll = app.max_preview_scroll(); // reading the end
+        let count = app.sessions[0].message_count;
+        append_prompt(&path, "four", "2026-11-10T12:05:00Z");
+        read_on(&mut app, &path);
+        let texts: Vec<&str> = app.preview_lines.iter().map(|l| l.0.as_str()).collect();
+        assert_eq!(texts, ["one", "two", "three", "four"]);
+        assert_eq!(app.preview_scroll, app.max_preview_scroll(), "still at the bottom");
+        assert_eq!(app.preview_line_offsets.len(), 4);
+        let rows = app.preview_total_rows;
+        app.recompute_preview_offsets();
+        assert_eq!(app.preview_total_rows, rows, "laid out as a full layout would");
+        assert_eq!(app.sessions[0].message_count, count + 1);
+    }
+
+    #[test]
+    fn test_reading_up_the_preview_stays_put_as_it_grows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.jsonl");
+        let mut app = three_sessions();
+        shown_transcript(&mut app, &path, &["one", "two caddy", "three", "four"]);
+        app.preview_search_query = "caddy".into();
+        app.refresh_preview_matches(true);
+        app.preview_scroll = 0;
+        // Next day: the first day's rule goes in at the top, above the view.
+        append_prompt(&path, "five caddy", "2026-11-12T12:00:00Z");
+        read_on(&mut app, &path);
+        let speakers: Vec<Speaker> = app.preview_lines.iter().map(|l| l.2).collect();
+        assert_eq!(speakers[0], Speaker::Day);
+        assert_eq!(speakers[5], Speaker::Day);
+        assert_eq!(app.preview_search_matches, vec![2, 6], "matches cover the new lines");
+        assert_eq!(app.preview_search_current, 0, "still on the same match");
+        assert_eq!(app.preview_scroll, 0);
+
+        // Further down, the rule going in above keeps the same message on top.
+        let mut app = three_sessions();
+        shown_transcript(&mut app, &path, &["one", "two", "three", "four", "five", "six"]);
+        app.preview_scroll = app.preview_line_offsets[2];
+        append_prompt(&path, "seven", "2026-11-12T12:00:00Z");
+        read_on(&mut app, &path);
+        let (top, _) = app.preview_place().unwrap();
+        assert_eq!(app.preview_lines[top].0, "three");
+    }
+
     #[test]
     fn test_preview_cache_keeps_to_its_budget_and_reuses_layouts() {
         let mut app = three_sessions();
@@ -3146,11 +3464,11 @@ mod search_tests {
             Arc::new(vec![("x".repeat(n), "x".repeat(n), Speaker::User)])
         };
         for (id, n) in [("a", 400), ("b", 400), ("c", 400)] {
-            app.cache_preview(id.into(), lines(n));
+            app.cache_preview(id.into(), lines(n), None);
         }
         app.trim_preview_cache(10, 1000);
         assert_eq!(Vec::from(app.preview_cache_order.clone()), ["c"], "oldest out, by bytes");
-        app.cache_preview("d".into(), lines(5000));
+        app.cache_preview("d".into(), lines(5000), None);
         app.trim_preview_cache(10, 1000);
         assert!(app.preview_cache.contains_key("d"), "the newest stays even when too big");
 
@@ -3180,7 +3498,7 @@ mod search_tests {
         app.preview_lines = a_lines.into();
         app.preview_session_id = "a".into();
         app.recompute_preview_offsets();
-        app.cache_preview("b".into(), filler.into());
+        app.cache_preview("b".into(), filler.into(), None);
         app.sessions[1].name_lc = "needle".into();
 
         app.search_query = "needle".into();

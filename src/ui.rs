@@ -421,7 +421,16 @@ fn draw_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
             // where you left off (skipped when it's just the first message again).
             let quiet = Style::default().fg(Color::DarkGray);
             if let Some(snippet) = snippets.get(&real_idx) {
-                let label = if snippet.in_file { "└ file: " } else { "└ match: " };
+                let label = match &snippet.subagent {
+                    // Found in what a subagent did, not the conversation.
+                    Some((task, _)) if !task.is_empty() => {
+                        let room = (max_width / 4).clamp(8, 24);
+                        format!("└ subagent \"{}\": ", truncate_width(task, room))
+                    }
+                    Some(_) => "└ subagent: ".to_string(),
+                    None if snippet.in_file => "└ file: ".to_string(),
+                    None => "└ match: ".to_string(),
+                };
                 let room = max_width.saturating_sub(INDENT.width() + label.width());
                 let body = snippet_body(&snippet.parts, room);
                 let mut spans = vec![Span::styled(format!("{}{}", INDENT, label), quiet)];
@@ -1058,7 +1067,9 @@ fn hidden_hits_hint(app: &mut App) -> Option<&'static str> {
     }
     let real = *app.filtered_indices.get(app.selected)?;
     let snippet = app.snippet(real)?;
-    Some(if snippet.in_file {
+    Some(if snippet.subagent.is_some() {
+        " hits in a subagent's work "
+    } else if snippet.in_file {
         " hit in a changed file · f files "
     } else if app.show_tools {
         " hits not in the shown text "
@@ -2058,6 +2069,27 @@ mod tests {
             screen
         );
         assert!(!screen.contains("left off"), "the match line takes its place");
+    }
+
+    #[test]
+    fn test_a_hit_in_a_subagent_says_so() {
+        let text = "the session itself\n\u{1}check the locks\nfound a flock race\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("text.bin");
+        std::fs::write(&path, text).unwrap();
+        let mut app = sessions(1);
+        app.text_cache = crate::text_cache::TextCache::open(&path);
+        app.sessions[0].text_len = text.len() as u32;
+        app.search_query = "flock".into();
+        app.apply_search();
+        app.zoom = true;
+        let screen = render(&mut app, 100, 12);
+        // No meta file to read the description as written: the folded one.
+        assert!(
+            screen.contains("└ subagent \"check the locks\": found a flock race"),
+            "{}",
+            screen
+        );
     }
 
     fn render(app: &mut App, w: u16, h: u16) -> String {

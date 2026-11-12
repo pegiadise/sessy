@@ -94,19 +94,224 @@ pub fn deserialize_index(bytes: &[u8]) -> Option<SessionIndex> {
     Some(index)
 }
 
-pub fn scan_session_file(path: &Path) -> Option<(SessionMeta, Vec<u8>)> {
+/// What a session's files look like now: the transcript's size and mtime,
+/// and its subagents'.
+struct FileStats {
+    size: u64,
+    mtime: i64,
+    /// What `SessionMeta::file_mtime` holds, compared to notice a change: a
+    /// hash of the transcript's and the subagents' mtimes (to the
+    /// nanosecond) and the subagents' names and sizes.
+    changed: i64,
+    subagents: Vec<crate::subagents::SubagentFile>,
+}
+
+fn file_stats(path: &Path) -> Option<FileStats> {
     let metadata = fs::metadata(path).ok()?;
-    let file_size = metadata.len();
-    let file_mtime = metadata
+    let mtime = metadata
         .modified()
         .ok()?
         .duration_since(UNIX_EPOCH)
         .ok()?
         .as_secs() as i64;
+    let (subagents, dir_mtime) = crate::subagents::list(path);
+    let mut h = Fnv::default();
+    h.add(&crate::subagents::mtime_nanos(&metadata).to_le_bytes());
+    h.add(&dir_mtime.to_le_bytes());
+    for f in &subagents {
+        h.add(f.path.file_name().map_or(&[][..], |n| n.as_encoded_bytes()));
+        h.add(&f.size.to_le_bytes());
+        h.add(&f.mtime.to_le_bytes());
+    }
+    Some(FileStats {
+        size: metadata.len(),
+        mtime,
+        changed: h.0 as i64,
+        subagents,
+    })
+}
+
+/// FNV-1a, for change checks (not security).
+struct Fnv(u64);
+
+impl Default for Fnv {
+    fn default() -> Self {
+        Fnv(0xcbf29ce484222325)
+    }
+}
+
+impl Fnv {
+    fn add(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+}
+
+/// The subagent files a text was built from: name, size, mtime.
+fn fingerprint(files: &[crate::subagents::SubagentFile]) -> Vec<(String, u64, i64)> {
+    files
+        .iter()
+        .map(|f| {
+            let name = f.path.file_name().map(|n| n.to_string_lossy().into_owned());
+            (name.unwrap_or_default(), f.size, f.mtime)
+        })
+        .collect()
+}
+
+/// Where a session's scan stopped, to carry on from there when only more
+/// was written (a session in use grows on every turn; a big one takes
+/// seconds to read whole). Kept in `resume.bin` next to the index, not in
+/// it, so the index stays readable by sessy versions that predate this.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Resume {
+    /// The cached text this goes with; anything else and it's ignored.
+    text_offset: u64,
+    text_len: u32,
+    /// Bytes of the transcript read (whole lines), and a hash of the bytes
+    /// just before that point, to notice a file rewritten rather than grown.
+    scanned: u64,
+    tail_check: u64,
+    /// Bytes of the text that come from those lines.
+    main_len: u32,
+    /// The subagent files its subagent text was built from.
+    subagents: Vec<(String, u64, i64)>,
+    scanner: crate::parser::Scanner,
+}
+
+const RESUME_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct ResumeFile {
+    version: u32,
+    sessions: std::collections::HashMap<PathBuf, Resume>,
+}
+
+fn resume_path(text_path: &Path) -> PathBuf {
+    text_path.with_file_name("resume.bin")
+}
+
+fn load_resume(path: &Path) -> std::collections::HashMap<PathBuf, Resume> {
+    const LIMIT: usize = 256 << 20;
+    let config = bincode::config::legacy().with_limit::<LIMIT>();
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| bincode::serde::decode_from_slice::<ResumeFile, _>(&bytes, config).ok())
+        .filter(|(f, _)| f.version == RESUME_VERSION)
+        .map(|(f, _)| f.sessions)
+        .unwrap_or_default()
+}
+
+fn save_resume(path: &Path, sessions: std::collections::HashMap<PathBuf, Resume>) {
+    let file = ResumeFile { version: RESUME_VERSION, sessions };
+    let Ok(bytes) = bincode::serde::encode_to_vec(&file, bincode::config::legacy()) else {
+        return;
+    };
+    let tmp = path.with_extension(format!("bin.{}.tmp", std::process::id()));
+    if fs::write(&tmp, bytes).is_err() || fs::rename(&tmp, path).is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+/// FNV-1a of the (up to) 4 KB before byte `at` of `path`.
+fn tail_check(path: &Path, at: u64) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let from = at.saturating_sub(4096);
+    let mut file = fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut buf = Vec::with_capacity((at - from) as usize);
+    file.take(at - from).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 != at - from {
+        return None;
+    }
+    let mut h = Fnv::default();
+    h.add(&buf);
+    Some(h.0)
+}
+
+/// Read a session whole: its metadata, its search text (its own, then its
+/// subagents'), and where to carry on next time.
+fn scan_full(path: &Path, stats: &FileStats) -> Option<(SessionMeta, Vec<u8>, Option<Resume>)> {
+    let part = crate::parser::scan_from(path, crate::parser::Scanner::default(), 0)?;
+    let scan = part.current.result()?;
+    let mut text = part.text.into_bytes();
+    text.extend_from_slice(crate::subagents::search_text(&stats.subagents).as_bytes());
+    let resume = tail_check(path, part.scanned).map(|tail_check| Resume {
+        text_offset: 0,
+        text_len: 0,
+        scanned: part.scanned,
+        tail_check,
+        main_len: part.text_complete as u32,
+        subagents: fingerprint(&stats.subagents),
+        scanner: part.resumable,
+    });
+    let meta = session_meta(path, stats, scan, text.len())?;
+    Some((meta, text, resume))
+}
+
+/// Carry on reading a session from where `resume` stopped, reusing its
+/// cached text (`old`): `None` when that isn't safe (the transcript was
+/// rewritten, not just added to), and it has to be read whole.
+fn scan_resumed(
+    path: &Path,
+    stats: &FileStats,
+    cached: &SessionMeta,
+    resume: &Resume,
+    old: &[u8],
+) -> Option<(SessionMeta, Vec<u8>, Option<Resume>)> {
+    let main_len = resume.main_len as usize;
+    if resume.text_offset != cached.text_offset
+        || resume.text_len != cached.text_len
+        || old.len() != cached.text_len as usize
+        || main_len > old.len()
+        || stats.size < resume.scanned
+        || tail_check(path, resume.scanned)? != resume.tail_check
+    {
+        return None;
+    }
+    let part = crate::parser::scan_from(path, resume.scanner.clone(), resume.scanned)?;
+    let scan = part.current.result()?;
+    let subagents = fingerprint(&stats.subagents);
+    let mut text = Vec::with_capacity(old.len() + part.text.len());
+    text.extend_from_slice(&old[..main_len]);
+    text.extend_from_slice(part.text.as_bytes());
+    if subagents == resume.subagents {
+        // The old subagent text, past the main text (and any unfinished
+        // last line read then).
+        let split = main_len + crate::subagents::split(&old[main_len..]);
+        text.extend_from_slice(&old[split..]);
+    } else {
+        text.extend_from_slice(crate::subagents::search_text(&stats.subagents).as_bytes());
+    }
+    let resume = tail_check(path, part.scanned).map(|tail_check| Resume {
+        text_offset: 0,
+        text_len: 0,
+        scanned: part.scanned,
+        tail_check,
+        main_len: (main_len + part.text_complete) as u32,
+        subagents,
+        scanner: part.resumable,
+    });
+    let meta = session_meta(path, stats, scan, text.len())?;
+    Some((meta, text, resume))
+}
+
+/// Scan one session file whole (tests).
+#[cfg(test)]
+pub fn scan_session_file(path: &Path) -> Option<(SessionMeta, Vec<u8>)> {
+    let stats = file_stats(path)?;
+    scan_full(path, &stats).map(|(meta, text, _)| (meta, text))
+}
+
+fn session_meta(
+    path: &Path,
+    stats: &FileStats,
+    scan: crate::parser::ScanResult,
+    text_len: usize,
+) -> Option<SessionMeta> {
+    let file_size = stats.size;
+    let file_mtime = stats.mtime;
     let id = path.file_stem()?.to_str()?.to_string();
-
-    let scan = crate::parser::scan_session(path)?;
-
     let home_dir = dirs::home_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
@@ -153,8 +358,6 @@ pub fn scan_session_file(path: &Path) -> Option<(SessionMeta, Vec<u8>)> {
     let branch_lc = fold(&branch);
     let changed_files_lc = fold(&scan.changed_files.join("\n"));
 
-    let text_bytes = scan.search_text_lc.into_bytes();
-
     let meta = SessionMeta {
         id,
         project,
@@ -165,13 +368,14 @@ pub fn scan_session_file(path: &Path) -> Option<(SessionMeta, Vec<u8>)> {
         duration_secs,
         timestamp: last_active,
         file_size,
-        file_mtime,
+        // The check for changes: subagents' too.
+        file_mtime: stats.changed,
         file_path: path.to_path_buf(),
         cwd: scan.head.cwd,
         message_count: scan.message_count,
         tickets: scan.tickets,
         text_offset: 0, // filled in finalize step
-        text_len: text_bytes.len() as u32,
+        text_len: text_len as u32,
         name_lc,
         title_lc,
         project_lc,
@@ -184,7 +388,7 @@ pub fn scan_session_file(path: &Path) -> Option<(SessionMeta, Vec<u8>)> {
         prs: scan.prs,
         recap: scan.recap,
     };
-    Some((meta, text_bytes))
+    Some(meta)
 }
 
 fn compute_duration(first: &str, last: &str) -> u64 {
@@ -201,10 +405,11 @@ fn compute_duration(first: &str, last: &str) -> u64 {
 }
 
 /// One session after the scan: still as cached (its text already in
-/// `text.bin` at its recorded offset), or freshly scanned with its text.
+/// `text.bin` at its recorded offset), or (re)scanned with its text. Either
+/// way with where its scan can carry on from.
 enum Scanned {
-    Reused(SessionMeta),
-    Fresh(SessionMeta, Vec<u8>),
+    Reused(SessionMeta, Option<Resume>),
+    Fresh(SessionMeta, Vec<u8>, Option<Resume>),
 }
 
 /// Build the index from the session files, reusing `cached` for files that
@@ -277,52 +482,54 @@ fn build_index_at(
         }
     }
 
-    // Count what needs a rescan up front so progress can show a total.
-    let unchanged = |path: &PathBuf, meta: &fs::Metadata| {
-        cache_map.get(path).is_some_and(|cached_entry| {
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            cached_entry.file_mtime == mtime && cached_entry.file_size == meta.len()
-        })
-    };
-    if let Some(p) = progress {
-        let stale = file_entries
-            .iter()
-            .filter(|path| !fs::metadata(path).is_ok_and(|m| unchanged(path, &m)))
-            .count();
-        p.total.store(stale, std::sync::atomic::Ordering::Relaxed);
-    }
-    let scan = |path: &PathBuf| {
-        let result = scan_session_file(path);
-        if let Some(p) = progress {
-            p.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        result
+    // Where each cached session's scan stopped (only with a usable cache:
+    // carrying on needs its text).
+    let resume_file = resume_path(text_path);
+    let mut resumes = if cached.is_some() {
+        load_resume(&resume_file)
+    } else {
+        std::collections::HashMap::new()
     };
 
-    // For each file: either reuse the cached meta (and its text in place),
-    // or rescan.
-    let scanned: Vec<Scanned> = file_entries
-        .par_iter()
-        .filter_map(|path| {
-            if let Some(cached_entry) = cache_map.get(path) {
-                let meta = match fs::metadata(path) {
-                    Ok(m) => m,
-                    Err(_) => return scan(path).map(|(m, t)| Scanned::Fresh(m, t)),
-                };
-                if unchanged(path, &meta) {
-                    return Some(Scanned::Reused((*cached_entry).clone()));
-                }
-            }
-            scan(path).map(|(m, t)| Scanned::Fresh(m, t))
-        })
+    let stats: Vec<(PathBuf, FileStats)> = file_entries
+        .into_par_iter()
+        .filter_map(|path| file_stats(&path).map(|st| (path, st)))
         .collect();
 
-    let reused = scanned.iter().filter(|s| matches!(s, Scanned::Reused(_))).count();
+    // Count what needs a rescan up front so progress can show a total.
+    let unchanged = |path: &PathBuf, st: &FileStats| {
+        cache_map
+            .get(path)
+            .is_some_and(|c| c.file_mtime == st.changed && c.file_size == st.size)
+    };
+    if let Some(p) = progress {
+        let stale = stats.iter().filter(|(path, st)| !unchanged(path, st)).count();
+        p.total.store(stale, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // For each file: reuse the cached meta (and its text in place), carry
+    // on its scan from where it stopped, or read it whole.
+    let scanned: Vec<Scanned> = stats
+        .par_iter()
+        .filter_map(|(path, st)| {
+            let cached_entry = cache_map.get(path);
+            let resume = resumes.get(path);
+            if unchanged(path, st) {
+                return cached_entry.map(|c| Scanned::Reused((*c).clone(), resume.cloned()));
+            }
+            let resumed = cached_entry.zip(resume).and_then(|(c, r)| {
+                scan_resumed(path, st, c, r, prev_text.slice(c.text_offset, c.text_len))
+            });
+            let result = resumed.or_else(|| scan_full(path, st));
+            if let Some(p) = progress {
+                p.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            result.map(|(m, t, r)| Scanned::Fresh(m, t, r))
+        })
+        .collect();
+    resumes.clear();
+
+    let reused = scanned.iter().filter(|s| matches!(s, Scanned::Reused(..))).count();
     let cached_count = cached.as_ref().map_or(0, |c| c.sessions.len());
     let cached_len = cached.as_ref().map_or(0, |c| c.text_cache_len);
     if cached.is_some() && reused == scanned.len() && reused == cached_count {
@@ -330,7 +537,7 @@ fn build_index_at(
         let sessions = scanned
             .into_iter()
             .filter_map(|s| match s {
-                Scanned::Reused(m) => Some(m),
+                Scanned::Reused(m, _) => Some(m),
                 Scanned::Fresh(..) => None,
             })
             .collect();
@@ -345,15 +552,15 @@ fn build_index_at(
     let fresh_bytes: u64 = scanned
         .iter()
         .map(|s| match s {
-            Scanned::Fresh(_, t) => t.len() as u64,
-            Scanned::Reused(_) => 0,
+            Scanned::Fresh(_, t, _) => t.len() as u64,
+            Scanned::Reused(..) => 0,
         })
         .sum();
     let live_bytes: u64 = fresh_bytes
         + scanned
             .iter()
             .map(|s| match s {
-                Scanned::Reused(m) => m.text_len as u64,
+                Scanned::Reused(m, _) => m.text_len as u64,
                 Scanned::Fresh(..) => 0,
             })
             .sum::<u64>();
@@ -363,8 +570,8 @@ fn build_index_at(
         let chunks: Vec<&[u8]> = scanned
             .iter()
             .filter_map(|s| match s {
-                Scanned::Fresh(_, t) => Some(t.as_slice()),
-                Scanned::Reused(_) => None,
+                Scanned::Fresh(_, t, _) => Some(t.as_slice()),
+                Scanned::Reused(..) => None,
             })
             .collect();
         if let Ok(offsets) = append_text_cache(text_path, cached_len, &chunks) {
@@ -372,22 +579,17 @@ fn build_index_at(
             let sessions = scanned
                 .into_iter()
                 .map(|s| match s {
-                    Scanned::Reused(m) => m,
-                    Scanned::Fresh(mut m, _) => {
+                    Scanned::Reused(m, r) => (m, r),
+                    Scanned::Fresh(mut m, _, r) => {
                         if let Some((offset, len)) = offsets.next() {
                             m.text_offset = offset;
                             m.text_len = len;
                         }
-                        m
+                        (m, r)
                     }
                 })
                 .collect();
-            let index = SessionIndex {
-                version: INDEX_VERSION,
-                sessions,
-                text_cache_len: cached_len + fresh_bytes,
-            };
-            return (index, true);
+            return finish(sessions, cached_len + fresh_bytes, &resume_file);
         }
         // Appending failed (another instance got there first?): rewrite,
         // copying from the mapping of the file the offsets belong to.
@@ -407,8 +609,8 @@ fn rewrite_text_cache(
     let chunks: Vec<&[u8]> = scanned
         .iter()
         .map(|s| match s {
-            Scanned::Reused(m) => prev_text.slice(m.text_offset, m.text_len),
-            Scanned::Fresh(_, t) => t.as_slice(),
+            Scanned::Reused(m, _) => prev_text.slice(m.text_offset, m.text_len),
+            Scanned::Fresh(_, t, _) => t.as_slice(),
         })
         .collect();
     let written = write_text_cache_tmp(text_path, &chunks);
@@ -420,7 +622,7 @@ fn rewrite_text_cache(
         Ok(offsets)
     });
     let metas = scanned.into_iter().map(|s| match s {
-        Scanned::Reused(m) | Scanned::Fresh(m, _) => m,
+        Scanned::Reused(m, r) | Scanned::Fresh(m, _, r) => (m, r),
     });
     let offsets = match offsets {
         Ok(o) => o,
@@ -430,7 +632,7 @@ fn rewrite_text_cache(
             // sessions browsable. An impossible cache length forces a rescan
             // next time.
             let sessions = metas
-                .map(|mut meta| {
+                .map(|(mut meta, _)| {
                     meta.text_offset = 0;
                     meta.text_len = 0;
                     meta
@@ -449,14 +651,37 @@ fn rewrite_text_cache(
         .last()
         .map(|&(offset, len)| offset + len as u64)
         .unwrap_or(0);
-    let sessions: Vec<SessionMeta> = metas
+    let sessions = metas
         .zip(offsets)
-        .map(|(mut meta, (offset, len))| {
+        .map(|((mut meta, resume), (offset, len))| {
             meta.text_offset = offset;
             meta.text_len = len;
+            (meta, resume)
+        })
+        .collect();
+    finish(sessions, text_cache_len, &resume_path(text_path))
+}
+
+/// The index for `sessions` (their text in place), with where each one's
+/// scan stopped saved for next time, pointing at that text.
+fn finish(
+    sessions: Vec<(SessionMeta, Option<Resume>)>,
+    text_cache_len: u64,
+    resume_file: &Path,
+) -> (SessionIndex, bool) {
+    let mut resumes = std::collections::HashMap::new();
+    let sessions = sessions
+        .into_iter()
+        .map(|(meta, resume)| {
+            if let Some(mut r) = resume {
+                r.text_offset = meta.text_offset;
+                r.text_len = meta.text_len;
+                resumes.insert(meta.file_path.clone(), r);
+            }
             meta
         })
         .collect();
+    save_resume(resume_file, resumes);
     let index = SessionIndex {
         version: INDEX_VERSION,
         sessions,
@@ -735,7 +960,7 @@ mod tests {
         let (meta, _) = scan_session_file(&path).unwrap();
         let last = chrono::DateTime::parse_from_rfc3339("2026-11-10T10:05:00Z").unwrap();
         assert_eq!(meta.timestamp, last.timestamp());
-        assert!(meta.file_mtime > meta.timestamp, "the mtime is still kept for change checks");
+        assert_ne!(meta.file_mtime, 0, "the change fingerprint is kept");
     }
 
     fn write_session(dir: &Path, id: &str, words: &str) {
@@ -847,6 +1072,125 @@ mod tests {
         assert!(changed, "rescanned instead of trusting stale offsets");
         let cache = TextCache::open(&text);
         assert!(text_of(&cache, &idx, "a").contains("alpha"));
+    }
+
+    fn user_line(text: &str) -> String {
+        serde_json::json!({"type": "user", "timestamp": "2026-11-10T11:00:00Z", "cwd": "/work/app",
+                           "message": {"content": text}})
+        .to_string()
+            + "\n"
+    }
+
+    fn append(path: &Path, text: &str) {
+        use std::io::Write;
+        fs::OpenOptions::new().append(true).open(path).unwrap().write_all(text.as_bytes()).unwrap();
+        touch_later(path);
+    }
+
+    fn session<'a>(idx: &'a SessionIndex, id: &str) -> &'a SessionMeta {
+        idx.sessions.iter().find(|s| s.id == id).unwrap()
+    }
+
+    #[test]
+    fn test_a_grown_session_carries_on_from_where_its_scan_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        let proj = projects.join("-work-app");
+        fs::create_dir_all(&proj).unwrap();
+        let text = dir.path().join("text.bin");
+        let path = proj.join("a.jsonl");
+        // Longer than the 4 KB the rewrite check covers.
+        let padding: String = (0..40).map(|i| user_line(&format!("filler {} {}", i, "x".repeat(100)))).collect();
+        fs::write(&path, user_line("first ask") + &padding).unwrap();
+        let (idx, _) = build_index_at(&projects, &text, None, false, None);
+        assert!(resume_path(&text).exists());
+
+        // The first prompt edited in place (same length): a whole read would
+        // see it, carrying on doesn't read it again. That's how this test
+        // tells the two apart.
+        let body = fs::read_to_string(&path).unwrap().replacen("first ask", "FIRST ASK", 1);
+        fs::write(&path, body).unwrap();
+        append(&path, &user_line("second ask"));
+        let (idx, changed) = build_index_at(&projects, &text, Some(idx), false, None);
+        assert!(changed);
+        let a = session(&idx, "a");
+        assert_eq!(a.title, "first ask", "carried on, not read again");
+        assert_eq!(a.last_message, "second ask");
+        assert_eq!(a.message_count, 42);
+        let cache = TextCache::open(&text);
+        let t = text_of(&cache, &idx, "a");
+        assert!(t.starts_with("first ask\n") && t.ends_with("second ask\n"), "old text, then the new");
+
+        // No resume.bin (an older sessy rewrote the cache): read whole.
+        fs::remove_file(resume_path(&text)).unwrap();
+        append(&path, &user_line("third ask"));
+        let (idx, _) = build_index_at(&projects, &text, Some(idx), false, None);
+        assert_eq!(session(&idx, "a").title, "FIRST ASK");
+        assert_eq!(session(&idx, "a").message_count, 43);
+
+        // Rewritten rather than grown (the end changed): read whole.
+        let body = fs::read_to_string(&path).unwrap().replace("third ask", "third ASK");
+        fs::write(&path, body + &user_line("fourth ask")).unwrap();
+        touch_later(&path);
+        let (idx, _) = build_index_at(&projects, &text, Some(idx), false, None);
+        let cache = TextCache::open(&text);
+        assert!(text_of(&cache, &idx, "a").contains("third ask\nfourth ask"));
+        assert_eq!(session(&idx, "a").message_count, 44);
+    }
+
+    #[test]
+    fn test_an_unfinished_last_line_is_counted_once_it_is_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        let proj = projects.join("-work-app");
+        fs::create_dir_all(&proj).unwrap();
+        let text = dir.path().join("text.bin");
+        let path = proj.join("a.jsonl");
+        let whole = user_line("half written");
+        let (head, tail) = whole.split_at(whole.len() - 10);
+        fs::write(&path, user_line("first") + head).unwrap();
+        let (idx, _) = build_index_at(&projects, &text, None, false, None);
+        assert_eq!(session(&idx, "a").message_count, 1, "the unfinished line isn't JSON yet");
+        append(&path, tail);
+        let (idx, _) = build_index_at(&projects, &text, Some(idx), false, None);
+        assert_eq!(session(&idx, "a").message_count, 2);
+        assert_eq!(session(&idx, "a").last_message, "half written");
+        let cache = TextCache::open(&text);
+        assert_eq!(text_of(&cache, &idx, "a"), "first\nhalf written\n");
+    }
+
+    #[test]
+    fn test_subagents_are_searched_and_noticed_when_they_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        let proj = projects.join("-work-app");
+        fs::create_dir_all(&proj).unwrap();
+        let text = dir.path().join("text.bin");
+        let path = proj.join("a.jsonl");
+        fs::write(&path, user_line("audit the index")).unwrap();
+        let (idx, _) = build_index_at(&projects, &text, None, false, None);
+
+        // A subagent starts: noticed though the transcript didn't change.
+        let sub = proj.join("a/subagents");
+        fs::create_dir_all(&sub).unwrap();
+        let said = serde_json::json!({"type": "assistant", "isSidechain": true,
+            "message": {"content": [{"type": "text", "text": "Found a flock race"}]}});
+        fs::write(sub.join("agent-x.jsonl"), format!("{}\n", said)).unwrap();
+        fs::write(sub.join("agent-x.meta.json"), r#"{"description":"Check the Locks"}"#).unwrap();
+        let (idx, changed) = build_index_at(&projects, &text, Some(idx), false, None);
+        assert!(changed);
+        let cache = TextCache::open(&text);
+        assert_eq!(text_of(&cache, &idx, "a"), "audit the index\n\u{1}check the locks\nfound a flock race\n");
+
+        // The transcript grows, the subagent doesn't: its text is kept.
+        append(&path, &user_line("thanks"));
+        let (idx, _) = build_index_at(&projects, &text, Some(idx), false, None);
+        let cache = TextCache::open(&text);
+        assert_eq!(
+            text_of(&cache, &idx, "a"),
+            "audit the index\nthanks\n\u{1}check the locks\nfound a flock race\n"
+        );
+        assert_eq!(session(&idx, "a").message_count, 2, "subagents' turns aren't the person's");
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub mod parser;
 pub mod preview;
 pub mod query;
 pub mod session;
+pub mod subagents;
 pub mod text_cache;
 pub mod trash;
 pub mod ui;

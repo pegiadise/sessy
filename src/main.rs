@@ -484,6 +484,7 @@ fn run_event_loop<B: ratatui::backend::Backend<Error = io::Error>>(
     let mut dirty = true;
     let mut last_draw = Instant::now();
     let mut last_live_scan = Instant::now();
+    let mut last_follow = Instant::now();
     loop {
         // Sessions opening and closing elsewhere; a handful of tiny files.
         if last_live_scan.elapsed() >= Duration::from_secs(2) {
@@ -492,6 +493,11 @@ fn run_event_loop<B: ratatui::backend::Backend<Error = io::Error>>(
                 app.live_stale = true;
                 dirty = true;
             }
+        }
+        // The session shown, if it's in use elsewhere, as it grows.
+        if last_follow.elapsed() >= Duration::from_secs(1) {
+            last_follow = Instant::now();
+            preview::follow_growth(app);
         }
         // `is:open` follows, once no prompt is aimed at the selection.
         if app.live_stale && !app.view_frozen() {

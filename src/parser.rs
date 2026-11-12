@@ -70,6 +70,7 @@ pub struct PrLink {
     pub url: String,
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct HeadMeta {
     pub title: String,
     pub branch: String,
@@ -199,7 +200,7 @@ fn is_injected_context(text: &str) -> bool {
 /// Prompts typed while Claude was busy are logged as queued-command
 /// attachments; a few also come back as a `type:"user"` turn later. This
 /// counts each prompt once.
-#[derive(Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct QueuedPrompts(std::collections::HashSet<String>);
 
 impl QueuedPrompts {
@@ -349,8 +350,20 @@ fn push_search_text(out: &mut String, text: &str) {
     if trimmed.is_empty() {
         return;
     }
-    out.push_str(&crate::fold::fold(trimmed));
+    let folded = crate::fold::fold(trimmed);
+    // The byte that marks where a subagent's text starts never occurs in
+    // the text itself.
+    if folded.as_bytes().contains(&crate::subagents::MARK) {
+        out.push_str(&folded.replace(crate::subagents::MARK as char, " "));
+    } else {
+        out.push_str(&folded);
+    }
     out.push('\n');
+}
+
+/// One entry's searchable text (see `index_entry_text`), without tickets.
+pub fn append_search_text(entry: &Value, out: &mut String) {
+    for_each_search_piece(entry, &mut |piece| push_search_text(out, piece));
 }
 
 /// Accumulate every piece of human-readable text in an entry into the search
@@ -489,56 +502,48 @@ pub struct ScanResult {
     pub recap: String,
 }
 
-pub fn scan_session(path: &Path) -> Option<ScanResult> {
-    let file = File::open(path).ok()?;
-    let reader = BufReader::new(file);
+/// Reads a transcript a line at a time, keeping what the index needs.
+/// Serializable, so a scan can carry on from where it stopped when the
+/// transcript has only grown (`index` keeps it between runs).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Scanner {
+    head: Option<HeadMeta>,
+    working_head: HeadMeta,
+    last_human_message: String,
+    last_timestamp: String,
+    custom_title: String,
+    legacy_rename: String,
+    fallback_title: String,
+    tickets_set: std::collections::HashSet<String>,
+    ai_title: String,
+    permission_mode: String,
+    cc_version: String,
+    skills_set: std::collections::HashSet<String>,
+    changed_files_set: std::collections::HashSet<String>,
+    message_count: u32,
+    prs: Vec<PrLink>,
+    recap: String,
+    last_branch: String,
+    /// Prompts queued while Claude was busy, not yet seen again as a turn.
+    queued: QueuedPrompts,
+}
 
-    let mut head: Option<HeadMeta> = None;
-    let mut working_head = HeadMeta {
-        title: String::new(),
-        branch: String::new(),
-        slug: String::new(),
-        first_timestamp: String::new(),
-        cwd: String::new(),
-    };
-    let mut last_human_message = String::new();
-    let mut last_timestamp = String::new();
-    let mut custom_title = String::new();
-    let mut legacy_rename = String::new();
-    let mut fallback_title = String::new();
-    let mut search_text_lc = String::new();
-    let mut tickets_set: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut ai_title = String::new();
-    let mut permission_mode = String::new();
-    let mut cc_version = String::new();
-    let mut skills_set: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut changed_files_set: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut message_count: u32 = 0;
-    let mut prs: Vec<PrLink> = Vec::new();
-    let mut recap = String::new();
-    let mut last_branch = String::new();
-    // Prompts queued while Claude was busy, not yet seen again as a turn.
-    let mut queued = QueuedPrompts::default();
-
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
+impl Scanner {
+    /// Take in one line of the transcript; its searchable text goes on the
+    /// end of `search_text_lc`.
+    pub fn feed(&mut self, line: &str, search_text_lc: &mut String) {
         if line.trim().is_empty() {
-            continue;
+            return;
         }
-
-        let entry: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            return;
         };
 
-        index_entry_text(&entry, &mut search_text_lc, &mut tickets_set);
+        index_entry_text(&entry, search_text_lc, &mut self.tickets_set);
         if let Some(b) = entry.get("gitBranch").and_then(|b| b.as_str()) {
-            if b != last_branch {
-                extract_tickets_into(b, &mut tickets_set);
-                last_branch = b.to_string();
+            if b != self.last_branch {
+                extract_tickets_into(b, &mut self.tickets_set);
+                self.last_branch = b.to_string();
             }
         }
 
@@ -546,18 +551,18 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
         match entry.get("type").and_then(|t| t.as_str()) {
             Some("ai-title") => {
                 if let Some(t) = entry.get("aiTitle").and_then(|t| t.as_str()) {
-                    ai_title = one_line(t, 200);
+                    self.ai_title = one_line(t, 200);
                 }
             }
             // `/rename` (and Claude Code's own naming) persists the title here.
             Some("custom-title") => {
                 if let Some(t) = entry.get("customTitle").and_then(|t| t.as_str()) {
-                    custom_title = one_line(t, 200);
+                    self.custom_title = one_line(t, 200);
                 }
             }
             Some("permission-mode") => {
                 if let Some(m) = entry.get("permissionMode").and_then(|m| m.as_str()) {
-                    permission_mode = m.to_string();
+                    self.permission_mode = m.to_string();
                 }
             }
             Some("file-history-snapshot") => {
@@ -567,22 +572,22 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
                     .and_then(|b| b.as_object())
                 {
                     for path in backups.keys() {
-                        changed_files_set.insert(path.clone());
+                        self.changed_files_set.insert(path.clone());
                     }
                 }
             }
             // Newer Claude Code records edits one file at a time.
             Some("file-history-delta") => {
                 if let Some(p) = entry.get("trackingPath").and_then(|p| p.as_str()) {
-                    changed_files_set.insert(p.to_string());
+                    self.changed_files_set.insert(p.to_string());
                 }
             }
             Some("pr-link") => {
                 let number = entry.get("prNumber").and_then(|n| n.as_u64());
                 let url = entry.get("prUrl").and_then(|u| u.as_str()).unwrap_or("");
                 if let Some(number) = number {
-                    if !prs.iter().any(|p| p.number == number && p.url == url) {
-                        prs.push(PrLink {
+                    if !self.prs.iter().any(|p| p.number == number && p.url == url) {
+                        self.prs.push(PrLink {
                             repo: entry
                                 .get("prRepository")
                                 .and_then(|r| r.as_str())
@@ -593,53 +598,53 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
                         });
                     }
                     // `#123` finds the session through ticket search.
-                    tickets_set.insert(format!("#{}", number));
+                    self.tickets_set.insert(format!("#{}", number));
                 }
             }
             _ => {}
         }
         if let Some(r) = recap_text(&entry) {
-            recap = one_line(&r, 1000);
+            self.recap = one_line(&r, 1000);
         }
-        if cc_version.is_empty() {
+        if self.cc_version.is_empty() {
             if let Some(v) = entry.get("version").and_then(|v| v.as_str()) {
-                cc_version = v.to_string();
+                self.cc_version = v.to_string();
             }
         }
         if let Some(skill) = entry.get("attributionSkill").and_then(|s| s.as_str()) {
             if !skill.is_empty() {
-                skills_set.insert(skill.to_string());
+                self.skills_set.insert(skill.to_string());
             }
         }
 
-        if working_head.branch.is_empty() {
+        if self.working_head.branch.is_empty() {
             if let Some(b) = entry.get("gitBranch").and_then(|b| b.as_str()) {
-                working_head.branch = b.to_string();
+                self.working_head.branch = b.to_string();
             }
         }
-        if working_head.slug.is_empty() {
+        if self.working_head.slug.is_empty() {
             if let Some(s) = entry.get("slug").and_then(|s| s.as_str()) {
-                working_head.slug = s.to_string();
+                self.working_head.slug = s.to_string();
             }
         }
-        if working_head.first_timestamp.is_empty() {
+        if self.working_head.first_timestamp.is_empty() {
             if let Some(ts) = entry.get("timestamp").and_then(|t| t.as_str()) {
-                working_head.first_timestamp = ts.to_string();
+                self.working_head.first_timestamp = ts.to_string();
             }
         }
-        if working_head.cwd.is_empty() {
+        if self.working_head.cwd.is_empty() {
             if let Some(c) = entry.get("cwd").and_then(|c| c.as_str()) {
-                working_head.cwd = c.to_string();
+                self.working_head.cwd = c.to_string();
             }
         }
 
         if let Some(ts) = entry.get("timestamp").and_then(|t| t.as_str()) {
-            last_timestamp = ts.to_string();
+            self.last_timestamp = ts.to_string();
         }
 
         // Remember the first command-noise turn so command-only sessions
         // (someone opened Claude and ran /exit) still get a listable title.
-        if fallback_title.is_empty()
+        if self.fallback_title.is_empty()
             && entry.get("type").and_then(|t| t.as_str()) == Some("user")
         {
             if let Some(c) = entry
@@ -648,7 +653,7 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
                 .and_then(|c| c.as_str())
             {
                 if is_command_noise(c) {
-                    fallback_title = command_noise_title(c);
+                    self.fallback_title = command_noise_title(c);
                 }
             }
         }
@@ -656,19 +661,19 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
         // Sidechain turns belong to subagents, not the person; the preview
         // skips them, so titles and counts must too.
         if !flag(&entry, "isSidechain") {
-            if let Some(text) = human_text(&entry).filter(|t| queued.is_new(&entry, t)) {
+            if let Some(text) = human_text(&entry).filter(|t| self.queued.is_new(&entry, t)) {
                 let line = one_line(&text, 200);
-                message_count += 1;
-                if head.is_none() {
-                    head = Some(HeadMeta {
+                self.message_count += 1;
+                if self.head.is_none() {
+                    self.head = Some(HeadMeta {
                         title: line.clone(),
-                        branch: working_head.branch.clone(),
-                        slug: working_head.slug.clone(),
-                        first_timestamp: working_head.first_timestamp.clone(),
-                        cwd: working_head.cwd.clone(),
+                        branch: self.working_head.branch.clone(),
+                        slug: self.working_head.slug.clone(),
+                        first_timestamp: self.working_head.first_timestamp.clone(),
+                        cwd: self.working_head.cwd.clone(),
                     });
                 }
-                last_human_message = line;
+                self.last_human_message = line;
             }
         }
 
@@ -681,7 +686,7 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
                     if let Some(args) = extract_command_args(content) {
                         let args = one_line(args, 200);
                         if !args.is_empty() {
-                            legacy_rename = args;
+                            self.legacy_rename = args;
                         }
                     }
                 }
@@ -689,61 +694,115 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
         }
     }
 
-    let rename = if custom_title.is_empty() {
-        legacy_rename
-    } else {
-        custom_title
-    };
+    /// What the scan found so far, `None` when nothing listable (no prompt,
+    /// not even a command). The search text isn't part of it.
+    pub fn result(&self) -> Option<ScanResult> {
+        let rename = if self.custom_title.is_empty() {
+            self.legacy_rename.clone()
+        } else {
+            self.custom_title.clone()
+        };
+        let mut head = match &self.head {
+            Some(h) => h.clone(),
+            None if !self.fallback_title.is_empty() => HeadMeta {
+                title: self.fallback_title.clone(),
+                ..self.working_head.clone()
+            },
+            None => return None,
+        };
+        // The slug is first written after the first prompt, so the head taken
+        // there rarely has it.
+        if head.slug.is_empty() {
+            head.slug = self.working_head.slug.clone();
+        }
+        let tail = if self.last_human_message.is_empty()
+            && self.last_timestamp.is_empty()
+            && rename.is_empty()
+        {
+            None
+        } else {
+            Some(TailMeta {
+                last_human_message: self.last_human_message.clone(),
+                last_timestamp: self.last_timestamp.clone(),
+                rename,
+            })
+        };
+        let sorted = |set: &std::collections::HashSet<String>| {
+            let mut v: Vec<String> = set.iter().cloned().collect();
+            v.sort();
+            v
+        };
+        Some(ScanResult {
+            head,
+            tail,
+            search_text_lc: String::new(),
+            tickets: sorted(&self.tickets_set),
+            ai_title: self.ai_title.clone(),
+            permission_mode: self.permission_mode.clone(),
+            cc_version: self.cc_version.clone(),
+            skills: sorted(&self.skills_set),
+            changed_files: sorted(&self.changed_files_set),
+            message_count: self.message_count,
+            prs: self.prs.clone(),
+            recap: self.recap.clone(),
+        })
+    }
+}
 
-    // The slug is first written after the first prompt, so the head taken
-    // there rarely has it.
-    if let Some(h) = head.as_mut() {
-        if h.slug.is_empty() {
-            h.slug = working_head.slug.clone();
+/// A transcript read from `from` (a line start) to its last complete line.
+/// A last line still being written (no newline yet) is fed too, so the
+/// result is current, but not counted in the returned scanner and offset:
+/// carrying on from there reads it again, whole.
+pub struct ScanPart {
+    /// The scan up to `scanned`, to carry on from later.
+    pub resumable: Scanner,
+    /// Byte offset just past the last complete line.
+    pub scanned: u64,
+    /// Search text of the complete lines, then of the unfinished one.
+    pub text: String,
+    pub text_complete: usize,
+    /// The scan including the unfinished line.
+    pub current: Scanner,
+}
+
+pub fn scan_from(path: &Path, mut scanner: Scanner, from: u64) -> Option<ScanPart> {
+    use std::io::{BufRead, Seek, SeekFrom};
+    let mut file = File::open(path).ok()?;
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut text = String::new();
+    let mut scanned = from;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        if buf.last() != Some(&b'\n') {
+            // Unfinished: count it in the current result only.
+            let text_complete = text.len();
+            let resumable = scanner.clone();
+            if let Ok(line) = std::str::from_utf8(&buf) {
+                scanner.feed(line, &mut text);
+            }
+            return Some(ScanPart { resumable, scanned, text, text_complete, current: scanner });
+        }
+        scanned += n as u64;
+        // Lines that aren't UTF-8 can't be JSON; skip them as before.
+        if let Ok(line) = std::str::from_utf8(&buf) {
+            scanner.feed(line.trim_end_matches(['\n', '\r']), &mut text);
         }
     }
-    let head = match head {
-        Some(h) => h,
-        None if !fallback_title.is_empty() => HeadMeta {
-            title: fallback_title,
-            branch: working_head.branch.clone(),
-            slug: working_head.slug.clone(),
-            first_timestamp: working_head.first_timestamp.clone(),
-            cwd: working_head.cwd.clone(),
-        },
-        None => return None,
-    };
-    let tail = if last_human_message.is_empty() && last_timestamp.is_empty() && rename.is_empty() {
-        None
-    } else {
-        Some(TailMeta {
-            last_human_message,
-            last_timestamp,
-            rename,
-        })
-    };
+    let text_complete = text.len();
+    Some(ScanPart { resumable: scanner.clone(), scanned, text, text_complete, current: scanner })
+}
 
-    let mut tickets: Vec<String> = tickets_set.into_iter().collect();
-    tickets.sort();
-    let mut skills: Vec<String> = skills_set.into_iter().collect();
-    skills.sort();
-    let mut changed_files: Vec<String> = changed_files_set.into_iter().collect();
-    changed_files.sort();
-
-    Some(ScanResult {
-        head,
-        tail,
-        search_text_lc,
-        tickets,
-        ai_title,
-        permission_mode,
-        cc_version,
-        skills,
-        changed_files,
-        message_count,
-        prs,
-        recap,
-    })
+pub fn scan_session(path: &Path) -> Option<ScanResult> {
+    let part = scan_from(path, Scanner::default(), 0)?;
+    let mut result = part.current.result()?;
+    result.search_text_lc = part.text;
+    Some(result)
 }
 
 /// User + assistant text messages, with tool use filtered out. Used by export.
@@ -765,73 +824,164 @@ pub fn extract_conversation(path: &Path) -> Vec<ConversationMessage> {
 /// true, assistant `tool_use` blocks are surfaced as `Speaker::Tool` lines with
 /// a compact summary (e.g. "Edit src/auth.rs", "Bash cargo test").
 pub fn extract_conversation_ext(path: &Path, include_tools: bool) -> Vec<(Speaker, String)> {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return vec![],
-    };
-    let reader = BufReader::new(file);
-    let mut messages = Vec::new();
-    let mut queued = QueuedPrompts::default();
-    // Local day of each message (index-aligned with `messages`).
-    let mut days: Vec<Option<chrono::NaiveDate>> = Vec::new();
+    let mut tail = ConversationTail::new(include_tools);
+    read_conversation(path, &mut tail).lines
+}
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        if line.trim().is_empty() {
-            continue;
+/// How far a conversation has been read, to read on when its transcript
+/// grows (a session open in Claude Code), with what that needs to carry
+/// on as one whole read would.
+#[derive(Debug, Clone)]
+pub struct ConversationTail {
+    /// Bytes read: whole lines only.
+    pub scanned: u64,
+    pub include_tools: bool,
+    queued: QueuedPrompts,
+    /// Lines given out so far (day rules included).
+    emitted: usize,
+    /// The first dated message's day and line, where its day rule goes
+    /// once a second day comes.
+    first_day: Option<(chrono::NaiveDate, usize)>,
+    last_day: Option<chrono::NaiveDate>,
+    /// Day rules are in: more than one day so far.
+    ruled: bool,
+}
+
+impl ConversationTail {
+    pub fn new(include_tools: bool) -> Self {
+        Self {
+            scanned: 0,
+            include_tools,
+            queued: QueuedPrompts::default(),
+            emitted: 0,
+            first_day: None,
+            last_day: None,
+            ruled: false,
         }
-        let entry: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+    }
+}
 
+/// What reading on found.
+pub struct MoreConversation {
+    pub lines: Vec<(Speaker, String)>,
+    /// The conversation came to span a second day just now: the first
+    /// day's rule, to go in at this line of what was read before.
+    pub first_rule: Option<(usize, String)>,
+}
+
+/// Read the conversation on from `tail` (as `(speaker, text)` lines, see
+/// `extract_conversation_ext`), up to its last whole line, and move `tail`
+/// past it. Sidechains are skipped; a day rule goes before the first
+/// message of each day once there are two.
+pub fn read_conversation(path: &Path, tail: &mut ConversationTail) -> MoreConversation {
+    use std::io::{Seek, SeekFrom};
+    let mut more = MoreConversation { lines: Vec::new(), first_rule: None };
+    let Ok(mut file) = File::open(path) else {
+        return more;
+    };
+    if file.seek(SeekFrom::Start(tail.scanned)).is_err() {
+        return more;
+    }
+    let start = tail.emitted;
+    let mut reader = BufReader::new(file);
+    let mut buf = Vec::new();
+    let mut messages: Vec<(Speaker, String)> = Vec::new();
+    loop {
+        buf.clear();
+        let n = match reader.read_until(b'\n', &mut buf) {
+            Ok(n) if n > 0 => n,
+            _ => break,
+        };
+        let entry = std::str::from_utf8(&buf)
+            .ok()
+            .and_then(|line| serde_json::from_str::<Value>(line.trim_end()).ok());
+        // A last line with no newline yet is still being written, unless it's
+        // whole JSON already (a file that just doesn't end in a newline).
+        if buf.last() != Some(&b'\n') && entry.is_none() {
+            break;
+        }
+        tail.scanned += n as u64;
+        let Some(entry) = entry else {
+            continue;
+        };
         if flag(&entry, "isSidechain") {
             continue;
         }
-
-        let before = messages.len();
-        match entry.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-            "user" | "attachment" => {
-                if let Some(text) = human_text(&entry).filter(|t| queued.is_new(&entry, t)) {
-                    messages.push((Speaker::User, text));
-                }
-            }
-            "assistant" => {
-                if let Some(content) = entry
-                    .get("message")
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| c.as_array())
-                {
-                    for block in content {
-                        match block.get("type").and_then(|t| t.as_str()) {
-                            Some("text") => {
-                                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                    let trimmed = text.trim();
-                                    if !trimmed.is_empty() {
-                                        messages.push((Speaker::Assistant, trimmed.to_string()));
-                                    }
-                                }
+        messages.clear();
+        conversation_lines(&entry, tail, &mut messages);
+        if messages.is_empty() {
+            continue;
+        }
+        if let Some(day) = entry_day(&entry) {
+            match tail.last_day {
+                None => tail.first_day = Some((day, tail.emitted)),
+                Some(prev) if prev != day => {
+                    if !tail.ruled {
+                        tail.ruled = true;
+                        if let Some((first, at)) = tail.first_day {
+                            let rule = (at, day_rule(first));
+                            // In this read's lines, or in what came before.
+                            if at >= start {
+                                more.lines.insert(at - start, (Speaker::Day, rule.1));
+                            } else {
+                                more.first_rule = Some(rule);
                             }
-                            Some("tool_use") if include_tools => {
-                                let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
-                                messages.push((Speaker::Tool, summarize_tool_use(name, block.get("input"))));
-                            }
-                            _ => {}
+                            tail.emitted += 1;
                         }
                     }
+                    more.lines.push((Speaker::Day, day_rule(day)));
+                    tail.emitted += 1;
+                }
+                Some(_) => {}
+            }
+            tail.last_day = Some(day);
+        }
+        tail.emitted += messages.len();
+        more.lines.append(&mut messages);
+    }
+    more
+}
+
+fn day_rule(day: chrono::NaiveDate) -> String {
+    day.format("%a %b %-d, %Y").to_string()
+}
+
+/// The preview lines of one transcript entry.
+fn conversation_lines(entry: &Value, tail: &mut ConversationTail, out: &mut Vec<(Speaker, String)>) {
+    match entry.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+        "user" | "attachment" => {
+            if let Some(text) = human_text(entry).filter(|t| tail.queued.is_new(entry, t)) {
+                out.push((Speaker::User, text));
+            }
+        }
+        "assistant" => {
+            let Some(content) = entry
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+            else {
+                return;
+            };
+            for block in content {
+                match block.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            let trimmed = text.trim();
+                            if !trimmed.is_empty() {
+                                out.push((Speaker::Assistant, trimmed.to_string()));
+                            }
+                        }
+                    }
+                    Some("tool_use") if tail.include_tools => {
+                        let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                        out.push((Speaker::Tool, summarize_tool_use(name, block.get("input"))));
+                    }
+                    _ => {}
                 }
             }
-            _ => {}
         }
-        if messages.len() > before {
-            let day = entry_day(&entry);
-            days.resize(messages.len(), day);
-        }
+        _ => {}
     }
-    with_day_rules(messages, &days)
 }
 
 /// Local day an entry was written, from its `timestamp`.
@@ -839,32 +989,6 @@ fn entry_day(entry: &Value) -> Option<chrono::NaiveDate> {
     let ts = entry.get("timestamp")?.as_str()?;
     let dt = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
     Some(dt.with_timezone(&chrono::Local).date_naive())
-}
-
-/// Put a `Speaker::Day` rule before the first message of each day, when the
-/// conversation spans more than one. Messages without a timestamp belong to
-/// the day before them.
-fn with_day_rules(
-    messages: Vec<(Speaker, String)>,
-    days: &[Option<chrono::NaiveDate>],
-) -> Vec<(Speaker, String)> {
-    let mut distinct: Vec<chrono::NaiveDate> = days.iter().flatten().copied().collect();
-    distinct.dedup();
-    if distinct.len() < 2 {
-        return messages;
-    }
-    let mut out = Vec::with_capacity(messages.len() + distinct.len());
-    let mut current: Option<chrono::NaiveDate> = None;
-    for (message, day) in messages.into_iter().zip(days) {
-        if let Some(day) = day {
-            if current != Some(*day) {
-                current = Some(*day);
-                out.push((Speaker::Day, day.format("%a %b %-d, %Y").to_string()));
-            }
-        }
-        out.push(message);
-    }
-    out
 }
 
 /// Build a one-line summary of a tool call: the tool name plus its most telling
@@ -918,6 +1042,44 @@ mod tests {
         assert_eq!(messages[2].text, "looks good, ship it");
         assert_eq!(messages[3].role, Role::Assistant);
         assert_eq!(messages[3].text, "Done! Everything is deployed.");
+    }
+
+    #[test]
+    fn test_reading_on_gives_what_one_whole_read_does() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let line = |ts: &str, text: &str| {
+            serde_json::json!({"type": "user", "timestamp": ts, "message": {"content": text}})
+                .to_string()
+                + "\n"
+        };
+        let add = |text: &str| {
+            std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(text.as_bytes()).unwrap();
+        };
+        std::fs::write(&path, line("2026-11-09T12:00:00Z", "first") + &line("2026-11-09T12:30:00Z", "same day")).unwrap();
+        let mut tail = ConversationTail::new(false);
+        let mut shown = read_conversation(&path, &mut tail).lines;
+        assert_eq!(shown.len(), 2, "one day: no rules");
+
+        // A line half written: nothing yet.
+        let later = line("2026-11-11T12:00:00Z", "two days later");
+        let (head, rest) = later.split_at(20);
+        add(head);
+        let before = tail.scanned;
+        assert!(read_conversation(&path, &mut tail).lines.is_empty());
+        assert_eq!(tail.scanned, before, "read again once whole");
+
+        // Whole, on another day: its rule, and the first day's for before.
+        add(rest);
+        let more = read_conversation(&path, &mut tail);
+        if let Some((at, rule)) = more.first_rule {
+            shown.insert(at, (Speaker::Day, rule));
+        }
+        shown.extend(more.lines);
+        assert_eq!(shown, extract_conversation_ext(&path, false));
+        let speakers: Vec<Speaker> = shown.iter().map(|(s, _)| *s).collect();
+        assert_eq!(speakers, [Speaker::Day, Speaker::User, Speaker::User, Speaker::Day, Speaker::User]);
     }
 
     #[test]
