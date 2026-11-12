@@ -59,6 +59,18 @@ impl TextCache {
 /// Writes `text.bin` atomically. Returns the per-session (offset, len) pairs
 /// in the order of the input.
 pub fn write_text_cache(path: &Path, chunks: &[&[u8]]) -> std::io::Result<Vec<(u64, u32)>> {
+    let (tmp, offsets) = write_text_cache_tmp(path, chunks)?;
+    commit_text_cache(&tmp, path)?;
+    Ok(offsets)
+}
+
+/// First half of `write_text_cache`: write the chunks to a temp file next to
+/// `path`. The caller drops any mmap of the old file (Windows can't replace
+/// a mapped file) and then calls `commit_text_cache`.
+pub fn write_text_cache_tmp(
+    path: &Path,
+    chunks: &[&[u8]],
+) -> std::io::Result<(PathBuf, Vec<(u64, u32)>)> {
     // Per-process temp name: two sessy instances rebuilding at once must not
     // interleave writes into the same file.
     let tmp = path.with_extension(format!("bin.{}.tmp", std::process::id()));
@@ -76,10 +88,49 @@ pub fn write_text_cache(path: &Path, chunks: &[&[u8]]) -> std::io::Result<Vec<(u
         offset += chunk.len() as u64;
     }
     file.sync_all()?;
-    drop(file);
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
+    Ok((tmp, out))
+}
+
+/// Second half of `write_text_cache`: move the temp file into place.
+pub fn commit_text_cache(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    if let Err(e) = fs::rename(tmp, path) {
+        let _ = fs::remove_file(tmp);
         return Err(e);
+    }
+    Ok(())
+}
+
+/// Append `chunks` to `text.bin`, which must be exactly `expected_len` bytes
+/// long now, leaving every existing offset valid. Returns the new chunks'
+/// (offset, len) pairs. Fails (and the caller rewrites the file) when the
+/// file isn't the expected size before or after, e.g. because another sessy
+/// appended at the same time.
+pub fn append_text_cache(
+    path: &Path,
+    expected_len: u64,
+    chunks: &[&[u8]],
+) -> std::io::Result<Vec<(u64, u32)>> {
+    let changed = || std::io::Error::other("text cache changed underneath");
+    let mut file = OpenOptions::new().append(true).open(path)?;
+    if file.metadata()?.len() != expected_len {
+        return Err(changed());
+    }
+    let total: usize = chunks.iter().map(|c| c.len()).sum();
+    let mut out = Vec::with_capacity(chunks.len());
+    let mut offset = expected_len;
+    let mut buf = Vec::with_capacity(total);
+    for chunk in chunks {
+        buf.extend_from_slice(chunk);
+        out.push((offset, chunk.len() as u32));
+        offset += chunk.len() as u64;
+    }
+    if !buf.is_empty() {
+        // One write, so a concurrent appender can't land in the middle.
+        file.write_all(&buf)?;
+        file.sync_data()?;
+    }
+    if file.metadata()?.len() != offset {
+        return Err(changed());
     }
     Ok(out)
 }
@@ -103,6 +154,23 @@ mod tests {
         assert_eq!(cache.slice(0, 5), b"hello");
         assert_eq!(cache.slice(5, 6), b"world!");
         assert_eq!(cache.slice(11, 1), b""); // out of range
+    }
+
+    #[test]
+    fn test_append_keeps_old_offsets_and_checks_the_size() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("text.bin");
+        write_text_cache(&path, &[b"hello".as_slice()]).unwrap();
+        let pairs = append_text_cache(&path, 5, &[b"abc".as_slice(), b"de".as_slice()]).unwrap();
+        assert_eq!(pairs, vec![(5, 3), (8, 2)]);
+        let cache = TextCache::open(&path);
+        assert_eq!(cache.slice(0, 5), b"hello");
+        assert_eq!(cache.slice(8, 2), b"de");
+        // The index expected a different file: refuse rather than misplace.
+        assert!(append_text_cache(&path, 4, &[b"x".as_slice()]).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 10);
+        // Nothing new: fine, nothing written.
+        assert_eq!(append_text_cache(&path, 10, &[]).unwrap(), vec![]);
     }
 
     #[test]

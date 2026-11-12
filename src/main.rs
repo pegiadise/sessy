@@ -64,11 +64,13 @@ fn main() -> io::Result<()> {
         index::load_cached_index()
     };
 
-    let mut idx = build_index_reporting_progress(cached, cli.rebuild_index);
+    let (mut idx, changed) = build_index_reporting_progress(cached, cli.rebuild_index);
     idx.sessions.sort_by_key(|s| std::cmp::Reverse(s.timestamp));
 
-    // Save index before applying runtime filters
-    index::save_index(&idx);
+    // Save index before applying runtime filters (and only when it changed).
+    if changed {
+        index::save_index(&idx);
+    }
 
     // Apply filters
     if let Some(ref project_filter) = cli.project {
@@ -154,7 +156,7 @@ fn main() -> io::Result<()> {
 fn build_index_reporting_progress(
     cached: Option<index::SessionIndex>,
     rebuild: bool,
-) -> index::SessionIndex {
+) -> (index::SessionIndex, bool) {
     use std::io::{IsTerminal, Write};
     use std::sync::atomic::{AtomicBool, Ordering};
 

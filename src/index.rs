@@ -1,5 +1,7 @@
 use crate::session::SessionMeta;
-use crate::text_cache::{text_cache_path, write_text_cache, TextCache};
+use crate::text_cache::{
+    append_text_cache, commit_text_cache, text_cache_path, write_text_cache_tmp, TextCache,
+};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -183,34 +185,65 @@ fn compute_duration(first: &str, last: &str) -> u64 {
     }
 }
 
+/// One session after the scan: still as cached (its text already in
+/// `text.bin` at its recorded offset), or freshly scanned with its text.
+enum Scanned {
+    Reused(SessionMeta),
+    Fresh(SessionMeta, Vec<u8>),
+}
+
+/// Build the index from the session files, reusing `cached` for files that
+/// haven't changed. Returns the index and whether it differs from `cached`
+/// (i.e. needs saving).
+///
+/// `text.bin` is only appended to: unchanged sessions keep their bytes and
+/// offsets, new and changed ones go on the end. It's rewritten from scratch
+/// (compacting away text of changed and deleted sessions) when that dead
+/// text outweighs the live text, or when appending isn't safe.
 pub fn build_index(
     cached: Option<SessionIndex>,
     force_rebuild: bool,
     progress: Option<&Progress>,
-) -> SessionIndex {
-    let projects_dir = claude_projects_dir();
+) -> (SessionIndex, bool) {
+    build_index_at(
+        &claude_projects_dir(),
+        &text_cache_path(),
+        cached,
+        force_rebuild,
+        progress,
+    )
+}
+
+/// `build_index` over an explicit projects directory and `text.bin`.
+fn build_index_at(
+    projects_dir: &Path,
+    text_path: &Path,
+    cached: Option<SessionIndex>,
+    force_rebuild: bool,
+    progress: Option<&Progress>,
+) -> (SessionIndex, bool) {
     if !projects_dir.exists() {
-        return SessionIndex {
+        let empty = SessionIndex {
             version: INDEX_VERSION,
             sessions: vec![],
             text_cache_len: 0,
         };
+        return (empty, true);
     }
 
     // Open the previous text.bin so we can reuse bytes for unchanged sessions.
-    let prev_text = TextCache::open(&text_cache_path());
+    let prev_text = TextCache::open(text_path);
+    // The cached offsets only mean something for the text.bin they were
+    // written with.
+    let cached = cached.filter(|c| !force_rebuild && prev_text.len() as u64 == c.text_cache_len);
 
-    let cache_map: std::collections::HashMap<PathBuf, &SessionMeta> = if force_rebuild {
-        std::collections::HashMap::new()
-    } else {
-        cached
-            .as_ref()
-            .map(|idx| idx.sessions.iter().map(|s| (s.file_path.clone(), s)).collect())
-            .unwrap_or_default()
-    };
+    let cache_map: std::collections::HashMap<PathBuf, &SessionMeta> = cached
+        .as_ref()
+        .map(|idx| idx.sessions.iter().map(|s| (s.file_path.clone(), s)).collect())
+        .unwrap_or_default();
 
     let mut file_entries: Vec<PathBuf> = Vec::new();
-    if let Ok(project_dirs) = fs::read_dir(&projects_dir) {
+    if let Ok(project_dirs) = fs::read_dir(projects_dir) {
         for proj_entry in project_dirs.flatten() {
             if !proj_entry.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
@@ -254,50 +287,144 @@ pub fn build_index(
         result
     };
 
-    // For each file: either reuse cached meta + old text bytes, or rescan.
-    let scanned: Vec<(SessionMeta, Vec<u8>)> = file_entries
+    // For each file: either reuse the cached meta (and its text in place),
+    // or rescan.
+    let scanned: Vec<Scanned> = file_entries
         .par_iter()
         .filter_map(|path| {
             if let Some(cached_entry) = cache_map.get(path) {
                 let meta = match fs::metadata(path) {
                     Ok(m) => m,
-                    Err(_) => return scan(path),
+                    Err(_) => return scan(path).map(|(m, t)| Scanned::Fresh(m, t)),
                 };
                 if unchanged(path, &meta) {
-                    let bytes = prev_text
-                        .slice(cached_entry.text_offset, cached_entry.text_len)
-                        .to_vec();
-                    let mut meta = (*cached_entry).clone();
-                    // offsets will be reassigned in the finalize step
-                    meta.text_offset = 0;
-                    return Some((meta, bytes));
+                    return Some(Scanned::Reused((*cached_entry).clone()));
                 }
             }
-            scan(path)
+            scan(path).map(|(m, t)| Scanned::Fresh(m, t))
         })
         .collect();
 
-    // Serial finalize: write text.bin and patch offsets onto each SessionMeta.
-    let chunks: Vec<&[u8]> = scanned.iter().map(|(_, b)| b.as_slice()).collect();
-    let offsets = match write_text_cache(&text_cache_path(), &chunks) {
+    let reused = scanned.iter().filter(|s| matches!(s, Scanned::Reused(_))).count();
+    let cached_count = cached.as_ref().map_or(0, |c| c.sessions.len());
+    let cached_len = cached.as_ref().map_or(0, |c| c.text_cache_len);
+    if cached.is_some() && reused == scanned.len() && reused == cached_count {
+        // Nothing new, changed or gone: the cache on disk is already right.
+        let sessions = scanned
+            .into_iter()
+            .filter_map(|s| match s {
+                Scanned::Reused(m) => Some(m),
+                Scanned::Fresh(..) => None,
+            })
+            .collect();
+        let index = SessionIndex {
+            version: INDEX_VERSION,
+            sessions,
+            text_cache_len: cached_len,
+        };
+        return (index, false);
+    }
+
+    let fresh_bytes: u64 = scanned
+        .iter()
+        .map(|s| match s {
+            Scanned::Fresh(_, t) => t.len() as u64,
+            Scanned::Reused(_) => 0,
+        })
+        .sum();
+    let live_bytes: u64 = fresh_bytes
+        + scanned
+            .iter()
+            .map(|s| match s {
+                Scanned::Reused(m) => m.text_len as u64,
+                Scanned::Fresh(..) => 0,
+            })
+            .sum::<u64>();
+
+    // Append when the result stays at least half live text.
+    if cached.is_some() && live_bytes * 2 >= cached_len + fresh_bytes {
+        let chunks: Vec<&[u8]> = scanned
+            .iter()
+            .filter_map(|s| match s {
+                Scanned::Fresh(_, t) => Some(t.as_slice()),
+                Scanned::Reused(_) => None,
+            })
+            .collect();
+        if let Ok(offsets) = append_text_cache(text_path, cached_len, &chunks) {
+            let mut offsets = offsets.into_iter();
+            let sessions = scanned
+                .into_iter()
+                .map(|s| match s {
+                    Scanned::Reused(m) => m,
+                    Scanned::Fresh(mut m, _) => {
+                        if let Some((offset, len)) = offsets.next() {
+                            m.text_offset = offset;
+                            m.text_len = len;
+                        }
+                        m
+                    }
+                })
+                .collect();
+            let index = SessionIndex {
+                version: INDEX_VERSION,
+                sessions,
+                text_cache_len: cached_len + fresh_bytes,
+            };
+            return (index, true);
+        }
+        // Appending failed (another instance got there first?): rewrite,
+        // copying from the mapping of the file the offsets belong to.
+        return rewrite_text_cache(scanned, prev_text, text_path);
+    }
+
+    rewrite_text_cache(scanned, prev_text, text_path)
+}
+
+/// Write a fresh, compact `text.bin` (reused sessions' text copied from
+/// `prev_text`) and the index pointing into it.
+fn rewrite_text_cache(
+    scanned: Vec<Scanned>,
+    prev_text: TextCache,
+    text_path: &Path,
+) -> (SessionIndex, bool) {
+    let chunks: Vec<&[u8]> = scanned
+        .iter()
+        .map(|s| match s {
+            Scanned::Reused(m) => prev_text.slice(m.text_offset, m.text_len),
+            Scanned::Fresh(_, t) => t.as_slice(),
+        })
+        .collect();
+    let written = write_text_cache_tmp(text_path, &chunks);
+    // Windows can't replace a file that's still mapped.
+    drop(chunks);
+    drop(prev_text);
+    let offsets = written.and_then(|(tmp, offsets)| {
+        commit_text_cache(&tmp, text_path)?;
+        Ok(offsets)
+    });
+    let metas = scanned.into_iter().map(|s| match s {
+        Scanned::Reused(m) | Scanned::Fresh(m, _) => m,
+    });
+    let offsets = match offsets {
         Ok(o) => o,
         Err(e) => {
             eprintln!("sessy: failed to write text cache: {}", e);
             // Without text.bin, full-text search just finds nothing; keep the
-            // sessions browsable. A zero cache length forces a rescan next time.
-            let sessions = scanned
-                .into_iter()
-                .map(|(mut meta, _)| {
+            // sessions browsable. An impossible cache length forces a rescan
+            // next time.
+            let sessions = metas
+                .map(|mut meta| {
                     meta.text_offset = 0;
                     meta.text_len = 0;
                     meta
                 })
                 .collect();
-            return SessionIndex {
+            let index = SessionIndex {
                 version: INDEX_VERSION,
                 sessions,
                 text_cache_len: u64::MAX,
             };
+            return (index, true);
         }
     };
 
@@ -305,21 +432,20 @@ pub fn build_index(
         .last()
         .map(|&(offset, len)| offset + len as u64)
         .unwrap_or(0);
-    let sessions: Vec<SessionMeta> = scanned
-        .into_iter()
+    let sessions: Vec<SessionMeta> = metas
         .zip(offsets)
-        .map(|((mut meta, _), (offset, len))| {
+        .map(|(mut meta, (offset, len))| {
             meta.text_offset = offset;
             meta.text_len = len;
             meta
         })
         .collect();
-
-    SessionIndex {
+    let index = SessionIndex {
         version: INDEX_VERSION,
         sessions,
         text_cache_len,
-    }
+    };
+    (index, true)
 }
 
 pub fn load_cached_index() -> Option<SessionIndex> {
@@ -494,6 +620,117 @@ mod tests {
         assert_eq!(parse_recent_filter("d"), None);
         assert_eq!(parse_recent_filter("99999999999999999999d"), None);
         assert_eq!(parse_recent_filter("999999999999999w"), None);
+    }
+
+    fn write_session(dir: &Path, id: &str, words: &str) {
+        let line = |ts: &str, text: &str| {
+            serde_json::json!({
+                "type": "user",
+                "timestamp": ts,
+                "cwd": "/work/app",
+                "message": {"content": text},
+            })
+            .to_string()
+        };
+        let body = format!(
+            "{}\n{}\n",
+            line("2026-11-10T10:00:00Z", words),
+            line("2026-11-10T10:05:00Z", "thanks")
+        );
+        fs::write(dir.join(format!("{}.jsonl", id)), body).unwrap();
+    }
+
+    fn text_of<'a>(cache: &'a TextCache, idx: &SessionIndex, id: &str) -> &'a str {
+        let s = idx.sessions.iter().find(|s| s.id == id).unwrap();
+        std::str::from_utf8(cache.slice(s.text_offset, s.text_len)).unwrap()
+    }
+
+    /// Bump a file's mtime so the index sees it as changed.
+    fn touch_later(path: &Path) {
+        let file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        file.set_modified(later).unwrap();
+    }
+
+    #[test]
+    fn test_incremental_build_appends_and_skips_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        let proj = projects.join("-work-app");
+        fs::create_dir_all(&proj).unwrap();
+        let text = dir.path().join("text.bin");
+        write_session(&proj, "a", "alpha words");
+        write_session(&proj, "b", "bravo words");
+
+        let (first, changed) = build_index_at(&projects, &text, None, false, None);
+        assert!(changed);
+        assert_eq!(first.sessions.len(), 2);
+        let len_after_first = fs::metadata(&text).unwrap().len();
+        assert_eq!(first.text_cache_len, len_after_first);
+
+        // Nothing changed: no writes, same offsets.
+        let a_offset = first.sessions.iter().find(|s| s.id == "a").unwrap().text_offset;
+        let (second, changed) = build_index_at(&projects, &text, Some(first), false, None);
+        assert!(!changed, "an unchanged index needn't be saved");
+        assert_eq!(fs::metadata(&text).unwrap().len(), len_after_first);
+        let a = second.sessions.iter().find(|s| s.id == "a").unwrap();
+        assert_eq!(a.text_offset, a_offset);
+
+        // One session changes: its new text is appended, the other stays put.
+        write_session(&proj, "b", "bravo charlie words");
+        touch_later(&proj.join("b.jsonl"));
+        let (third, changed) = build_index_at(&projects, &text, Some(second), false, None);
+        assert!(changed);
+        assert!(fs::metadata(&text).unwrap().len() > len_after_first, "appended");
+        assert_eq!(third.text_cache_len, fs::metadata(&text).unwrap().len());
+        let a = third.sessions.iter().find(|s| s.id == "a").unwrap();
+        assert_eq!(a.text_offset, a_offset, "unchanged sessions keep their bytes");
+        let cache = TextCache::open(&text);
+        assert!(text_of(&cache, &third, "a").contains("alpha words"));
+        assert!(text_of(&cache, &third, "b").contains("bravo charlie words"));
+
+        // A deleted session drops out (and needs a save).
+        fs::remove_file(proj.join("a.jsonl")).unwrap();
+        let (fourth, changed) = build_index_at(&projects, &text, Some(third), false, None);
+        assert!(changed);
+        assert_eq!(fourth.sessions.len(), 1);
+    }
+
+    #[test]
+    fn test_mostly_dead_text_is_compacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        let proj = projects.join("-work-app");
+        fs::create_dir_all(&proj).unwrap();
+        let text = dir.path().join("text.bin");
+        write_session(&proj, "a", &"long text ".repeat(200));
+        write_session(&proj, "b", "short");
+        let (idx, _) = build_index_at(&projects, &text, None, false, None);
+        // "a" shrinks to almost nothing: its old 2 KB would be mostly dead.
+        write_session(&proj, "a", "tiny");
+        touch_later(&proj.join("a.jsonl"));
+        let (idx, _) = build_index_at(&projects, &text, Some(idx), false, None);
+        let live: u64 = idx.sessions.iter().map(|s| s.text_len as u64).sum();
+        assert_eq!(fs::metadata(&text).unwrap().len(), live, "rewritten without the dead text");
+        let cache = TextCache::open(&text);
+        assert!(text_of(&cache, &idx, "a").contains("tiny"));
+        assert!(text_of(&cache, &idx, "b").contains("short"));
+    }
+
+    #[test]
+    fn test_cache_for_another_text_file_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        let proj = projects.join("-work-app");
+        fs::create_dir_all(&proj).unwrap();
+        let text = dir.path().join("text.bin");
+        write_session(&proj, "a", "alpha");
+        let (mut idx, _) = build_index_at(&projects, &text, None, false, None);
+        idx.text_cache_len += 1; // as if text.bin was replaced since
+        let (idx, changed) = build_index_at(&projects, &text, Some(idx), false, None);
+        assert!(changed, "rescanned instead of trusting stale offsets");
+        let cache = TextCache::open(&text);
+        assert!(text_of(&cache, &idx, "a").contains("alpha"));
     }
 
     #[test]
