@@ -1,4 +1,4 @@
-use crate::app::SortMode;
+use crate::app::{Density, SortMode};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -16,6 +16,8 @@ pub struct Config {
     /// What Enter does: "yolo" (resume with --dangerously-skip-permissions)
     /// or "safe" (plain resume).
     pub enter: String,
+    /// "comfortable" (three lines per session) or "compact" (one line).
+    pub density: String,
 }
 
 impl Default for Config {
@@ -25,6 +27,7 @@ impl Default for Config {
             sort: "date".to_string(),
             show_tool_activity: false,
             enter: "yolo".to_string(),
+            density: "comfortable".to_string(),
         }
     }
 }
@@ -39,6 +42,14 @@ impl Config {
             self.enter.to_lowercase().as_str(),
             "safe" | "resume" | "normal"
         )
+    }
+
+    pub fn density(&self) -> Density {
+        if self.density.eq_ignore_ascii_case("compact") {
+            Density::Compact
+        } else {
+            Density::Comfortable
+        }
     }
 
     pub fn sort_mode(&self) -> SortMode {
@@ -122,17 +133,20 @@ mod tests {
         assert_eq!(c.sort_mode(), SortMode::Date);
         assert!(!c.show_tool_activity);
         assert!(c.enter_is_yolo());
+        assert_eq!(c.density(), Density::Comfortable);
     }
 
     #[test]
     fn test_config_parse() {
         let c = parse_config(
-            "scope = \"all\"\nsort = \"messages\"\nshow_tool_activity = true\nenter = \"safe\"\n",
+            "scope = \"all\"\nsort = \"messages\"\nshow_tool_activity = true\n\
+             enter = \"safe\"\ndensity = \"compact\"\n",
         );
         assert!(c.scope_is_all());
         assert_eq!(c.sort_mode(), SortMode::Messages);
         assert!(c.show_tool_activity);
         assert!(!c.enter_is_yolo());
+        assert_eq!(c.density(), Density::Compact);
     }
 
     #[test]

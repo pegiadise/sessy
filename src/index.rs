@@ -35,18 +35,30 @@ pub fn encode_project_path(path: &str) -> String {
         .collect()
 }
 
-/// `~/.claude/projects`, or `$CLAUDE_CONFIG_DIR/projects` when Claude Code
-/// has been pointed at another config directory.
-pub fn claude_projects_dir() -> PathBuf {
-    let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+/// `~/.claude`, or `$CLAUDE_CONFIG_DIR` when Claude Code has been pointed at
+/// another config directory.
+pub fn claude_config_dir() -> PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("/"))
                 .join(".claude")
-        });
-    config_dir.join("projects")
+        })
+}
+
+/// `~/.claude/projects` (under `$CLAUDE_CONFIG_DIR` when set).
+pub fn claude_projects_dir() -> PathBuf {
+    claude_config_dir().join("projects")
+}
+
+/// Index build progress, shared with whoever reports it: how many session
+/// files need a (re)scan and how many of those are done.
+#[derive(Debug, Default)]
+pub struct Progress {
+    pub total: std::sync::atomic::AtomicUsize,
+    pub done: std::sync::atomic::AtomicUsize,
 }
 
 /// Whether a `.jsonl` file in a project dir is a resumable session. Old
@@ -171,7 +183,11 @@ fn compute_duration(first: &str, last: &str) -> u64 {
     }
 }
 
-pub fn build_index(cached: Option<SessionIndex>, force_rebuild: bool) -> SessionIndex {
+pub fn build_index(
+    cached: Option<SessionIndex>,
+    force_rebuild: bool,
+    progress: Option<&Progress>,
+) -> SessionIndex {
     let projects_dir = claude_projects_dir();
     if !projects_dir.exists() {
         return SessionIndex {
@@ -211,6 +227,33 @@ pub fn build_index(cached: Option<SessionIndex>, force_rebuild: bool) -> Session
         }
     }
 
+    // Count what needs a rescan up front so progress can show a total.
+    let unchanged = |path: &PathBuf, meta: &fs::Metadata| {
+        cache_map.get(path).is_some_and(|cached_entry| {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            cached_entry.file_mtime == mtime && cached_entry.file_size == meta.len()
+        })
+    };
+    if let Some(p) = progress {
+        let stale = file_entries
+            .iter()
+            .filter(|path| !fs::metadata(path).is_ok_and(|m| unchanged(path, &m)))
+            .count();
+        p.total.store(stale, std::sync::atomic::Ordering::Relaxed);
+    }
+    let scan = |path: &PathBuf| {
+        let result = scan_session_file(path);
+        if let Some(p) = progress {
+            p.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    };
+
     // For each file: either reuse cached meta + old text bytes, or rescan.
     let scanned: Vec<(SessionMeta, Vec<u8>)> = file_entries
         .par_iter()
@@ -218,18 +261,9 @@ pub fn build_index(cached: Option<SessionIndex>, force_rebuild: bool) -> Session
             if let Some(cached_entry) = cache_map.get(path) {
                 let meta = match fs::metadata(path) {
                     Ok(m) => m,
-                    Err(_) => return scan_session_file(path),
+                    Err(_) => return scan(path),
                 };
-                let current_mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                let current_size = meta.len();
-                if cached_entry.file_mtime == current_mtime
-                    && cached_entry.file_size == current_size
-                {
+                if unchanged(path, &meta) {
                     let bytes = prev_text
                         .slice(cached_entry.text_offset, cached_entry.text_len)
                         .to_vec();
@@ -239,7 +273,7 @@ pub fn build_index(cached: Option<SessionIndex>, force_rebuild: bool) -> Session
                     return Some((meta, bytes));
                 }
             }
-            scan_session_file(path)
+            scan(path)
         })
         .collect();
 

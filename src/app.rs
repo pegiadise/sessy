@@ -2,7 +2,7 @@ use crate::input::TextInput;
 use crate::parser::Speaker;
 use crate::session::SessionMeta;
 use crate::text_cache::TextCache;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Instant;
@@ -50,6 +50,25 @@ pub enum ViewMode {
     Timeline,
 }
 
+/// How much of each session the list shows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Density {
+    /// Three lines: headline, stats + first message, where you left off.
+    Comfortable,
+    /// One line per session.
+    Compact,
+}
+
+impl Density {
+    /// Screen rows per session, including the gap after it.
+    pub fn rows(self) -> usize {
+        match self {
+            Density::Comfortable => 4,
+            Density::Compact => 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Scope {
     /// Only sessions started in the launch project (git root, or the launch
@@ -73,8 +92,29 @@ pub enum AppAction {
     None,
     Launch(usize),
     LaunchDangerously(usize),
+    /// Resume into a new session ID (`--fork-session`), leaving the original as is.
+    Fork(usize),
     Print(usize),
     Quit,
+}
+
+/// Where a search hit that the list row doesn't otherwise show was found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Snippet {
+    /// The hit is in a changed file's path rather than the conversation.
+    pub in_file: bool,
+    /// The line around the hit (lowercased, like the search text).
+    pub text: String,
+    /// Char offset of the hit within `text`.
+    pub hit: usize,
+}
+
+/// A delete that `u` can still undo.
+pub struct DeletedSession {
+    pub meta: SessionMeta,
+    pub pinned: bool,
+    /// Trash folder holding the transcript.
+    pub slot: PathBuf,
 }
 
 pub struct PreviewResult {
@@ -152,6 +192,26 @@ pub struct App {
     pub show_files: bool,
     /// Whether the keybinding help overlay is open.
     pub show_help: bool,
+    /// First visible row of the help overlay.
+    pub help_scroll: usize,
+    pub density: Density,
+    /// Show only the focused pane, full width.
+    pub zoom: bool,
+    /// Sessions open in a running Claude Code, by session ID.
+    pub live: HashMap<String, crate::live::LiveSession>,
+    /// Where Claude Code's per-process files live; `None` disables live
+    /// detection (tests).
+    pub live_dir: Option<PathBuf>,
+    /// A resume waiting for `y` because the session is open elsewhere.
+    pub confirm_resume: Option<AppAction>,
+    /// Where deleted sessions go so they can be restored; `None` deletes
+    /// for good (tests).
+    pub trash_dir: Option<PathBuf>,
+    /// Deletes `u` can undo, most recent last.
+    pub undo_stack: Vec<DeletedSession>,
+    /// Per session (real index): the hit snippet for the current search,
+    /// computed when the row is first drawn.
+    pub snippets: HashMap<usize, Option<Snippet>>,
 }
 
 impl App {
@@ -208,6 +268,15 @@ impl App {
             show_tools: false,
             show_files: false,
             show_help: false,
+            help_scroll: 0,
+            density: Density::Comfortable,
+            zoom: false,
+            live: HashMap::new(),
+            live_dir: None,
+            confirm_resume: None,
+            trash_dir: None,
+            undo_stack: Vec::new(),
+            snippets: HashMap::new(),
         }
     }
 
@@ -218,6 +287,7 @@ impl App {
         self.preview_cache.clear();
         self.preview_cache_order.clear();
         self.preview_lines.clear();
+        self.preview_search_matches.clear();
         self.preview_session_id.clear();
         self.preview_loading = false;
         self.preview_scroll = 0;
@@ -411,6 +481,22 @@ impl App {
         self.filtered_indices.retain(|&i| keep[i]);
     }
 
+    /// Launched somewhere without sessions of its own (a new repo, /tmp): an
+    /// empty list helps nobody, so show every project instead.
+    pub fn widen_scope_if_empty(&mut self) {
+        if self.scope == Scope::Current
+            && self.filtered_indices.is_empty()
+            && !self.sessions.is_empty()
+        {
+            self.scope = Scope::All;
+            self.rebuild_view();
+            self.set_status(
+                "No sessions for this directory yet — showing all projects (a toggles)"
+                    .to_string(),
+            );
+        }
+    }
+
     pub fn toggle_scope(&mut self) {
         self.scope = match self.scope {
             Scope::Current => Scope::All,
@@ -421,6 +507,7 @@ impl App {
 
     fn apply_search_inner(&mut self) {
         self.exact_matches.clear();
+        self.snippets.clear();
         if self.search_query.is_empty() {
             self.filtered_indices = (0..self.sessions.len()).collect();
             return;
@@ -625,6 +712,11 @@ impl App {
     pub fn apply_search(&mut self) {
         self.search_dirty = false;
         self.rebuild_view();
+        // Still previewing the same session: mark the new words. (Otherwise
+        // the lines belong to another session; its load does this.)
+        if self.selected_session().is_some_and(|s| s.id == self.preview_session_id) {
+            self.refresh_preview_matches(true);
+        }
     }
 
     /// Cycle the sort. Search results cycle relevance → date → … → messages
@@ -771,27 +863,50 @@ impl App {
     }
 
     pub fn update_preview_search(&mut self) {
-        let query_lc = self.preview_search_query.text().to_lowercase();
-        if query_lc.is_empty() {
+        self.refresh_preview_matches(true);
+    }
+
+    /// What the preview highlights and `n`/`N` walk: the find-in-conversation
+    /// query when one is typed, otherwise the words of the session search, so
+    /// a search result opens with its hits marked.
+    pub fn preview_terms(&self) -> Vec<String> {
+        let find = self.preview_search_query.text().to_lowercase();
+        if !find.is_empty() {
+            return vec![find];
+        }
+        self.search_query
+            .text()
+            .to_lowercase()
+            .split_whitespace()
+            .map(String::from)
+            .collect()
+    }
+
+    /// Recompute which preview messages contain a term; with `scroll`, move
+    /// to the first of them.
+    pub fn refresh_preview_matches(&mut self, scroll: bool) {
+        let terms = self.preview_terms();
+        self.preview_search_current = 0;
+        if terms.is_empty() {
             self.preview_search_matches.clear();
-            self.preview_search_current = 0;
             return;
         }
-        let finder = memchr::memmem::Finder::new(query_lc.as_bytes());
+        let finders: Vec<memchr::memmem::Finder> = terms
+            .iter()
+            .map(|t| memchr::memmem::Finder::new(t.as_bytes()))
+            .collect();
         self.preview_search_matches = self
             .preview_lines
             .iter()
             .enumerate()
-            .filter_map(|(i, (_orig, lower, _speaker))| {
-                if finder.find(lower.as_bytes()).is_some() {
-                    Some(i)
-                } else {
-                    None
-                }
+            .filter(|(_, (_orig, lower, _speaker))| {
+                finders.iter().any(|f| f.find(lower.as_bytes()).is_some())
             })
+            .map(|(i, _)| i)
             .collect();
-        self.preview_search_current = 0;
-        self.scroll_to_current_match();
+        if scroll {
+            self.scroll_to_current_match();
+        }
     }
 
     pub fn next_preview_match(&mut self) {
@@ -837,6 +952,10 @@ impl App {
     }
 
     fn scroll_to_current_match(&mut self) {
+        // The files view scrolls its own list, not conversation rows.
+        if self.show_files {
+            return;
+        }
         let line_idx = match self.preview_search_matches.get(self.preview_search_current) {
             Some(&i) => i,
             None => return,
@@ -856,14 +975,10 @@ impl App {
         let Some((_text, lower, _speaker)) = self.preview_lines.get(line_idx) else {
             return 0;
         };
-        let query_lc = self.preview_search_query.text().to_lowercase();
-        if query_lc.is_empty() {
-            return 0;
-        }
-        let finder = memchr::memmem::Finder::new(query_lc.as_bytes());
+        let terms = self.preview_terms();
         crate::ui::message_rows(lower, self.preview_body_width())
             .iter()
-            .position(|row| finder.find(row.as_bytes()).is_some())
+            .position(|row| terms.iter().any(|t| row.contains(t.as_str())))
             .unwrap_or(0)
     }
 
@@ -881,16 +996,42 @@ impl App {
         }
     }
 
-    /// Reset search state without touching focus. Called when the previewed
-    /// session changes: match indices refer to the old conversation's lines.
+    /// Drop the find-in-conversation query without touching focus or the
+    /// scroll position. The session search's words (if any) take over the
+    /// highlighting again.
     pub fn clear_preview_search(&mut self) {
         self.preview_search_query.clear();
-        self.preview_search_matches.clear();
-        self.preview_search_current = 0;
+        self.refresh_preview_matches(false);
     }
 
+    /// A find-in-conversation query is in effect (typed or committed).
     pub fn preview_search_active(&self) -> bool {
-        !self.preview_search_query.is_empty() || !self.preview_search_matches.is_empty()
+        !self.preview_search_query.is_empty()
+    }
+
+    /// Scroll the preview to the next (`forward`) or previous message you
+    /// wrote, so long sessions can be skimmed prompt by prompt.
+    pub fn jump_to_prompt(&mut self, forward: bool) {
+        if self.show_files {
+            return;
+        }
+        let user_rows = self
+            .preview_lines
+            .iter()
+            .zip(&self.preview_line_offsets)
+            .filter(|((_, _, speaker), _)| *speaker == Speaker::User)
+            .map(|(_, &offset)| offset);
+        let user_rows: Vec<usize> = user_rows.collect();
+        let target = if forward {
+            user_rows.iter().copied().find(|&o| o > self.preview_scroll)
+        } else {
+            user_rows.iter().copied().rfind(|&o| o < self.preview_scroll)
+        };
+        match target {
+            Some(row) => self.preview_scroll = row.min(self.max_preview_scroll()),
+            None if forward => self.preview_scroll = self.max_preview_scroll(),
+            None => self.preview_scroll = 0,
+        }
     }
 
     // Status message
@@ -932,15 +1073,29 @@ impl App {
         };
         let id = self.sessions[real_idx].id.clone();
         let path = self.sessions[real_idx].file_path.clone();
-        if let Err(e) = std::fs::remove_file(&path) {
-            self.set_status(format!("Delete failed: {}", e));
-            return;
+        // Into the trash when possible; when it can't take the file (another
+        // disk, no cache dir), delete for good as before.
+        let slot = self
+            .trash_dir
+            .as_ref()
+            .and_then(|root| crate::trash::move_to_trash(&path, root, &id).ok());
+        if slot.is_none() {
+            if let Err(e) = std::fs::remove_file(&path) {
+                self.set_status(format!("Delete failed: {}", e));
+                return;
+            }
+            let companion_dir = path.with_extension("");
+            if companion_dir.is_dir() {
+                std::fs::remove_dir_all(&companion_dir).ok();
+            }
         }
-        let companion_dir = path.with_extension("");
-        if companion_dir.is_dir() {
-            std::fs::remove_dir_all(&companion_dir).ok();
+        let undoable = slot.is_some();
+        let pinned = self.bookmarks.contains(&id);
+        let meta = self.sessions.remove(real_idx);
+        if let Some(slot) = slot {
+            self.undo_stack.push(DeletedSession { meta, pinned, slot });
         }
-        self.sessions.remove(real_idx);
+        self.snippets.clear();
         if real_idx < self.exact_matches.len() {
             self.exact_matches.remove(real_idx);
         }
@@ -955,19 +1110,158 @@ impl App {
         }
         self.preview_scroll = 0;
         self.preview_lines.clear();
+        self.preview_search_matches.clear();
         self.preview_session_id.clear();
         self.preview_loading = false;
         self.recompute_preview_offsets();
         self.preview_cache.remove(&id);
         self.preview_cache_order.retain(|c| c != &id);
         self.cleanup_bookmark_for_deleted(&id);
-        self.set_status("Session deleted".to_string());
+        self.set_status(if undoable {
+            "Session deleted — u undoes".to_string()
+        } else {
+            "Session deleted".to_string()
+        });
+    }
+
+    /// Bring back the most recently deleted session.
+    pub fn undo_delete(&mut self) {
+        let Some(deleted) = self.undo_stack.pop() else {
+            self.set_status("Nothing to undo".to_string());
+            return;
+        };
+        if let Err(e) = crate::trash::restore(&deleted.slot, &deleted.meta.file_path) {
+            self.set_status(format!(
+                "Undo failed: {} (kept in {})",
+                e,
+                deleted.slot.display()
+            ));
+            self.undo_stack.push(deleted);
+            return;
+        }
+        let id = deleted.meta.id.clone();
+        let name = deleted.meta.display_name().to_string();
+        if deleted.pinned {
+            self.bookmarks.insert(id.clone());
+            self.save_bookmarks();
+        }
+        self.sessions.push(deleted.meta);
+        self.view_mode = ViewMode::Normal;
+        self.recompute_view();
+        self.reselect(Some(id));
+        self.set_status(format!("Restored \"{}\"", name));
     }
 
     pub fn cleanup_bookmark_for_deleted(&mut self, id: &str) {
         if self.bookmarks.remove(id) {
             self.save_bookmarks();
         }
+    }
+
+    /// Why session `real_idx` matched the search, when its row doesn't show
+    /// it: the first hit in the conversation text (or a changed file's path)
+    /// for a search word that's not in the name, first message, project,
+    /// branch or "left off" line. Cached until the next search.
+    pub fn snippet(&mut self, real_idx: usize) -> Option<Snippet> {
+        if let Some(cached) = self.snippets.get(&real_idx) {
+            return cached.clone();
+        }
+        let snippet = self.compute_snippet(real_idx);
+        self.snippets.insert(real_idx, snippet.clone());
+        snippet
+    }
+
+    fn compute_snippet(&self, real_idx: usize) -> Option<Snippet> {
+        let s = self.sessions.get(real_idx)?;
+        let phrase = self.search_phrase();
+        if phrase.is_empty() {
+            return None;
+        }
+        let shown = [
+            s.name_lc.as_str(),
+            s.title_lc.as_str(),
+            s.project_lc.as_str(),
+            s.branch_lc.as_str(),
+            &s.last_message.to_lowercase(),
+        ]
+        .join("\n");
+        let hidden: Vec<&str> = phrase
+            .split(' ')
+            .filter(|word| !shown.contains(word))
+            .collect();
+        if hidden.is_empty() {
+            return None;
+        }
+        // Prefer a place where the whole query occurs together.
+        let text = self.text_cache.slice(s.text_offset, s.text_len);
+        for needle in std::iter::once(phrase.as_str()).chain(hidden.iter().copied()) {
+            if let Some(pos) = memchr::memmem::find(text, needle.as_bytes()) {
+                return Some(snippet_around(text, pos));
+            }
+        }
+        hidden.iter().find_map(|word| {
+            s.changed_files.iter().find_map(|f| {
+                let lower = f.to_lowercase();
+                let pos = lower.find(word)?;
+                Some(Snippet {
+                    in_file: true,
+                    hit: lower[..pos].chars().count(),
+                    text: lower,
+                })
+            })
+        })
+    }
+
+    /// Re-read which sessions are open in a running Claude Code. Returns
+    /// whether that changed.
+    pub fn refresh_live(&mut self) -> bool {
+        let Some(dir) = &self.live_dir else {
+            return false;
+        };
+        let live = crate::live::scan(dir);
+        if live == self.live {
+            return false;
+        }
+        self.live = live;
+        true
+    }
+
+    pub fn live_status(&self, s: &SessionMeta) -> Option<crate::live::LiveSession> {
+        self.live.get(&s.id).copied()
+    }
+
+    /// Resume the selected session, or ask first when it's already open in
+    /// another Claude Code: two processes appending to one transcript
+    /// interleave their turns.
+    pub fn request_resume(&mut self, action: AppAction) {
+        let open = self.selected_session().and_then(|s| self.live_status(s));
+        let resumes = matches!(action, AppAction::Launch(_) | AppAction::LaunchDangerously(_));
+        if open.is_some() && resumes {
+            self.confirm_resume = Some(action);
+        } else {
+            self.action = action;
+        }
+    }
+
+    pub fn open_help(&mut self) {
+        self.show_help = true;
+        self.help_scroll = 0;
+    }
+
+    pub fn toggle_density(&mut self) {
+        self.density = match self.density {
+            Density::Comfortable => Density::Compact,
+            Density::Compact => Density::Comfortable,
+        };
+    }
+
+    pub fn toggle_zoom(&mut self) {
+        self.zoom = !self.zoom;
+        self.set_status(if self.zoom {
+            "Zoomed: one pane at a time (Tab switches, z restores)".to_string()
+        } else {
+            "Both panes".to_string()
+        });
     }
 
     fn save_bookmarks(&self) {
@@ -1040,6 +1334,30 @@ pub fn shell_quote(s: &str) -> String {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// The search-text line holding the hit at byte `pos` of `text`, cut to a
+/// few hundred bytes around it, with control characters removed.
+fn snippet_around(text: &[u8], pos: usize) -> Snippet {
+    const REACH: usize = 240;
+    let floor = pos.saturating_sub(REACH);
+    let mut start = memchr::memrchr(b'\n', &text[floor..pos]).map_or(floor, |i| floor + i + 1);
+    let ceil = (pos + REACH).min(text.len());
+    let mut end = memchr::memchr(b'\n', &text[pos..ceil]).map_or(ceil, |i| pos + i);
+    // Never cut a UTF-8 sequence in half.
+    while start < pos && (text[start] & 0xC0) == 0x80 {
+        start += 1;
+    }
+    while end > pos && end < text.len() && (text[end] & 0xC0) == 0x80 {
+        end -= 1;
+    }
+    let before = crate::parser::sanitize_line(&String::from_utf8_lossy(&text[start..pos]));
+    let after = crate::parser::sanitize_line(&String::from_utf8_lossy(&text[pos..end]));
+    Snippet {
+        in_file: false,
+        hit: before.chars().count(),
+        text: format!("{}{}", before, after),
     }
 }
 
@@ -1718,6 +2036,304 @@ mod search_tests {
         app.exit_preview_search();
         assert_eq!(app.focus, Focus::Preview);
         assert!(!app.preview_search_active());
+    }
+
+    fn preview_of(app: &mut App, lines: &[(&str, Speaker)]) {
+        app.preview_inner_width = 60;
+        app.preview_viewport_height = 4;
+        app.preview_lines = lines
+            .iter()
+            .map(|(t, sp)| (t.to_string(), t.to_lowercase(), *sp))
+            .collect();
+        app.recompute_preview_offsets();
+    }
+
+    #[test]
+    fn test_session_search_words_mark_the_preview_and_scroll_to_the_first() {
+        let mut app = three_sessions();
+        preview_of(
+            &mut app,
+            &[
+                ("intro", Speaker::User),
+                ("one\ntwo\nthree", Speaker::Assistant),
+                ("set up Caddy", Speaker::Assistant),
+                ("more", Speaker::User),
+                ("deploy it", Speaker::Assistant),
+                ("tail", Speaker::User),
+            ],
+        );
+        app.search_query = "caddy deploy".into();
+        app.refresh_preview_matches(true);
+        assert_eq!(app.preview_search_matches, vec![2, 4], "any of the words");
+        assert!(app.preview_scroll > 0, "opens at the first hit");
+        assert_eq!(app.preview_scroll, app.preview_line_offsets[2].saturating_sub(2));
+        app.next_preview_match();
+        assert_eq!(app.preview_search_current, 1);
+    }
+
+    #[test]
+    fn test_find_query_takes_over_and_clearing_it_restores_search_words() {
+        let mut app = three_sessions();
+        preview_of(&mut app, &[("caddy", Speaker::User), ("nginx", Speaker::Assistant)]);
+        app.search_query = "caddy".into();
+        app.start_preview_search();
+        app.preview_search_query = "nginx".into();
+        app.update_preview_search();
+        assert_eq!(app.preview_search_matches, vec![1]);
+        assert!(app.preview_search_active());
+        app.exit_preview_search();
+        assert!(!app.preview_search_active());
+        assert_eq!(app.preview_search_matches, vec![0], "back to the session search's hits");
+        assert_eq!(app.focus, Focus::Preview);
+    }
+
+    #[test]
+    fn test_esc_in_preview_with_only_search_hits_returns_to_list() {
+        let mut app = three_sessions();
+        preview_of(&mut app, &[("caddy", Speaker::User)]);
+        app.search_query = "caddy".into();
+        app.refresh_preview_matches(false);
+        app.focus = Focus::Preview;
+        app.handle_esc();
+        assert_eq!(app.focus, Focus::List, "nothing of the preview's own to clear");
+    }
+
+    #[test]
+    fn test_jump_between_prompts() {
+        let mut app = three_sessions();
+        preview_of(
+            &mut app,
+            &[
+                ("q1", Speaker::User),
+                ("a\nb\nc", Speaker::Assistant),
+                ("q2", Speaker::User),
+                ("d\ne\nf\ng\nh", Speaker::Assistant),
+                ("q3", Speaker::User),
+                ("i\nj\nk\nl\nm\nn", Speaker::Assistant),
+            ],
+        );
+        let q2 = app.preview_line_offsets[2];
+        let q3 = app.preview_line_offsets[4];
+        app.jump_to_prompt(true);
+        assert_eq!(app.preview_scroll, q2);
+        app.jump_to_prompt(true);
+        assert_eq!(app.preview_scroll, q3);
+        app.jump_to_prompt(false);
+        assert_eq!(app.preview_scroll, q2);
+        app.jump_to_prompt(false);
+        assert_eq!(app.preview_scroll, 0);
+    }
+
+    fn cache_with(text: &str) -> (tempfile::TempDir, TextCache) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("text.bin");
+        std::fs::write(&path, text).unwrap();
+        let cache = TextCache::open(&path);
+        (dir, cache)
+    }
+
+    #[test]
+    fn test_snippet_shows_hits_the_row_does_not() {
+        let text = "first line\nwe reload caddy after the deploy step\nlast";
+        let (_dir, cache) = cache_with(text);
+        let mut s = make_session("a", "server work", "fix the box", "p", "main", vec![]);
+        s.text_len = text.len() as u32;
+        s.changed_files = vec!["/srv/Caddyfile".into()];
+        let mut app = App::new(vec![s], false, HashSet::new(), cache);
+
+        app.search_query = "caddy".into();
+        app.apply_search();
+        let snip = app.snippet(0).unwrap();
+        assert!(!snip.in_file);
+        assert_eq!(snip.text, "we reload caddy after the deploy step");
+        assert_eq!(&snip.text[snip.hit..snip.hit + 5], "caddy");
+
+        // The whole phrase together is preferred over the first word alone.
+        app.search_query = "the deploy".into();
+        app.apply_search();
+        let snip = app.snippet(0).unwrap();
+        assert_eq!(snip.hit, "we reload caddy after ".len());
+
+        // Visible in the name: nothing to explain.
+        app.search_query = "server".into();
+        app.apply_search();
+        assert_eq!(app.snippet(0), None);
+    }
+
+    #[test]
+    fn test_snippet_falls_back_to_changed_files() {
+        let mut s = make_session("a", "x", "", "p", "main", vec![]);
+        s.changed_files = vec!["/repo/src/Auth.rs".into()];
+        s.changed_files_lc = "/repo/src/auth.rs".into();
+        let mut app = App::new(vec![s], false, HashSet::new(), empty_cache());
+        app.search_query = "auth.rs".into();
+        app.apply_search();
+        let snip = app.snippet(0).unwrap();
+        assert!(snip.in_file);
+        assert_eq!(snip.text, "/repo/src/auth.rs");
+        assert_eq!(snip.hit, "/repo/src/".len());
+    }
+
+    #[test]
+    fn test_snippet_never_splits_a_utf8_char() {
+        let text = format!("{}λογαριασμός caddy", "ά".repeat(200));
+        let (_dir, cache) = cache_with(&text);
+        let mut s = make_session("a", "x", "", "p", "main", vec![]);
+        s.text_len = text.len() as u32;
+        let mut app = App::new(vec![s], false, HashSet::new(), cache);
+        app.search_query = "caddy".into();
+        app.apply_search();
+        let snip = app.snippet(0).unwrap();
+        assert!(snip.text.ends_with("λογαριασμός caddy"));
+        assert_eq!(snip.text.chars().skip(snip.hit).collect::<String>(), "caddy");
+    }
+
+    #[test]
+    fn test_delete_goes_to_trash_and_undo_restores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sessions = Vec::new();
+        for (i, id) in ["a", "b", "c"].iter().enumerate() {
+            let path = dir.path().join(format!("{}.jsonl", id));
+            std::fs::write(&path, "{}\n").unwrap();
+            let mut s = make_session(id, &format!("name {}", id), "", "p", "main", vec![]);
+            s.timestamp = 100 - i as i64;
+            s.file_path = path;
+            sessions.push(s);
+        }
+        let mut bookmarks = HashSet::new();
+        bookmarks.insert("b".to_string());
+        let mut app = App::new(sessions, false, bookmarks, empty_cache());
+        app.trash_dir = Some(dir.path().join("trash"));
+        app.rebuild_view();
+        assert_eq!(selected_id(&app), "b", "pinned first");
+
+        app.delete_selected();
+        assert_eq!(app.sessions.len(), 2);
+        assert!(!dir.path().join("b.jsonl").exists());
+        assert!(!app.bookmarks.contains("b"));
+        assert_eq!(app.active_status(), Some("Session deleted — u undoes"));
+
+        app.move_to_bottom();
+        app.undo_delete();
+        assert_eq!(app.sessions.len(), 3);
+        assert!(dir.path().join("b.jsonl").is_file());
+        assert!(app.bookmarks.contains("b"), "the pin comes back too");
+        assert_eq!(selected_id(&app), "b", "the restored session is selected");
+
+        app.undo_delete();
+        assert_eq!(app.active_status(), Some("Nothing to undo"));
+    }
+
+    #[test]
+    fn test_failed_undo_keeps_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.jsonl");
+        std::fs::write(&path, "{}\n").unwrap();
+        let mut s = make_session("a", "x", "", "p", "main", vec![]);
+        s.file_path = path.clone();
+        let mut app = App::new(vec![s], false, HashSet::new(), empty_cache());
+        app.trash_dir = Some(dir.path().join("trash"));
+        app.delete_selected();
+        std::fs::write(&path, "recreated\n").unwrap();
+        app.undo_delete();
+        assert!(app.active_status().unwrap().starts_with("Undo failed"));
+        assert_eq!(app.undo_stack.len(), 1, "still undoable once the conflict is gone");
+        std::fs::remove_file(&path).unwrap();
+        app.undo_delete();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}\n");
+    }
+
+    #[test]
+    fn test_delete_without_a_usable_trash_still_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.jsonl");
+        std::fs::write(&path, "{}\n").unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, "").unwrap();
+        let mut s = make_session("a", "x", "", "p", "main", vec![]);
+        s.file_path = path.clone();
+        let mut app = App::new(vec![s], false, HashSet::new(), empty_cache());
+        app.trash_dir = Some(blocker.join("trash"));
+        app.delete_selected();
+        assert!(!path.exists());
+        assert!(app.sessions.is_empty());
+        assert_eq!(app.active_status(), Some("Session deleted"), "no undo promised");
+    }
+
+    #[test]
+    fn test_search_moving_to_a_cached_session_opens_it_at_the_top() {
+        let mut app = three_sessions();
+        app.preview_inner_width = 60;
+        app.preview_viewport_height = 3;
+        // Previewing "a", whose hit is far down; "b" is cached with no hit.
+        let filler: Vec<(String, String, Speaker)> = (0..30)
+            .map(|i| (format!("line {}", i), format!("line {}", i), Speaker::Assistant))
+            .collect();
+        let mut a_lines = filler.clone();
+        a_lines.push(("needle".into(), "needle".into(), Speaker::User));
+        app.preview_lines = a_lines;
+        app.preview_session_id = "a".into();
+        app.recompute_preview_offsets();
+        app.cache_preview("b".into(), filler);
+        app.sessions[1].name_lc = "needle".into();
+
+        app.search_query = "needle".into();
+        app.apply_search();
+        crate::preview::request_preview(&mut app);
+        assert_eq!(app.preview_session_id, "b");
+        assert_eq!(app.preview_scroll, 0, "not a's hit position");
+    }
+
+    #[test]
+    fn test_search_hits_do_not_scroll_the_files_view() {
+        let mut app = three_sessions();
+        preview_of(
+            &mut app,
+            &[("a\nb\nc\nd\ne", Speaker::User), ("caddy", Speaker::Assistant)],
+        );
+        app.show_files = true;
+        app.search_query = "caddy".into();
+        app.refresh_preview_matches(true);
+        assert_eq!(app.preview_scroll, 0);
+        app.jump_to_prompt(true);
+        assert_eq!(app.preview_scroll, 0);
+    }
+
+    #[test]
+    fn test_resuming_a_live_session_asks_first() {
+        let mut app = three_sessions();
+        app.live.insert(
+            "a".into(),
+            crate::live::LiveSession { pid: 42, busy: true },
+        );
+        app.request_resume(AppAction::Launch(0));
+        assert_eq!(app.action, AppAction::None);
+        assert_eq!(app.confirm_resume, Some(AppAction::Launch(0)));
+
+        // Forking makes a new session, so it never collides.
+        app.confirm_resume = None;
+        app.request_resume(AppAction::Fork(0));
+        assert_eq!(app.action, AppAction::Fork(0));
+
+        let mut app = three_sessions();
+        app.move_down();
+        app.live.insert("a".into(), crate::live::LiveSession { pid: 42, busy: false });
+        app.request_resume(AppAction::Launch(1));
+        assert_eq!(app.action, AppAction::Launch(1), "only the open one asks");
+    }
+
+    #[test]
+    fn test_empty_current_scope_widens_to_all_projects() {
+        let mut a = make_session("a", "x", "", "p", "main", vec![]);
+        a.cwd = "/elsewhere".into();
+        let mut app = App::new(vec![a], false, HashSet::new(), empty_cache());
+        app.scope_root = Some(PathBuf::from("/Users/me/new-repo"));
+        app.scope = Scope::Current;
+        app.rebuild_view();
+        assert!(app.filtered_indices.is_empty());
+        app.widen_scope_if_empty();
+        assert_eq!(app.scope, Scope::All);
+        assert_eq!(app.filtered_indices.len(), 1);
     }
 
     #[test]

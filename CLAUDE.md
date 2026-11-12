@@ -27,7 +27,7 @@ cargo run -- --all       # run the TUI against all projects
 - The tree is **not** rustfmt-clean (`cargo fmt --check` fails on `main`). Don't run `cargo fmt` over the whole crate in an unrelated change; format only the lines you touch.
 - TUI smoke test without touching the real cache: run in a pty with `HOME=<scratch>` and `CLAUDE_CONFIG_DIR=<scratch>` holding a `projects/<dir>/` with a few `.jsonl` files (e.g. copies of `tests/fixtures/`). Against the real `~/.claude/projects`, the first index build in a fresh `HOME` is slow (a debug build still hadn't drawn after ~20 s).
 
-CLI flags (`src/main.rs`, README): default = sessions for the current project; `--all`/`-a` (every project); `--project X` (substring filter, implies all projects); `--recent 7d` (1h/7d/2w/1m; invalid values exit with an error); `--rebuild-index` (ignore the cache; not in the README); `--print` (emit the picked session ID for `claude --resume $(sessy --print)`; the TUI renders on **stderr** so stdout stays clean, every pick key prints, quitting exits 1); `--purge` (delete sessions < 15 KB older than 2 days, pinned ones kept; respects `--project`/`--recent`). After a resume, sessy exits with claude's exit code.
+CLI flags (`src/main.rs`, README): default = sessions for the current project (all projects when the current one has none); `--all`/`-a` (every project); `--project X` (substring filter, implies all projects); `--recent 7d` (1h/7d/2w/1m; invalid values exit with an error); `--rebuild-index` (ignore the cache; not in the README); `--print` (emit the picked session ID for `claude --resume $(sessy --print)`; the TUI renders on **stderr** so stdout stays clean, every pick key prints, quitting exits 1); `--purge` (delete sessions < 15 KB older than 2 days, pinned ones kept; respects `--project`/`--recent`). After a resume, sessy exits with claude's exit code.
 
 ## Architecture
 
@@ -40,12 +40,14 @@ src/
   clipboard.rs  — Copy (pbcopy / wl-copy / xclip / xsel / copypasta / OSC 52) and open-URL
   index.rs      — Filesystem scanner, bincode cache (<cache>/sessy/index.bin), incremental rebuild
   input.rs      — TextInput: single-line editor with movable cursor (search bars)
+  live.rs       — Sessions open in a running Claude Code (<config>/sessions/<pid>.json, pid liveness via kill(pid, 0))
   parser.rs     — JSONL single-pass scanner; human message detection; conversation extraction (with optional tool lines)
   session.rs    — SessionMeta struct, formatting helpers (duration, file size, size category)
   preview.rs    — Single background preview worker (skips to the newest request) + FIFO cache
   text_cache.rs — mmap'd companion (<cache>/sessy/text.bin) holding searchable conversation text (user + assistant + thinking + tool I/O)
-  config.rs     — Optional ~/.config/sessy/config.toml (scope, sort, show_tool_activity, enter); parse errors surface in the status bar
+  config.rs     — Optional ~/.config/sessy/config.toml (scope, sort, show_tool_activity, enter, density); parse errors surface in the status bar
   bookmarks.rs  — Bookmark persistence (<cache>/sessy/bookmarks.json)
+  trash.rs      — Deleted sessions go to <cache>/sessy/trash/<unix-secs>-<id>/ (undo with `u`; pruned after 7 days)
   export.rs     — Markdown export of session conversations
 ```
 
@@ -68,6 +70,11 @@ src/
 - **Preview line role**: `parser::Speaker` (User/Assistant/Tool/Recap); Tool lines only appear when tool activity is on; the latest recap is pinned as line 0
 - **Preview rendering**: `ui::message_rows` (newline-preserving, display-width wrapping) is the single source of truth for row counts — `recompute_preview_offsets`, match scrolling, and `visible_preview_lines` all call it with `App::preview_body_width()`. Scroll/offsets are `usize` (long sessions exceed 65k rows); only on-screen rows are built each frame
 - **Selection**: search edits reset to the top match; bookmark/scope/size-filter changes and clearing a search keep the selected session (`reselect`). Search runs once per drained event batch (`search_dirty`), so actions that read `selected` from the search input must apply a pending search first
+- **Live sessions**: Claude Code writes `<config>/sessions/<pid>.json` (`pid`, `sessionId` = the transcript's file stem, `status` "busy"/"idle", …) per interactive process. `live::scan` keeps entries whose pid is alive; the event loop rescans every 2 s. Enter/`l` on a live session sets `App.confirm_resume` (only `y` proceeds); `F` (fork) and `p` never ask. `App.live_dir` is `None` in tests
+- **Preview terms**: `App::preview_terms` = the find-in-conversation query when typed, else the session search's words. `refresh_preview_matches` recomputes `preview_search_matches` (messages containing any term) and runs after a search, on preview load (cache hit or worker result) and when the find query changes; match indices must never outlive the lines they index (tool toggle, delete, and loads clear them). `preview_search_active` means an explicit find query only
+- **Snippets**: while searching, comfortable rows whose search words aren't all visible in name/title/project/branch/left-off show `└ match:` (the text-cache line around the first hit, phrase preferred) or `└ file:`. Computed lazily for visible rows, cached in `App.snippets` (keyed by real index; cleared on every search, delete and undo)
+- **Layout**: below `ui::NARROW_WIDTH` (100) columns, or with `z`, only the focused pane is drawn; the hidden preview's geometry is still synced (`sync_preview_geometry`) so match scrolling is right when it appears. Row prefix is 4 columns (selection, pin, live, space); second/third lines indent 4. `Density::Compact` is one row per session; its divider before partial matches takes a row of its own
+- **Delete**: with `App.trash_dir` set (main), deletes move the transcript + companion dir into the trash and push an undo entry (meta + pin); `None` (tests) deletes for good. `--purge` always deletes for good
 - **Stdout hygiene in `--print` mode**: crossterm's kitty-keyboard probe writes its query to stdout when it can't write /dev/tty, so the probe only runs when stdout is a terminal. Anything else that talks to the terminal (OSC 52) goes to /dev/tty
 
 ## Release / publish
@@ -89,6 +96,7 @@ History quirks (don't "fix" them): 0.1.0–0.1.9 and 0.2.0–0.2.2 were publishe
 - No `unwrap()` in non-test code — use `ok()?`, `unwrap_or_default()`, or `unwrap_or_else()`
 - Parallel scanning with rayon, background preview with std::sync::mpsc
 - Status bar keybinding style: Cyan bold key + Rgb(180,180,180) description on Rgb(40,40,40) bg
+- Body text uses the terminal's default foreground (`Style::default()`), never `Color::White`, so light themes stay readable; explicit colors only on explicit backgrounds
 - Size categories: quick <1MB (green), medium 1-10MB (yellow), deep 10-30MB (magenta), massive >30MB (red)
 - Filter out `gitBranch: "HEAD"` — it's noise from detached HEAD states
 - Timeline heatmap uses GitHub-style green color scale

@@ -58,6 +58,7 @@ fn load(req: PreviewRequest) -> PreviewResult {
 pub fn request_preview(app: &mut App) {
     let Some(session) = app.selected_session() else {
         app.preview_lines.clear();
+        app.preview_search_matches.clear();
         app.preview_session_id.clear();
         app.preview_loading = false;
         app.recompute_preview_offsets();
@@ -78,21 +79,25 @@ pub fn request_preview(app: &mut App) {
         recap: session.recap.clone(),
     };
 
-    // Loading a different session: committed search matches point into the
-    // old conversation's lines.
-    app.clear_preview_search();
+    // Loading a different session: a find-in-conversation query (and its
+    // match indices and scroll position) belonged to the old conversation.
+    app.preview_search_query.clear();
+    app.preview_scroll = 0;
 
     if let Some(cached) = app.preview_cache.get(&session_id) {
         app.preview_lines = cached.clone();
         app.preview_session_id = session_id;
         app.preview_loading = false;
         app.recompute_preview_offsets();
+        // While searching, open at the first hit.
+        app.refresh_preview_matches(true);
         return;
     }
 
     app.preview_loading = true;
     app.preview_session_id = session_id;
     app.preview_lines.clear();
+    app.preview_search_matches.clear();
     app.recompute_preview_offsets();
     let _ = app.preview_req_tx.send(request);
 }
@@ -113,6 +118,8 @@ pub fn check_preview_updates(app: &mut App) -> bool {
             app.preview_lines = result.lines;
             app.preview_loading = false;
             app.recompute_preview_offsets();
+            // While searching, open at the first hit.
+            app.refresh_preview_matches(true);
             changed = true;
         }
 

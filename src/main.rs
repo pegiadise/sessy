@@ -1,4 +1,4 @@
-use sessy::{app, bookmarks, config, index, preview, session, text_cache, ui};
+use sessy::{app, bookmarks, config, index, live, preview, session, text_cache, trash, ui};
 use app::{App, AppAction, Focus, Scope, ViewMode};
 use clap::Parser;
 use crossterm::event::{
@@ -64,7 +64,7 @@ fn main() -> io::Result<()> {
         index::load_cached_index()
     };
 
-    let mut idx = index::build_index(cached, cli.rebuild_index);
+    let mut idx = build_index_reporting_progress(cached, cli.rebuild_index);
     idx.sessions.sort_by_key(|s| std::cmp::Reverse(s.timestamp));
 
     // Save index before applying runtime filters
@@ -100,6 +100,11 @@ fn main() -> io::Result<()> {
     let tc = text_cache::TextCache::open(&text_cache::text_cache_path());
     let mut app = App::new(idx.sessions, cli.print, bookmarks, tc);
     app.bookmarks_file = Some(bookmarks::bookmarks_path());
+    app.trash_dir = Some(trash::trash_dir());
+    trash::prune(&trash::trash_dir());
+    app.live_dir = Some(live::sessions_dir());
+    app.refresh_live();
+    app.density = cfg.density();
     app.scope_root = std::env::current_dir().ok().map(|cwd| project_root(&cwd));
     // `--project` names the project explicitly; restricting it further to
     // the launch directory would usually leave nothing.
@@ -112,6 +117,7 @@ fn main() -> io::Result<()> {
     app.show_tools = cfg.show_tool_activity;
     app.enter_yolo = cfg.enter_is_yolo();
     app.rebuild_view(); // apply scope filter + bookmark floating on initial load
+    app.widen_scope_if_empty();
     if let Some(warning) = cfg_warning {
         app.set_status(warning);
     }
@@ -141,6 +147,55 @@ fn main() -> io::Result<()> {
     // Handle post-TUI actions
     let code = handle_post_tui_action(&app);
     std::process::exit(code);
+}
+
+/// Build the index, showing a progress line on stderr when it takes more
+/// than a moment (the first run reads every session file).
+fn build_index_reporting_progress(
+    cached: Option<index::SessionIndex>,
+    rebuild: bool,
+) -> index::SessionIndex {
+    use std::io::{IsTerminal, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let progress = index::Progress::default();
+    let finished = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        if io::stderr().is_terminal() {
+            scope.spawn(|| {
+                let started = Instant::now();
+                let mut last_shown: Option<Instant> = None;
+                // Short naps so a warm start (done in milliseconds) isn't
+                // held up waiting for this thread.
+                while !finished.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(10));
+                    let total = progress.total.load(Ordering::Relaxed);
+                    if total == 0
+                        || started.elapsed() < Duration::from_millis(500)
+                        || last_shown.is_some_and(|t| t.elapsed() < Duration::from_millis(100))
+                    {
+                        continue;
+                    }
+                    let done = progress.done.load(Ordering::Relaxed).min(total);
+                    eprint!(
+                        "\r\x1b[2Ksessy: indexing sessions {}/{} ({}%)",
+                        done,
+                        total,
+                        done * 100 / total
+                    );
+                    let _ = io::stderr().flush();
+                    last_shown = Some(Instant::now());
+                }
+                if last_shown.is_some() {
+                    eprint!("\r\x1b[2K");
+                    let _ = io::stderr().flush();
+                }
+            });
+        }
+        let idx = index::build_index(cached, rebuild, Some(&progress));
+        finished.store(true, Ordering::Relaxed);
+        idx
+    })
 }
 
 /// The directory `Scope::Current` covers: the enclosing git checkout, so
@@ -277,7 +332,7 @@ fn handle_post_tui_action(app: &App) -> i32 {
     };
 
     match app.action {
-        AppAction::Launch(idx) | AppAction::LaunchDangerously(idx) => {
+        AppAction::Launch(idx) | AppAction::LaunchDangerously(idx) | AppAction::Fork(idx) => {
             let Some(session) = resolve(idx) else {
                 return 1;
             };
@@ -294,7 +349,16 @@ fn handle_post_tui_action(app: &App) -> i32 {
             }
             let mut cmd = std::process::Command::new("claude");
             cmd.arg("--resume").arg(&session.id);
-            if matches!(app.action, AppAction::LaunchDangerously(_)) {
+            let yolo = match app.action {
+                AppAction::LaunchDangerously(_) => true,
+                // A fork follows what Enter does.
+                AppAction::Fork(_) => {
+                    cmd.arg("--fork-session");
+                    app.enter_yolo
+                }
+                _ => false,
+            };
+            if yolo {
                 cmd.arg("--dangerously-skip-permissions");
             }
             match cmd.status() {
@@ -328,7 +392,16 @@ fn run_event_loop<B: ratatui::backend::Backend<Error = io::Error>>(
 
     let mut dirty = true;
     let mut last_draw = Instant::now();
+    let mut last_live_scan = Instant::now();
     loop {
+        // Sessions opening and closing elsewhere; a handful of tiny files.
+        if last_live_scan.elapsed() >= Duration::from_secs(2) {
+            last_live_scan = Instant::now();
+            if app.refresh_live() {
+                dirty = true;
+            }
+        }
+
         // Redraw on change, plus a slow tick so the loading indicator and
         // status-message expiry still update when idle.
         if dirty || last_draw.elapsed() >= Duration::from_millis(250) {
@@ -386,9 +459,23 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // The help overlay captures the next keypress to dismiss itself.
+    // Resuming a session that's open elsewhere: only `y` goes ahead.
+    if let Some(action) = app.confirm_resume.take() {
+        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+            app.action = action;
+        }
+        return;
+    }
+
+    // The help overlay scrolls with the movement keys; anything else closes it.
     if app.show_help {
-        app.show_help = false;
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => app.help_scroll += 1,
+            KeyCode::Up | KeyCode::Char('k') => app.help_scroll = app.help_scroll.saturating_sub(1),
+            KeyCode::PageDown | KeyCode::Char(' ') => app.help_scroll += 10,
+            KeyCode::PageUp => app.help_scroll = app.help_scroll.saturating_sub(10),
+            _ => app.show_help = false,
+        }
         return;
     }
 
@@ -429,9 +516,10 @@ fn is_paste_key(key: &KeyEvent) -> bool {
 fn handle_paste(app: &mut App, text: &str) {
     // An open prompt takes the paste as its next input, like any key: it
     // isn't `y`, so a pending delete is cancelled.
-    if app.confirm_delete || app.show_help {
+    if app.confirm_delete || app.show_help || app.confirm_resume.is_some() {
         app.confirm_delete = false;
         app.show_help = false;
+        app.confirm_resume = None;
         return;
     }
     match app.focus {
@@ -601,17 +689,47 @@ fn handle_preview_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('/') => app.start_preview_search(),
         KeyCode::Char('n') => app.next_preview_match(),
         KeyCode::Char('N') => app.prev_preview_match(),
+        KeyCode::Char(']') => app.jump_to_prompt(true),
+        KeyCode::Char('[') => app.jump_to_prompt(false),
+        KeyCode::Char('z') => app.toggle_zoom(),
+        // Right after committing a find, Enter means "next hit" (as in a
+        // browser's find bar), never an accidental resume.
+        KeyCode::Enter if app.preview_search_active() => app.next_preview_match(),
+        // Otherwise picking from the preview works like picking from the list.
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Char('p') | KeyCode::Char('F') => {
+            pick_selected(app, key.code)
+        }
         KeyCode::Char('T') => {
             app.toggle_tools();
             preview::request_preview(app);
         }
         KeyCode::Char('f') => app.toggle_files(),
-        KeyCode::Char('?') => app.show_help = true,
+        KeyCode::Char('?') => app.open_help(),
         KeyCode::Char('q') => {
             app.action = AppAction::Quit;
         }
         _ => {}
     }
+}
+
+/// The "pick this session" keys, from the list or the preview: Enter
+/// resumes as configured, `l` with normal permissions, `F` as a fork, `p`
+/// prints the ID. In --print mode every one of them prints: launching
+/// claude inside `$(sessy --print)` would capture its output.
+fn pick_selected(app: &mut App, code: KeyCode) {
+    if app.selected_session().is_none() {
+        return;
+    }
+    let idx = app.selected;
+    let action = match code {
+        _ if app.print_mode => AppAction::Print(idx),
+        KeyCode::Enter if app.enter_yolo => AppAction::LaunchDangerously(idx),
+        KeyCode::Enter | KeyCode::Char('l') => AppAction::Launch(idx),
+        KeyCode::Char('F') => AppAction::Fork(idx),
+        KeyCode::Char('p') => AppAction::Print(idx),
+        _ => return,
+    };
+    app.request_resume(action);
 }
 
 fn handle_list_key(app: &mut App, key: KeyEvent) {
@@ -633,7 +751,7 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
     if app.view_mode == ViewMode::Timeline {
         match key.code {
             KeyCode::Char('t') | KeyCode::Esc => app.handle_esc(),
-            KeyCode::Char('?') => app.show_help = true,
+            KeyCode::Char('?') => app.open_help(),
             KeyCode::Char('q') => {
                 app.action = AppAction::Quit;
             }
@@ -658,9 +776,7 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
             app.toggle_scope();
             preview::request_preview(app);
         }
-        KeyCode::Char('?') => {
-            app.show_help = true;
-        }
+        KeyCode::Char('?') => app.open_help(),
         KeyCode::Tab | KeyCode::BackTab | KeyCode::Right => {
             app.focus = Focus::Preview;
         }
@@ -688,24 +804,17 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
             app.move_to_bottom();
             preview::request_preview(app);
         }
-        // In --print mode every "pick this one" key prints: launching claude
-        // inside `$(sessy --print)` would capture its output.
-        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Char('p') if has_selection && app.print_mode => {
-            app.action = AppAction::Print(app.selected);
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Char('p') | KeyCode::Char('F')
+            if has_selection =>
+        {
+            pick_selected(app, key.code)
         }
-        KeyCode::Enter if has_selection => {
-            app.action = if app.enter_yolo {
-                AppAction::LaunchDangerously(app.selected)
-            } else {
-                AppAction::Launch(app.selected)
-            };
+        KeyCode::Char('u') => {
+            app.undo_delete();
+            preview::request_preview(app);
         }
-        KeyCode::Char('l') if has_selection => {
-            app.action = AppAction::Launch(app.selected);
-        }
-        KeyCode::Char('p') if has_selection => {
-            app.action = AppAction::Print(app.selected);
-        }
+        KeyCode::Char('v') => app.toggle_density(),
+        KeyCode::Char('z') => app.toggle_zoom(),
         KeyCode::Char('c') => app.copy_selected(),
         KeyCode::Char('o') => app.open_pr(),
         KeyCode::Char('r') => app.start_rename(),
@@ -880,6 +989,85 @@ mod tests {
         app.enter_yolo = false;
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.action, AppAction::Launch(0));
+    }
+
+    #[test]
+    fn resuming_an_open_session_needs_a_y() {
+        let mut app = app_with(&["a", "b"]);
+        app.live.insert("a".into(), sessy::live::LiveSession { pid: 7, busy: false });
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.action, AppAction::None);
+        assert!(app.confirm_resume.is_some());
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.confirm_resume.is_none(), "any other key cancels");
+        assert_eq!(app.action, AppAction::None);
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.action, AppAction::LaunchDangerously(0));
+    }
+
+    #[test]
+    fn f_forks_and_preview_enter_resumes() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('F'));
+        assert_eq!(app.action, AppAction::Fork(0));
+
+        let mut app = app_with(&["a"]);
+        app.focus = Focus::Preview;
+        app.enter_yolo = false;
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.action, AppAction::Launch(0));
+
+        let mut app = app_with(&["a"]);
+        app.print_mode = true;
+        press(&mut app, KeyCode::Char('F'));
+        assert_eq!(app.action, AppAction::Print(0), "--print only ever prints");
+    }
+
+    #[test]
+    fn enter_after_committing_a_find_goes_to_the_next_hit() {
+        let mut app = app_with(&["a"]);
+        app.focus = Focus::Preview;
+        app.preview_lines = vec![
+            ("hit".into(), "hit".into(), sessy::parser::Speaker::User),
+            ("hit".into(), "hit".into(), sessy::parser::Speaker::User),
+        ];
+        press(&mut app, KeyCode::Char('/'));
+        for c in "hit".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter); // commit
+        press(&mut app, KeyCode::Enter); // next hit, not a resume
+        assert_eq!(app.action, AppAction::None);
+        assert_eq!(app.preview_search_current, 1);
+    }
+
+    #[test]
+    fn help_scrolls_with_movement_keys() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('?'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Down);
+        assert!(app.show_help, "movement keys keep it open");
+        assert_eq!(app.help_scroll, 2);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.help_scroll, 1);
+        press(&mut app, KeyCode::Char('x'));
+        assert!(!app.show_help);
+        press(&mut app, KeyCode::Char('?'));
+        assert_eq!(app.help_scroll, 0, "reopens at the top");
+    }
+
+    #[test]
+    fn density_and_zoom_toggle_from_the_list() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.density, app::Density::Compact);
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.density, app::Density::Comfortable);
+        press(&mut app, KeyCode::Char('z'));
+        assert!(app.zoom);
     }
 
     #[test]

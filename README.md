@@ -51,6 +51,7 @@ Press `?` in the app for the full list.
 | `PgUp` / `PgDn` | Page (also `Ctrl+U` / `Ctrl+D`) |
 | `Enter` | Resume with `--dangerously-skip-permissions` (yolo mode; see `enter` in [Config](#config)) |
 | `l` | Resume with normal permissions |
+| `F` | Resume as a fork (`--fork-session`: a new session ID, the original stays as it was; permissions follow `Enter`) |
 | `c` | Copy a ready-to-run `cd <dir> && claude --resume <id>` command (stays open) |
 | `p` | Print session ID to stdout and exit |
 | `/` | Search (title, name, project, branch, changed files, tickets/PR numbers, full conversation text). Exact matches (the whole query as whole words; a `/` doesn't end a word, so part of a longer URL or path is partial) come first with the match highlighted; partial matches follow below a divider |
@@ -63,6 +64,9 @@ Press `?` in the app for the full list.
 | `o` | Open the pull request linked to the session |
 | `e` | Export session as markdown |
 | `d` | Delete session (confirm with `y`) |
+| `u` | Undo the last delete |
+| `v` | Toggle compact rows (one line per session) |
+| `z` | Zoom: show one pane at a time, full width (`Tab` switches) |
 | `t` | Toggle timeline heatmap view |
 | `f` | Show files changed in the selected session |
 | `T` | Toggle tool-use activity in the preview |
@@ -86,7 +90,10 @@ Type to filter; `↑` / `↓` move through the results without leaving the input
 | `j` / `k` or `↑` / `↓` | Scroll |
 | `PgUp` / `PgDn` / `Space` | Page (also `Ctrl+U` / `Ctrl+D`) |
 | `g` / `G` | Top / end of the conversation |
+| `[` / `]` | Previous / next message you wrote |
 | `/` | Search within the conversation; `Enter` keeps the matches, `n` / `N` jump between them |
+| `n` / `N` | While a session search is active: next / previous hit of its words |
+| `Enter` / `l` / `F` / `p` | Resume, fork or print, as in the list (while a find is active, `Enter` goes to the next hit instead) |
 | `T` / `f` | Tool activity / changed files |
 | `Tab` / `←` / `Esc` | Back to the list (`Esc` first clears an active search) |
 
@@ -95,14 +102,20 @@ Type to filter; `↑` / `↓` move through the results without leaving the input
 Each session shows three lines:
 
 ```
-▸★ Jun 10 14:32  my-app  feat/auth  Add JWT login endpoint
-   1h45m  4.2 MB [medium] · 42 msgs · PR #128  "add login endpoint with JWT"
-   └ left off: "looks good, ship it"
+▸★● today 14:32   my-app  feat/auth  Add JWT login endpoint
+    1h45m  4.2 MB [medium] · 42 msgs · PR #128  "add login endpoint with JWT"
+    └ left off: "looks good, ship it"
 ```
 
-- **Line 1**: Selection/pin indicator, timestamp, project, branch, session name
+- **Line 1**: Selection, pin and live indicators, when it was last active (`today 14:32`, a weekday for the past week, then the date), project, branch, session name
 - **Line 2**: Duration, file size with color-coded category, message count, linked PR, first message
-- **Line 3**: Last message you sent — where you left off
+- **Line 3**: Last message you sent — where you left off. While searching, results whose hit isn't visible in the row show it here instead: `└ match: …the text around the hit…` (or `└ file:` for a changed file's path)
+
+`●` marks a session that's open in a running Claude Code right now (yellow while Claude is working; macOS and Linux). Resuming one asks first: two Claude Code processes on one session interleave their turns. `F` (fork) never asks.
+
+Press `v` for compact rows (one line per session, about four times as many on screen), or set `density = "compact"`.
+
+Terminals narrower than 100 columns show one pane at a time, full width; `Tab` switches between the list and the preview. `z` does the same at any width.
 
 The session name prefers an explicit `/rename` value, falling back to Claude Code's AI-generated title or the session slug. Messages count what you typed: slash commands with arguments and messages with pasted images count; tool results, compaction summaries, background-task notifications and messages from other sessions don't.
 
@@ -125,6 +138,8 @@ Scrollable conversation showing `USER:` and `ASST:` messages with their paragrap
 
 - Press `T` to fold tool-use activity into the preview (`TOOL:` lines summarising each Edit/Bash/etc. call).
 - Press `f` to list the files the session changed.
+- While a session search is active, the preview marks its words and opens at the first hit; `n`/`N` walk the hits. When the hits are only in text the preview doesn't show (tool output, thinking), the pane says so.
+- Press `[` / `]` to jump between the messages you wrote.
 - Press `/` while in the preview pane to search within the conversation. Matching messages are highlighted; `Enter` commits the search so `n`/`N` jump between matches, `Esc` clears it.
 
 ## Export
@@ -140,14 +155,19 @@ scope = "current"          # "current" (this project) or "all" (every project)
 sort = "date"              # date | size | duration | messages
 show_tool_activity = false # start with tool-use lines shown in the preview
 enter = "yolo"             # "yolo" (--dangerously-skip-permissions) or "safe"
+density = "comfortable"    # "comfortable" (three lines per session) or "compact" (one)
 ```
 
-A missing file means defaults; a malformed one also falls back to defaults, with the parse error shown in the status bar at startup. `--all` and `--project` override `scope`.
+A missing file means defaults; a malformed one also falls back to defaults, with the parse error shown in the status bar at startup. `--all` and `--project` override `scope`. Launched in a directory with no sessions of its own, sessy shows all projects.
+
+## Delete and undo
+
+`d` then `y` deletes a session; `u` brings it back while sessy is still open. Deleted sessions are kept in sessy's cache folder (`trash/`) for 7 days before they're removed for good. `--purge` deletes permanently.
 
 ## Performance
 
 - **Warm start** (cached index): < 100 ms
-- **Cold start** (first run): a couple of seconds for a few thousand files
+- **Cold start** (first run): a few seconds for a few thousand files, with a progress line while it indexes
 - Incremental index updates — only changed files are re-scanned; unchanged sessions reuse their cached text
 - Parallel scanning with rayon; the preview renders only the rows on screen, so huge sessions stay smooth
 
@@ -155,7 +175,9 @@ A missing file means defaults; a malformed one also falls back to defaults, with
 
 Reads JSONL session files from `~/.claude/projects/`. A single-pass scanner extracts per-session metadata — title, branch, slug, cwd, custom and AI titles, permission mode, skills, changed files, linked PRs, recap, tickets, message count, the "left off" message, and the full conversation text used for search (user + assistant messages, thinking, tool inputs and outputs) — into a cached index (`~/.cache/sessy/index.bin`), with the searchable text stored in an mmap'd companion (`~/.cache/sessy/text.bin`). Full conversations are only parsed when you open a preview.
 
-Bookmarks are persisted at `~/.cache/sessy/bookmarks.json`.
+Bookmarks are persisted at `~/.cache/sessy/bookmarks.json`. On macOS the cache folder is `~/Library/Caches/sessy/`.
+
+Live sessions come from the files Claude Code keeps for each running process in `~/.claude/sessions/`.
 
 ## License
 

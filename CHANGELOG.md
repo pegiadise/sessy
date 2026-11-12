@@ -4,6 +4,32 @@ All notable changes to sessy. The format follows [Keep a Changelog](https://keep
 
 Each version's section doubles as its GitHub release notes (`scripts/release-notes.sh vX.Y.Z`).
 
+## [Unreleased]
+
+### Added
+
+- Sessions open in a running Claude Code are marked `●` (yellow while Claude is working; macOS and Linux), and the preview title says so. Resuming one asks first, since two Claude Code processes on one session interleave their turns.
+- While searching, the preview marks the search words and opens at the first hit; `n`/`N` walk the hits. If the hits are only in text the preview doesn't show (tool output, thinking), its title says so.
+- Search results whose hit isn't visible in the row show it on the row's third line: `└ match: …text around the hit…`, or `└ file:` for a changed file's path.
+- `v` toggles compact rows, one line per session (config `density = "compact"`).
+- `F` resumes a session as a fork (`--fork-session`), leaving the original untouched.
+- `u` undoes the last delete. Deleted sessions are kept in sessy's cache folder for 7 days (when it's on another disk than the sessions, deletes are permanent as before).
+- `[` / `]` jump between the messages you wrote in the preview; `Enter`, `l`, `F` and `p` work from the preview as in the list (while a find is active, `Enter` goes to the next hit).
+- `z` zooms to one pane at a time, full width.
+- A progress line while the index builds (the first run reads every session).
+
+### Changed
+
+- Terminals narrower than 100 columns show one pane at a time, full width; `Tab` switches.
+- Timestamps read `today 14:32`, a weekday for the past week, then the date; older years show the year.
+- Launched in a directory with no sessions of its own, sessy shows all projects instead of an empty list.
+
+### Fixed
+
+- The help screen was cut off on short terminals; it scrolls now.
+- On narrow panes a session's stats line was clipped mid-word; it now drops the size tag, PR badge and message count, in that order, to fit.
+- List and preview text was set to white, which is unreadable on light terminal themes; it uses the terminal's own text color now.
+
 ## [1.5.0] - 2026-10-22
 
 ### Changed
@@ -166,6 +192,7 @@ Covers 0.2.0 – 0.2.3.
 
 First release (0.1.0 – 0.1.10): a two-pane TUI to browse, search, preview, and resume Claude Code sessions.
 
+[Unreleased]: https://github.com/pegiadise/sessy/compare/v1.5.0...HEAD
 [1.5.0]: https://github.com/pegiadise/sessy/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/pegiadise/sessy/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/pegiadise/sessy/compare/v1.2.0...v1.3.0
