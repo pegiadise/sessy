@@ -749,9 +749,18 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // In timeline view, only allow t/Esc/q/?
+    // Timeline: the arrows pick a day (columns are weeks, rows weekdays),
+    // Enter lists its sessions.
     if app.view_mode == ViewMode::Timeline {
         match key.code {
+            KeyCode::Left | KeyCode::Char('h') => app.timeline_move(-7),
+            KeyCode::Right | KeyCode::Char('l') => app.timeline_move(7),
+            KeyCode::Up | KeyCode::Char('k') => app.timeline_move(-1),
+            KeyCode::Down | KeyCode::Char('j') => app.timeline_move(1),
+            KeyCode::Enter => {
+                app.pick_timeline_day();
+                preview::request_preview(app);
+            }
             KeyCode::Char('t') | KeyCode::Esc => app.handle_esc(),
             KeyCode::Char('?') => app.open_help(),
             KeyCode::Char('q') => {

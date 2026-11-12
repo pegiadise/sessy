@@ -212,6 +212,12 @@ pub struct App {
     /// Per session (real index): the hit snippet for the current search,
     /// computed when the row is first drawn.
     pub snippets: HashMap<usize, Option<Snippet>>,
+    /// The timeline's selected day (`None`: today).
+    pub timeline_day: Option<chrono::NaiveDate>,
+    /// First day the timeline shows (set by the renderer each frame).
+    pub timeline_start: Option<chrono::NaiveDate>,
+    /// Where each timeline day was drawn, for mouse clicks: (x, y, day).
+    pub timeline_cells: Vec<(u16, u16, chrono::NaiveDate)>,
 }
 
 impl App {
@@ -277,6 +283,9 @@ impl App {
             trash_dir: None,
             undo_stack: Vec::new(),
             snippets: HashMap::new(),
+            timeline_day: None,
+            timeline_start: None,
+            timeline_cells: Vec::new(),
         }
     }
 
@@ -866,6 +875,37 @@ impl App {
             }
             Err(e) => self.set_status(format!("Rename failed: {}", e)),
         }
+    }
+
+    /// The timeline's selected day.
+    pub fn timeline_selected(&self) -> chrono::NaiveDate {
+        self.timeline_day
+            .unwrap_or_else(|| chrono::Local::now().date_naive())
+    }
+
+    /// Move the timeline cursor by `days`, staying between the first day
+    /// shown and today.
+    pub fn timeline_move(&mut self, days: i64) {
+        let today = chrono::Local::now().date_naive();
+        let mut day = self.timeline_selected() + chrono::Duration::days(days);
+        if day > today {
+            day = today;
+        }
+        if let Some(start) = self.timeline_start {
+            if day < start {
+                day = start;
+            }
+        }
+        self.timeline_day = Some(day);
+    }
+
+    /// List the sessions of the timeline's selected day (an `on:` search).
+    pub fn pick_timeline_day(&mut self) {
+        let day = self.timeline_selected();
+        self.search_query = TextInput::from(format!("on:{}", day.format("%Y-%m-%d")).as_str());
+        self.view_mode = ViewMode::Normal;
+        self.focus = Focus::List;
+        self.apply_search();
     }
 
     pub fn toggle_timeline(&mut self) {

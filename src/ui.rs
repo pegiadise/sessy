@@ -608,7 +608,7 @@ fn pr_badge(s: &SessionMeta) -> Option<String> {
     }
 }
 
-fn draw_timeline(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -627,6 +627,13 @@ fn draw_timeline(frame: &mut Frame, app: &App, area: Rect) {
     let days_since_monday = today.weekday().num_days_from_monday();
     let this_monday = today - chrono::Duration::days(days_since_monday as i64);
     let start_date = this_monday - chrono::Duration::weeks(num_weeks as i64 - 1);
+    app.timeline_start = Some(start_date);
+    // A selection that scrolled out of view (narrower pane) snaps back in.
+    if app.timeline_selected() < start_date {
+        app.timeline_day = Some(start_date);
+    }
+    let selected = app.timeline_selected();
+    app.timeline_cells.clear();
 
     // Count sessions per date, honoring the current scope so the heatmap
     // matches the list.
@@ -679,14 +686,40 @@ fn draw_timeline(frame: &mut Frame, app: &App, area: Rect) {
             }
             let count = counts.get(&date).copied().unwrap_or(0);
             let (ch, color) = heatmap_cell(count);
-            spans.push(Span::styled(
-                format!("{} ", ch),
-                Style::default().fg(color),
-            ));
+            let x = inner.x + 4 + (w as u16) * 2;
+            let y = inner.y + 1 + day_idx as u16;
+            app.timeline_cells.push((x, y, date));
+            if date == selected {
+                spans.push(Span::styled(
+                    ch.to_string(),
+                    Style::default().fg(color).bg(Color::Cyan),
+                ));
+                spans.push(Span::raw(" "));
+            } else {
+                spans.push(Span::styled(format!("{} ", ch), Style::default().fg(color)));
+            }
         }
 
         lines.push(Line::from(spans));
     }
+
+    // The selected day
+    lines.push(Line::from(""));
+    let picked = counts.get(&selected).copied().unwrap_or(0);
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("  {}", selected.format("%a %b %e %Y")),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(match picked {
+            1 => " · 1 session".to_string(),
+            n => format!(" · {} sessions", n),
+        }),
+        Span::styled(
+            if picked > 0 { "  Enter lists them" } else { "" },
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
 
     // Summary below
     lines.push(Line::from(""));
@@ -1149,9 +1182,12 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 ("Tab", "list"),
                 ("?", "help"),
             ],
-            Focus::List if app.view_mode == ViewMode::Timeline => {
-                vec![("t Esc", "back to list"), ("q", "quit")]
-            }
+            Focus::List if app.view_mode == ViewMode::Timeline => vec![
+                ("←→ ↑↓", "pick a day"),
+                ("Enter", "list its sessions"),
+                ("t Esc", "back to list"),
+                ("q", "quit"),
+            ],
             Focus::List => vec![
                 ("↑↓", "move"),
                 ("Enter", enter),
@@ -1271,7 +1307,7 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &mut App) {
                 ("e", "export as markdown"),
                 ("d  u", "delete / undo the last delete"),
                 ("v", "compact / comfortable rows"),
-                ("t", "activity timeline"),
+                ("t", "timeline: arrows pick a day, Enter lists it"),
                 ("●", "open in a running Claude Code (yellow: working)"),
             ],
         ),
@@ -1837,6 +1873,49 @@ mod tests {
         app.confirm_delete = true;
         let screen = render(&mut app, 140, 20);
         assert!(screen.lines().last().unwrap().contains("DELETE"));
+    }
+
+    #[test]
+    fn test_timeline_picks_a_day_and_lists_it() {
+        use chrono::TimeZone;
+        let mut app = sessions(3);
+        let today = chrono::Local::now().date_naive();
+        let at = |d: chrono::NaiveDate, h| {
+            chrono::Local
+                .from_local_datetime(&d.and_hms_opt(h, 0, 0).unwrap())
+                .earliest()
+                .unwrap()
+                .timestamp()
+        };
+        let yesterday = today.pred_opt().unwrap();
+        app.sessions[0].timestamp = at(today, 9);
+        app.sessions[1].timestamp = at(yesterday, 9);
+        app.sessions[2].timestamp = at(yesterday, 15);
+        app.rebuild_view();
+        app.view_mode = ViewMode::Timeline;
+
+        let screen = render(&mut app, 140, 30);
+        assert!(screen.contains(&today.format("%a %b %e %Y").to_string()));
+        assert!(screen.contains("1 session"), "today's count");
+        app.timeline_move(7);
+        assert_eq!(app.timeline_selected(), today, "never past today");
+        app.timeline_move(-1);
+        let screen = render(&mut app, 140, 30);
+        assert!(screen.contains("2 sessions  Enter lists them"));
+        assert!(app.timeline_cells.iter().any(|&(_, _, d)| d == yesterday));
+
+        app.pick_timeline_day();
+        assert_eq!(app.view_mode, ViewMode::Normal);
+        assert_eq!(app.search_query.text(), format!("on:{}", yesterday.format("%Y-%m-%d")));
+        let shown: Vec<&str> = app
+            .filtered_indices
+            .iter()
+            .map(|&i| app.sessions[i].id.as_str())
+            .collect();
+        assert_eq!(shown, vec!["id2", "id1"], "that day only, newest first");
+
+        app.timeline_move(-10_000);
+        assert_eq!(app.timeline_selected(), app.timeline_start.unwrap(), "clamped to the grid");
     }
 
     #[test]
