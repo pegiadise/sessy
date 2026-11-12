@@ -8,7 +8,10 @@ use std::sync::OnceLock;
 fn ticket_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"\b[A-Z][A-Z0-9]{1,9}-\d{1,7}\b|(?:^|[^A-Za-z0-9_])#\d{1,7}\b").unwrap()
+        // ASCII word boundaries: Unicode `\b` sends every line with a
+        // non-ASCII char to the slow engine (seconds on a big transcript).
+        Regex::new(r"(?-u:\b)[A-Z][A-Z0-9]{1,9}-\d{1,7}(?-u:\b)|(?:^|[^A-Za-z0-9_])#\d{1,7}(?-u:\b)")
+            .unwrap()
     })
 }
 
@@ -90,8 +93,13 @@ fn flag(entry: &Value, key: &str) -> bool {
 /// summaries, messages from other sessions or background tasks, interrupt
 /// markers, and command noise. Handles both content forms — a plain string,
 /// and a block array (text + pasted images). A slash command typed with
-/// arguments counts as a human turn ("/loop fix the tests").
+/// arguments counts as a human turn ("/loop fix the tests"). A prompt typed
+/// while Claude was busy is stored as a queued-command attachment instead,
+/// and counts too.
 pub fn human_text(entry: &Value) -> Option<String> {
+    if let Some(prompt) = queued_prompt(entry) {
+        return typed_text(prompt);
+    }
     if entry.get("type").and_then(|t| t.as_str()) != Some("user")
         || flag(entry, "isMeta")
         || flag(entry, "isCompactSummary")
@@ -110,17 +118,52 @@ pub fn human_text(entry: &Value) -> Option<String> {
             return None;
         }
     }
-    let content = entry.get("message")?.get("content")?;
+    typed_text(entry.get("message")?.get("content")?)
+}
+
+/// The `prompt` of a queued-command attachment the person typed (Claude
+/// Code stores prompts sent while it's busy this way, often never as a
+/// `type:"user"` turn). Not task notifications or messages from other
+/// sessions, which are queued the same way.
+fn queued_prompt(entry: &Value) -> Option<&Value> {
+    if entry.get("type").and_then(|t| t.as_str()) != Some("attachment") {
+        return None;
+    }
+    let attachment = entry.get("attachment")?;
+    if attachment.get("type").and_then(|t| t.as_str()) != Some("queued_command")
+        || attachment.get("commandMode").and_then(|m| m.as_str()) != Some("prompt")
+    {
+        return None;
+    }
+    let origin = attachment
+        .get("origin")
+        .and_then(|o| o.get("kind"))
+        .and_then(|k| k.as_str());
+    if origin.is_some_and(|kind| kind != "human") {
+        return None;
+    }
+    attachment.get("prompt")
+}
+
+/// What a person typed, from message content (a string, or text and image
+/// blocks). Blocks the client injects (IDE context, reminders) are skipped,
+/// so they don't become the title or hide the words after them.
+fn typed_text(content: &Value) -> Option<String> {
     let text = match content {
         Value::String(s) => s.trim().to_string(),
         Value::Array(blocks) => {
             let mut parts: Vec<&str> = Vec::new();
+            let mut noise: Option<&str> = None;
             let mut has_image = false;
             for block in blocks {
                 match block.get("type").and_then(|t| t.as_str()) {
                     Some("text") => {
                         if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
-                            parts.push(t);
+                            if is_command_noise(t) || is_injected_context(t) {
+                                noise.get_or_insert(t);
+                            } else {
+                                parts.push(t);
+                            }
                         }
                     }
                     Some("image") => has_image = true,
@@ -129,10 +172,11 @@ pub fn human_text(entry: &Value) -> Option<String> {
                 }
             }
             let joined = parts.join("\n").trim().to_string();
-            if joined.is_empty() && has_image {
-                "[Image]".to_string()
-            } else {
-                joined
+            match (joined.is_empty(), has_image, noise) {
+                (false, _, _) => joined,
+                (true, true, _) => "[Image]".to_string(),
+                (true, false, Some(noise)) => return command_invocation(noise),
+                (true, false, None) => return None,
             }
         }
         _ => return None,
@@ -144,6 +188,30 @@ pub fn human_text(entry: &Value) -> Option<String> {
         return command_invocation(&text);
     }
     Some(text)
+}
+
+/// A block the editor integration adds to a typed turn (`<ide_opened_file>`,
+/// `<ide_selection>`, …).
+fn is_injected_context(text: &str) -> bool {
+    text.trim_start().starts_with("<ide_")
+}
+
+/// Prompts typed while Claude was busy are logged as queued-command
+/// attachments; a few also come back as a `type:"user"` turn later. This
+/// counts each prompt once.
+#[derive(Default)]
+struct QueuedPrompts(std::collections::HashSet<String>);
+
+impl QueuedPrompts {
+    /// Whether `text`, typed in `entry`, is a prompt not seen before.
+    fn is_new(&mut self, entry: &Value, text: &str) -> bool {
+        if queued_prompt(entry).is_some() {
+            self.0.insert(text.to_string());
+            true
+        } else {
+            !self.0.remove(text)
+        }
+    }
 }
 
 /// Machine-generated content stored as `type:"user"` turns — slash-command
@@ -289,17 +357,47 @@ fn push_search_text(out: &mut String, text: &str) {
 /// text: user messages (string or block form), assistant text and thinking,
 /// tool-use string inputs (commands, paths, …), and tool-result output.
 /// Command noise is filtered (a slash command's arguments are kept); images
-/// and JSON structure are not indexed.
-fn append_searchable_text(entry: &Value, out: &mut String) {
+/// and JSON structure are not indexed. Ticket IDs are read from the
+/// text as written (not the raw JSON line, where "\nPROJ-1" reads as
+/// "nPROJ-1" and the system prompt adds noise) and from the branch name.
+fn index_entry_text(
+    entry: &Value,
+    out: &mut String,
+    tickets: &mut std::collections::HashSet<String>,
+) {
+    for_each_search_piece(entry, &mut |piece| {
+        extract_tickets_into(piece, tickets);
+        push_search_text(out, piece);
+    });
+}
+
+/// The pieces of an entry's text the search text is made of, as written:
+/// each is trimmed, lowercased and ended with a newline there.
+pub fn for_each_search_piece(entry: &Value, f: &mut dyn FnMut(&str)) {
+    if let Some(prompt) = queued_prompt(entry) {
+        if let Some(text) = typed_text(prompt) {
+            f(&text);
+        }
+        return;
+    }
+    // Only the conversation: not the system prompt, tool listings and
+    // CLAUDE.md that Claude Code also logs (`api-request-blob`), which would
+    // make every session match words like "docx".
+    if !matches!(
+        entry.get("type").and_then(|t| t.as_str()),
+        Some("user" | "assistant")
+    ) {
+        return;
+    }
     let Some(content) = entry.get("message").and_then(|m| m.get("content")) else {
         return;
     };
     match content {
         Value::String(s) => {
             if !is_command_noise(s) {
-                push_search_text(out, s);
+                f(s);
             } else if let Some(cmd) = command_invocation(s) {
-                push_search_text(out, &cmd);
+                f(&cmd);
             }
         }
         Value::Array(blocks) => {
@@ -308,30 +406,30 @@ fn append_searchable_text(entry: &Value, out: &mut String) {
                     Some("text") => {
                         if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
                             if !is_command_noise(t) {
-                                push_search_text(out, t);
+                                f(t);
                             }
                         }
                     }
                     Some("thinking") => {
                         if let Some(t) = block.get("thinking").and_then(|t| t.as_str()) {
-                            push_search_text(out, t);
+                            f(t);
                         }
                     }
                     Some("tool_use") => {
                         if let Some(input) = block.get("input").and_then(|i| i.as_object()) {
                             for value in input.values() {
                                 if let Some(s) = value.as_str() {
-                                    push_search_text(out, s);
+                                    f(s);
                                 }
                             }
                         }
                     }
                     Some("tool_result") => match block.get("content") {
-                        Some(Value::String(s)) => push_search_text(out, s),
+                        Some(Value::String(s)) => f(s),
                         Some(Value::Array(parts)) => {
                             for part in parts {
                                 if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                                    push_search_text(out, t);
+                                    f(t);
                                 }
                             }
                         }
@@ -418,6 +516,9 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
     let mut message_count: u32 = 0;
     let mut prs: Vec<PrLink> = Vec::new();
     let mut recap = String::new();
+    let mut last_branch = String::new();
+    // Prompts queued while Claude was busy, not yet seen again as a turn.
+    let mut queued = QueuedPrompts::default();
 
     for line in reader.lines() {
         let line = match line {
@@ -428,14 +529,18 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
             continue;
         }
 
-        extract_tickets_into(&line, &mut tickets_set);
-
         let entry: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(_) => continue,
         };
 
-        append_searchable_text(&entry, &mut search_text_lc);
+        index_entry_text(&entry, &mut search_text_lc, &mut tickets_set);
+        if let Some(b) = entry.get("gitBranch").and_then(|b| b.as_str()) {
+            if b != last_branch {
+                extract_tickets_into(b, &mut tickets_set);
+                last_branch = b.to_string();
+            }
+        }
 
         // Modern-format metadata, harvested in the same single pass.
         match entry.get("type").and_then(|t| t.as_str()) {
@@ -551,7 +656,7 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
         // Sidechain turns belong to subagents, not the person; the preview
         // skips them, so titles and counts must too.
         if !flag(&entry, "isSidechain") {
-            if let Some(text) = human_text(&entry) {
+            if let Some(text) = human_text(&entry).filter(|t| queued.is_new(&entry, t)) {
                 let line = one_line(&text, 200);
                 message_count += 1;
                 if head.is_none() {
@@ -590,6 +695,13 @@ pub fn scan_session(path: &Path) -> Option<ScanResult> {
         custom_title
     };
 
+    // The slug is first written after the first prompt, so the head taken
+    // there rarely has it.
+    if let Some(h) = head.as_mut() {
+        if h.slug.is_empty() {
+            h.slug = working_head.slug.clone();
+        }
+    }
     let head = match head {
         Some(h) => h,
         None if !fallback_title.is_empty() => HeadMeta {
@@ -659,6 +771,7 @@ pub fn extract_conversation_ext(path: &Path, include_tools: bool) -> Vec<(Speake
     };
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
+    let mut queued = QueuedPrompts::default();
     // Local day of each message (index-aligned with `messages`).
     let mut days: Vec<Option<chrono::NaiveDate>> = Vec::new();
 
@@ -681,8 +794,8 @@ pub fn extract_conversation_ext(path: &Path, include_tools: bool) -> Vec<(Speake
 
         let before = messages.len();
         match entry.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-            "user" => {
-                if let Some(text) = human_text(&entry) {
+            "user" | "attachment" => {
+                if let Some(text) = human_text(&entry).filter(|t| queued.is_new(&entry, t)) {
                     messages.push((Speaker::User, text));
                 }
             }
@@ -992,6 +1105,102 @@ mod tests {
         assert_eq!(result.head.title, "hello");
         let tail = result.tail.expect("tail");
         assert_eq!(tail.rename, "", "malformed rename must be ignored");
+    }
+
+    fn transcript(dir: &tempfile::TempDir, lines: &[serde_json::Value]) -> std::path::PathBuf {
+        use std::io::Write;
+        let path = dir.path().join("s.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for line in lines {
+            writeln!(f, "{}", line).unwrap();
+        }
+        path
+    }
+
+    fn queued(prompt: serde_json::Value, origin: &str, mode: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "attachment", "timestamp": "2026-11-10T10:05:00Z",
+            "attachment": {"type": "queued_command", "prompt": prompt, "commandMode": mode,
+                           "origin": {"kind": origin}}
+        })
+    }
+
+    #[test]
+    fn test_prompts_typed_while_claude_was_busy_count_and_show() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = transcript(&dir, &[
+            serde_json::json!({"type": "user", "timestamp": "2026-11-10T10:00:00Z",
+                               "message": {"role": "user", "content": "fix the panic"}}),
+            serde_json::json!({"type": "assistant", "timestamp": "2026-11-10T10:01:00Z",
+                               "message": {"role": "assistant", "content": [{"type": "text", "text": "Looking."}]}}),
+            queued(serde_json::json!("also check the Logger"), "human", "prompt"),
+            queued(serde_json::json!([{"type": "text", "text": "and the tests"}]), "human", "prompt"),
+            queued(serde_json::json!("<task-notification>done</task-notification>"), "task-notification", "task-notification"),
+            queued(serde_json::json!("hi from another session"), "peer", "prompt"),
+            // Delivered again as a turn later: still one prompt.
+            serde_json::json!({"type": "user", "timestamp": "2026-11-10T10:06:00Z",
+                               "message": {"role": "user", "content": "and the tests"}}),
+        ]);
+        let scan = scan_session(&path).unwrap();
+        assert_eq!(scan.message_count, 3, "typed: the first turn and two queued prompts");
+        assert_eq!(scan.tail.unwrap().last_human_message, "and the tests");
+        assert!(scan.search_text_lc.contains("also check the logger"));
+        assert!(!scan.search_text_lc.contains("another session"));
+
+        let users: Vec<String> = extract_conversation_ext(&path, false)
+            .into_iter()
+            .filter(|(sp, _)| *sp == Speaker::User)
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(users, ["fix the panic", "also check the Logger", "and the tests"]);
+    }
+
+    #[test]
+    fn test_logged_system_prompts_are_not_searched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = transcript(&dir, &[
+            serde_json::json!({"type": "api-request-blob", "hash": "x",
+                               "message": {"role": "system", "content": [{"type": "text", "text": "skills: docx, PROJ-77"}]}}),
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": "hello"}}),
+        ]);
+        let scan = scan_session(&path).unwrap();
+        assert!(!scan.search_text_lc.contains("docx"));
+        assert!(scan.tickets.is_empty(), "nor its ticket-like words");
+    }
+
+    #[test]
+    fn test_editor_context_blocks_do_not_become_the_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = transcript(&dir, &[serde_json::json!({"type": "user", "message": {"role": "user", "content": [
+            {"type": "text", "text": "<ide_opened_file>The user opened src/main.rs</ide_opened_file>"},
+            {"type": "text", "text": "<system-reminder>be brief</system-reminder>"},
+            {"type": "text", "text": "fix the panic"},
+        ]}})]);
+        let scan = scan_session(&path).unwrap();
+        assert_eq!(scan.head.title, "fix the panic");
+        assert_eq!(scan.message_count, 1);
+    }
+
+    #[test]
+    fn test_tickets_come_from_the_text_and_the_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = transcript(&dir, &[
+            serde_json::json!({"type": "user", "gitBranch": "feat/WEB-9-login",
+                               "message": {"role": "user", "content": "see:\nPROJ-123 and\n#42"}}),
+        ]);
+        let tickets = scan_session(&path).unwrap().tickets;
+        assert_eq!(tickets, ["#42", "PROJ-123", "WEB-9"]);
+    }
+
+    #[test]
+    fn test_slug_written_after_the_first_prompt_still_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = transcript(&dir, &[
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": "hello"}}),
+            serde_json::json!({"type": "assistant", "slug": "brave-otter",
+                               "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}]}}),
+        ]);
+        assert_eq!(scan_session(&path).unwrap().head.slug, "brave-otter");
     }
 
     #[test]

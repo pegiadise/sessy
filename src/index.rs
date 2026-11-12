@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-pub const INDEX_VERSION: u32 = 7;
+pub const INDEX_VERSION: u32 = 8;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionIndex {
@@ -81,8 +81,13 @@ pub fn serialize_index(index: &SessionIndex) -> Vec<u8> {
 }
 
 pub fn deserialize_index(bytes: &[u8]) -> Option<SessionIndex> {
+    // A damaged file (or a layout change without a version bump) can read
+    // as a huge length; unlimited, decoding it aborts on the allocation,
+    // on every start. Limited, it's just a cache to rebuild.
+    const LIMIT: usize = 256 << 20;
+    let config = bincode::config::legacy().with_limit::<LIMIT>();
     let (index, _): (SessionIndex, usize) =
-        bincode::serde::decode_from_slice(bytes, bincode::config::legacy()).ok()?;
+        bincode::serde::decode_from_slice(bytes, config).ok()?;
     if index.version != INDEX_VERSION {
         return None;
     }
@@ -113,6 +118,14 @@ pub fn scan_session_file(path: &Path) -> Option<(SessionMeta, Vec<u8>)> {
     } else {
         (String::new(), 0, String::new())
     };
+    // When it was last active: its last timestamped entry. Claude Code also
+    // appends bookkeeping (costs, the last prompt) later without one, which
+    // moves the mtime weeks after the conversation ended.
+    let last_active = scan
+        .tail
+        .as_ref()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t.last_timestamp).ok())
+        .map_or(file_mtime, |t| t.timestamp());
 
     // Headline priority: an explicit /rename wins, then Claude's AI title,
     // then the random word-slug, then nothing.
@@ -148,7 +161,7 @@ pub fn scan_session_file(path: &Path) -> Option<(SessionMeta, Vec<u8>)> {
         title: scan.head.title,
         last_message,
         duration_secs,
-        timestamp: file_mtime,
+        timestamp: last_active,
         file_size,
         file_mtime,
         file_path: path.to_path_buf(),
@@ -222,13 +235,15 @@ fn build_index_at(
     force_rebuild: bool,
     progress: Option<&Progress>,
 ) -> (SessionIndex, bool) {
-    if !projects_dir.exists() {
+    // No (readable) projects folder: nothing to list, and nothing to save
+    // either — an empty index would throw away the cache for the next run.
+    if fs::read_dir(projects_dir).is_err() {
         let empty = SessionIndex {
             version: INDEX_VERSION,
             sessions: vec![],
             text_cache_len: 0,
         };
-        return (empty, true);
+        return (empty, false);
     }
 
     // Open the previous text.bin so we can reuse bytes for unchanged sessions.
@@ -465,7 +480,13 @@ pub fn save_index(index: &SessionIndex) {
     // Write-then-rename so a crash or a concurrent instance never leaves a
     // half-written index behind.
     let tmp = path.with_extension(format!("bin.{}.tmp", std::process::id()));
-    if fs::write(&tmp, bytes).is_err() || fs::rename(&tmp, &path).is_err() {
+    let written = fs::File::create(&tmp).and_then(|mut f| {
+        use std::io::Write;
+        f.write_all(&bytes)?;
+        // On disk before the rename makes it the index, as text.bin is.
+        f.sync_all()
+    });
+    if written.is_err() || fs::rename(&tmp, &path).is_err() {
         let _ = fs::remove_file(&tmp);
     }
 }
@@ -675,6 +696,44 @@ mod tests {
         assert_eq!(parse_recent_filter("d"), None);
         assert_eq!(parse_recent_filter("99999999999999999999d"), None);
         assert_eq!(parse_recent_filter("999999999999999w"), None);
+    }
+
+    #[test]
+    fn a_damaged_index_is_rebuilt_not_fatal() {
+        let index = SessionIndex {
+            version: INDEX_VERSION,
+            sessions: vec![],
+            text_cache_len: 7,
+        };
+        let mut bytes = serialize_index(&index);
+        assert!(deserialize_index(&bytes).is_some());
+        // The sessions vec's length, as a huge number.
+        bytes[4..12].copy_from_slice(&(1u64 << 62).to_le_bytes());
+        assert!(deserialize_index(&bytes).is_none());
+    }
+
+    #[test]
+    fn a_missing_projects_folder_leaves_the_cache_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, changed) =
+            build_index_at(&dir.path().join("nope"), &dir.path().join("text.bin"), None, false, None);
+        assert!(index.sessions.is_empty());
+        assert!(!changed, "nothing to save over the cache");
+    }
+
+    #[test]
+    fn listed_date_is_the_last_activity_not_the_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        write_session(dir.path(), "a", "hello");
+        // Bookkeeping appended weeks later, with no timestamp.
+        let path = dir.path().join("a.jsonl");
+        let mut body = fs::read_to_string(&path).unwrap();
+        body.push_str("{\"type\":\"last-prompt\",\"lastPrompt\":\"thanks\"}\n");
+        fs::write(&path, body).unwrap();
+        let (meta, _) = scan_session_file(&path).unwrap();
+        let last = chrono::DateTime::parse_from_rfc3339("2026-11-10T10:05:00Z").unwrap();
+        assert_eq!(meta.timestamp, last.timestamp());
+        assert!(meta.file_mtime > meta.timestamp, "the mtime is still kept for change checks");
     }
 
     fn write_session(dir: &Path, id: &str, words: &str) {
