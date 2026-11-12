@@ -505,19 +505,47 @@ impl App {
         self.rebuild_view_keep_selection();
     }
 
+    /// The search box parsed into text and `key:value` filters.
+    pub fn query(&self) -> crate::query::Query {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        crate::query::parse(self.search_query.text(), now)
+    }
+
+    /// The search has words to match (not only filters): results are ranked
+    /// by relevance and their hits marked.
+    pub fn text_search_active(&self) -> bool {
+        !self.query().text.is_empty()
+    }
+
     fn apply_search_inner(&mut self) {
         self.exact_matches.clear();
         self.snippets.clear();
-        if self.search_query.is_empty() {
-            self.filtered_indices = (0..self.sessions.len()).collect();
-            return;
+        let query = self.query();
+        self.apply_text_search(&query.text);
+        if !query.filters.is_empty() {
+            let keep: Vec<bool> = self
+                .sessions
+                .iter()
+                .map(|s| {
+                    let pinned = self.bookmarks.contains(&s.id);
+                    let open = self.live.contains_key(&s.id);
+                    query.filters.iter().all(|f| f.matches(s, pinned, open))
+                })
+                .collect();
+            self.filtered_indices.retain(|&i| keep[i]);
         }
+    }
 
+    /// Rank sessions against the search words (`query_lc`, lowercased);
+    /// everything when there are none.
+    fn apply_text_search(&mut self, query_lc: &str) {
         use memchr::memmem::Finder;
         use rayon::prelude::*;
 
-        let query_lc = self.search_query.text().to_lowercase();
-        let query_upper = self.search_query.text().trim().to_ascii_uppercase();
+        let query_upper = query_lc.trim().to_ascii_uppercase();
         let is_ticket_form = is_ticket_query(&query_upper);
         let tokens: Vec<&str> = query_lc.split_whitespace().collect();
         if tokens.is_empty() {
@@ -644,15 +672,10 @@ impl App {
             .count()
     }
 
-    /// The search query as the exact tier compares it: lowercased, with
-    /// whitespace runs folded to single spaces.
+    /// The search words as the exact tier compares them: lowercased, with
+    /// whitespace runs folded to single spaces, filters left out.
     pub fn search_phrase(&self) -> String {
-        self.search_query
-            .text()
-            .to_lowercase()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
+        self.query().text
     }
 
     fn apply_size_filter(&mut self) {
@@ -673,10 +696,11 @@ impl App {
         let sessions = &self.sessions;
         let bookmarks = &self.bookmarks;
         let exact = |i: usize| self.exact_matches.get(i).copied().unwrap_or(false);
-        let mode = if self.search_query.is_empty() {
-            Some(self.sort_mode)
-        } else {
+        // Relevance needs words; filters alone keep the browse sort.
+        let mode = if self.text_search_active() {
             self.search_sort
+        } else {
+            Some(self.sort_mode)
         };
 
         self.filtered_indices.sort_by(|&a, &b| {
@@ -701,10 +725,10 @@ impl App {
 
     /// Label for the sort currently shaping the list.
     pub fn sort_label(&self) -> &'static str {
-        if self.search_query.is_empty() {
-            self.sort_mode.label()
-        } else {
+        if self.text_search_active() {
             self.search_sort.map(SortMode::label).unwrap_or("relevance")
+        } else {
+            self.sort_mode.label()
         }
     }
 
@@ -722,7 +746,7 @@ impl App {
     /// Cycle the sort. Search results cycle relevance → date → … → messages
     /// → relevance; the browse sort is remembered separately.
     pub fn cycle_sort(&mut self) {
-        if self.search_query.is_empty() {
+        if !self.text_search_active() {
             self.sort_mode = self.sort_mode.next();
         } else {
             self.search_sort = match self.search_sort {
@@ -874,12 +898,7 @@ impl App {
         if !find.is_empty() {
             return vec![find];
         }
-        self.search_query
-            .text()
-            .to_lowercase()
-            .split_whitespace()
-            .map(String::from)
-            .collect()
+        self.query().text.split_whitespace().map(String::from).collect()
     }
 
     /// Recompute which preview messages contain a term; with `scroll`, move
@@ -2222,6 +2241,45 @@ mod search_tests {
 
         app.undo_delete();
         assert_eq!(app.active_status(), Some("Nothing to undo"));
+    }
+
+    #[test]
+    fn test_filters_narrow_and_combine_with_words() {
+        let mut a = make_session("a", "auth fix", "", "web", "main", vec![]);
+        a.timestamp = 300;
+        let mut b = make_session("b", "auth rework", "", "api", "main", vec![]);
+        b.timestamp = 200;
+        let mut c = make_session("c", "docs", "", "web", "main", vec![]);
+        c.timestamp = 100;
+        let mut bookmarks = HashSet::new();
+        bookmarks.insert("c".to_string());
+        let mut app = App::new(vec![a, b, c], false, bookmarks, empty_cache());
+
+        app.search_query = "project:web".into();
+        app.apply_search();
+        assert_eq!(ids(&app), vec!["c", "a"], "filters alone: pinned first, then by date");
+        assert_eq!(app.sort_label(), "date", "no words, no relevance");
+        assert_eq!(app.exact_match_count(), 0);
+        assert_eq!(app.search_phrase(), "");
+
+        app.search_query = "auth project:web".into();
+        app.apply_search();
+        assert_eq!(ids(&app), vec!["a"]);
+        assert_eq!(app.search_phrase(), "auth", "filters are never highlighted");
+        assert_eq!(app.preview_terms(), vec!["auth".to_string()]);
+
+        app.search_query = "is:pinned".into();
+        app.apply_search();
+        assert_eq!(ids(&app), vec!["c"]);
+
+        app.live.insert("b".into(), crate::live::LiveSession { pid: 1, busy: false });
+        app.search_query = "is:open auth".into();
+        app.apply_search();
+        assert_eq!(ids(&app), vec!["b"]);
+
+        app.search_query = "before:1970-01-02".into();
+        app.apply_search();
+        assert_eq!(ids(&app).len(), 3, "timestamps 100-300 are on Jan 1 1970");
     }
 
     #[test]

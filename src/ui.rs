@@ -80,15 +80,17 @@ fn draw_search_bar(frame: &mut Frame, app: &App, area: Rect) {
 
     if app.search_query.is_empty() {
         let hint = if focused {
-            "titles, projects, branches, files, tickets, full conversation text…"
+            "words, tickets, #PR · filters: project: branch: file: is:open|pinned|pr \
+             after:7d before:2026-10-01 on:today"
         } else {
             "Press / to search, or paste"
         };
+        let hint = truncate_width(hint, inner.width as usize);
         let p = Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))).block(block);
         frame.render_widget(p, area);
     } else {
         let (visible, _) = visible_input(&app.search_query, inner.width as usize);
-        frame.render_widget(Paragraph::new(visible).block(block), area);
+        frame.render_widget(Paragraph::new(query_spans(&visible)).block(block), area);
     }
 
     if focused {
@@ -104,6 +106,34 @@ pub const NARROW_WIDTH: u16 = 100;
 /// Whether only the focused pane is drawn (narrow terminal, or `z`).
 pub fn single_pane(app: &App, width: u16) -> bool {
     app.zoom || width < NARROW_WIDTH
+}
+
+/// The search box's text with `key:value` filters coloured, so it's clear
+/// which words filter and which are searched for.
+fn query_spans(visible: &str) -> Line<'static> {
+    let filter = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let mut spans = Vec::new();
+    let mut word = String::new();
+    let flush = |word: &mut String, spans: &mut Vec<Span<'static>>| {
+        if !word.is_empty() {
+            let style = if crate::query::is_filter_token(word) {
+                filter
+            } else {
+                Style::default()
+            };
+            spans.push(Span::styled(std::mem::take(word), style));
+        }
+    };
+    for c in visible.chars() {
+        if c.is_whitespace() {
+            flush(&mut word, &mut spans);
+            spans.push(Span::raw(c.to_string()));
+        } else {
+            word.push(c);
+        }
+    }
+    flush(&mut word, &mut spans);
+    Line::from(spans)
 }
 
 fn draw_content(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -1261,6 +1291,18 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &mut App) {
             ],
         ),
         (
+            "Search filters (combine with words)",
+            &[
+                ("project:web", "project name contains \"web\""),
+                ("branch:  file:", "branch / a changed file's path contains"),
+                ("is:open", "open in a running Claude Code"),
+                ("is:pinned  is:pr", "pinned / has a linked pull request"),
+                ("after:7d", "active in the last 7 days (h d w m, or a date)"),
+                ("before:2026-10-01", "last active before that day"),
+                ("on:today", "active that day (today, yesterday, a date)"),
+            ],
+        ),
+        (
             "Anywhere",
             &[
                 ("Esc", "back: clear search → list → quit"),
@@ -1285,13 +1327,13 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &mut App) {
         lines.push(Line::from(Span::styled(format!(" {}", heading), head_style)));
         for (k, d) in rows.iter() {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {:<15}", k), key_style),
+                Span::styled(format!("  {:<18}", k), key_style),
                 Span::styled((*d).to_string(), desc_style),
             ]));
         }
     }
 
-    let w = 66u16.min(area.width.saturating_sub(2));
+    let w = 72u16.min(area.width.saturating_sub(2));
     let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;

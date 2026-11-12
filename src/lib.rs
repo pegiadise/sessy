@@ -8,6 +8,7 @@ pub mod input;
 pub mod live;
 pub mod parser;
 pub mod preview;
+pub mod query;
 pub mod session;
 pub mod text_cache;
 pub mod trash;
