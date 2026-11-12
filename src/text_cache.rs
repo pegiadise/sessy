@@ -74,21 +74,30 @@ pub fn write_text_cache_tmp(
     // Per-process temp name: two sessy instances rebuilding at once must not
     // interleave writes into the same file.
     let tmp = path.with_extension(format!("bin.{}.tmp", std::process::id()));
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&tmp)?;
-
-    let mut out = Vec::with_capacity(chunks.len());
-    let mut offset: u64 = 0;
-    for chunk in chunks {
-        file.write_all(chunk)?;
-        out.push((offset, chunk.len() as u32));
-        offset += chunk.len() as u64;
+    let write = || -> std::io::Result<Vec<(u64, u32)>> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        let mut out = Vec::with_capacity(chunks.len());
+        let mut offset: u64 = 0;
+        for chunk in chunks {
+            file.write_all(chunk)?;
+            out.push((offset, chunk.len() as u32));
+            offset += chunk.len() as u64;
+        }
+        file.sync_all()?;
+        Ok(out)
+    };
+    match write() {
+        Ok(out) => Ok((tmp, out)),
+        Err(e) => {
+            // A half-written temp file (disk full) is never picked up again.
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
     }
-    file.sync_all()?;
-    Ok((tmp, out))
 }
 
 /// Second half of `write_text_cache`: move the temp file into place.

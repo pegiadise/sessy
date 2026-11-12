@@ -463,6 +463,7 @@ fn draw_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
     // Which session each screen row belongs to, for mouse clicks.
     app.list_rows = owners
         .into_iter()
+        .take(height)
         .enumerate()
         .map(|(i, visual)| (inner.y + i as u16, visual))
         .collect();

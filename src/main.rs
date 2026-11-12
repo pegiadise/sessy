@@ -62,7 +62,10 @@ fn main() -> io::Result<()> {
         None => None,
     };
 
-    // Build index
+    // Build index: load → build → save under the cache lock, so another
+    // instance starting at the same time waits instead of interleaving.
+    let lock = index::lock_cache();
+    index::sweep_stale_temp_files();
     let cached = if cli.rebuild_index {
         None
     } else {
@@ -76,6 +79,10 @@ fn main() -> io::Result<()> {
     if changed {
         index::save_index(&idx);
     }
+    // Map text.bin before letting another instance rewrite it: these
+    // offsets belong to this file.
+    let tc = text_cache::TextCache::open(&text_cache::text_cache_path());
+    drop(lock);
 
     // Apply filters
     if let Some(ref project_filter) = cli.project {
@@ -104,7 +111,6 @@ fn main() -> io::Result<()> {
 
     // Run TUI
     let (cfg, cfg_warning) = config::load();
-    let tc = text_cache::TextCache::open(&text_cache::text_cache_path());
     let mut app = App::new(idx.sessions, cli.print, bookmarks, tc);
     app.bookmarks_file = Some(bookmarks::bookmarks_path());
     app.trash_dir = Some(trash::trash_dir());
@@ -137,6 +143,7 @@ fn main() -> io::Result<()> {
         run_tui_on_stderr(&mut app)
     } else {
         let mut terminal = ratatui::init();
+        restore_terminal_on_panic(false);
         // Kitty keyboard protocol: without it, terminals send legacy codes in
         // which Cmd/Alt+Backspace are indistinguishable from plain Backspace
         // (or never delivered), so the modifier-aware search-input bindings
@@ -242,6 +249,7 @@ fn run_tui_on_stderr(app: &mut App) -> io::Result<()> {
         let _ = disable_raw_mode();
         return Err(e);
     }
+    restore_terminal_on_panic(true);
     let kbd_enhanced = push_keyboard_enhancement(&mut io::stderr());
     let _ = crossterm::execute!(io::stderr(), EnableBracketedPaste);
     if app.mouse {
@@ -257,6 +265,31 @@ fn run_tui_on_stderr(app: &mut App) -> io::Result<()> {
     let _ = crossterm::execute!(io::stderr(), LeaveAlternateScreen, Show);
     let _ = disable_raw_mode();
     result
+}
+
+/// If sessy panics, switch off the terminal modes it turned on before the
+/// panic message prints; otherwise the shell is left reporting every mouse
+/// move (and, for the stderr TUI, in raw mode on the alternate screen).
+/// Chains to the previous hook (ratatui's restores the stdout TUI).
+fn restore_terminal_on_panic(on_stderr: bool) {
+    use crossterm::cursor::Show;
+    use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if on_stderr {
+            let _ = crossterm::execute!(
+                io::stderr(),
+                DisableMouseCapture,
+                DisableBracketedPaste,
+                LeaveAlternateScreen,
+                Show
+            );
+            let _ = disable_raw_mode();
+        } else {
+            let _ = crossterm::execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
+        }
+        previous(info);
+    }));
 }
 
 /// Enable the kitty keyboard protocol when the terminal supports it, so
@@ -418,6 +451,8 @@ fn run_event_loop<B: ratatui::backend::Backend<Error = io::Error>>(
         if last_live_scan.elapsed() >= Duration::from_secs(2) {
             last_live_scan = Instant::now();
             if app.refresh_live() {
+                app.live_changed();
+                preview::request_preview(app);
                 dirty = true;
             }
         }
@@ -434,13 +469,19 @@ fn run_event_loop<B: ratatui::backend::Backend<Error = io::Error>>(
             // Drain everything already queued (fast typing, key repeat) before
             // searching and redrawing once.
             loop {
-                match event::read()? {
+                let event = event::read()?;
+                // Pointer motion arrives at mouse speed and changes nothing.
+                let moved = matches!(
+                    &event,
+                    Event::Mouse(m) if matches!(m.kind, MouseEventKind::Moved)
+                );
+                match event {
                     Event::Key(key) if key.kind != KeyEventKind::Release => handle_key(app, key),
                     Event::Paste(text) => handle_paste(app, &text),
                     Event::Mouse(m) if app.mouse => handle_mouse(app, m),
                     _ => {}
                 }
-                dirty = true;
+                dirty |= !moved;
                 if app.action != AppAction::None || !event::poll(Duration::ZERO)? {
                     break;
                 }
@@ -568,6 +609,11 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
     if app.search_dirty {
         app.apply_search();
         preview::request_preview(app);
+        // The list just changed under the pointer: the last frame's rows no
+        // longer say which session is where.
+        if down {
+            return;
+        }
     }
 
     if let Some(forward) = wheel {
@@ -580,11 +626,8 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
         } else if app.view_mode == ViewMode::Timeline {
             app.timeline_move(if forward { 1 } else { -1 });
         } else if contains(app.list_area, x, y) {
-            if forward {
-                app.move_down();
-            } else {
-                app.move_up();
-            }
+            // No wrap-around: momentum scrolling stops at the ends.
+            app.scroll_list(forward);
             preview::request_preview(app);
         }
         return;
@@ -1189,9 +1232,13 @@ mod tests {
     }
 
     fn drawn(ids: &[&str]) -> App {
+        drawn_at(ids, 30)
+    }
+
+    fn drawn_at(ids: &[&str], height: u16) -> App {
         let mut app = app_with(ids);
         app.mouse = true;
-        let backend = ratatui::backend::TestBackend::new(140, 30);
+        let backend = ratatui::backend::TestBackend::new(140, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         app
@@ -1260,6 +1307,41 @@ mod tests {
         let s = app.search_area;
         click(&mut app, s.x + 3, s.y + 1);
         assert_eq!(app.focus, Focus::Search);
+    }
+
+    #[test]
+    fn the_wheel_stops_at_the_ends_of_the_list() {
+        let mut app = drawn(&["a", "b"]);
+        let y = app.list_rows[0].0;
+        for _ in 0..5 {
+            mouse(&mut app, MouseEventKind::ScrollDown, 10, y);
+        }
+        assert_eq!(app.selected, 1, "no wrap to the top");
+        for _ in 0..5 {
+            mouse(&mut app, MouseEventKind::ScrollUp, 10, y);
+        }
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn a_click_right_after_typing_is_dropped() {
+        let mut app = drawn(&["a", "b", "c"]);
+        let y = app.list_rows.iter().find(|&&(_, v)| v == 2).unwrap().0;
+        app.search_query = "session c".into();
+        app.search_dirty = true;
+        click(&mut app, 10, y);
+        assert!(!app.search_dirty);
+        assert_eq!(app.selected, 0, "row 2 of the old list isn't a row any more");
+    }
+
+    #[test]
+    fn rows_below_the_list_are_not_clickable() {
+        // 27 rows leave a list 21 rows tall: five sessions and the first
+        // line of a sixth, whose other lines fall off the bottom.
+        let app = drawn_at(&["a", "b", "c", "d", "e", "f", "g", "h"], 27);
+        let border = app.list_area.y + app.list_area.height - 1;
+        assert!(app.list_rows.iter().any(|&(_, v)| v == 5), "the cut-off session's top row");
+        assert!(app.list_rows.iter().all(|&(y, _)| y < border));
     }
 
     #[test]

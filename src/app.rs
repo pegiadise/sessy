@@ -387,6 +387,28 @@ impl App {
         self.select(target);
     }
 
+    /// One step through the list without wrapping (mouse wheel).
+    pub fn scroll_list(&mut self, down: bool) {
+        let last = self.filtered_indices.len().saturating_sub(1);
+        let target = if down {
+            (self.selected + 1).min(last)
+        } else {
+            self.selected.saturating_sub(1)
+        };
+        self.select(target);
+    }
+
+    /// Sessions opened or closed elsewhere: an `is:open` search must follow.
+    pub fn live_changed(&mut self) {
+        let filters_on_open = self
+            .query()
+            .filters
+            .contains(&crate::query::Filter::Open);
+        if filters_on_open {
+            self.rebuild_view_keep_selection();
+        }
+    }
+
     pub fn move_to_top(&mut self) {
         self.select(0);
     }
@@ -2342,6 +2364,20 @@ mod search_tests {
         app.search_query = "before:1970-01-02".into();
         app.apply_search();
         assert_eq!(ids(&app).len(), 3, "timestamps 100-300 are on Jan 1 1970");
+    }
+
+    #[test]
+    fn test_is_open_follows_sessions_opening_and_closing() {
+        let mut app = three_sessions();
+        app.search_query = "is:open".into();
+        app.apply_search();
+        assert!(app.filtered_indices.is_empty());
+        app.live.insert("b".into(), crate::live::LiveSession { pid: 1, busy: false });
+        app.live_changed();
+        assert_eq!(ids(&app), vec!["b"]);
+        app.live.clear();
+        app.live_changed();
+        assert!(app.filtered_indices.is_empty());
     }
 
     #[test]

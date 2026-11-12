@@ -465,8 +465,63 @@ pub fn save_index(index: &SessionIndex) {
     // Write-then-rename so a crash or a concurrent instance never leaves a
     // half-written index behind.
     let tmp = path.with_extension(format!("bin.{}.tmp", std::process::id()));
-    if fs::write(&tmp, bytes).is_ok() && fs::rename(&tmp, &path).is_err() {
+    if fs::write(&tmp, bytes).is_err() || fs::rename(&tmp, &path).is_err() {
         let _ = fs::remove_file(&tmp);
+    }
+}
+
+/// Held while one sessy instance loads, builds and saves the index, so two
+/// starting at once never interleave writes to `index.bin`/`text.bin` (the
+/// pair is only checked by size, which can't tell an appended layout from
+/// a rewritten one). Released when dropped. Best effort: without a lock
+/// (no cache dir, not unix) instances simply don't wait for each other.
+pub struct CacheLock {
+    _file: Option<fs::File>,
+}
+
+pub fn lock_cache() -> CacheLock {
+    let path = index_cache_path().with_file_name("index.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .ok();
+    #[cfg(unix)]
+    if let Some(f) = &file {
+        use std::os::unix::io::AsRawFd;
+        // Blocks until another instance finishes its build (usually ms).
+        unsafe {
+            libc::flock(f.as_raw_fd(), libc::LOCK_EX);
+        }
+    }
+    CacheLock { _file: file }
+}
+
+/// Remove temp files that a killed or crashed instance left in the cache
+/// dir (`*.tmp`, more than an hour old: a live one is seconds old).
+pub fn sweep_stale_temp_files() {
+    let Some(dir) = index_cache_path().parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+    let hour = std::time::Duration::from_secs(3600);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("tmp") {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > hour);
+        if old {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 

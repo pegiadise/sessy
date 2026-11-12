@@ -99,6 +99,10 @@ fn classify(token: &str, now: i64) -> Token {
     if value.is_empty() {
         return Token::Pending;
     }
+    // `file:///…` (a URL), `file::open` (a Rust path): text, not filters.
+    if value.starts_with(':') || value.starts_with("//") {
+        return Token::Text;
+    }
     let v = value.to_lowercase();
     let filter = match key.as_str() {
         "project" => Some(Filter::Project(v)),
@@ -149,11 +153,14 @@ fn day(v: &str, now: i64) -> Option<NaiveDate> {
 /// (`1h`, `7d`, `2w`, `1m`, as `--recent` takes).
 fn moment(v: &str, now: i64) -> Option<i64> {
     if let Some(d) = day(v, now) {
-        let midnight = d.and_hms_opt(0, 0, 0)?;
-        return Local
-            .from_local_datetime(&midnight)
-            .earliest()
-            .map(|t| t.timestamp());
+        // The day's first instant; where a DST change skips midnight, the
+        // first hour that exists.
+        return (0..3).find_map(|h| {
+            Local
+                .from_local_datetime(&d.and_hms_opt(h, 0, 0)?)
+                .earliest()
+                .map(|t| t.timestamp())
+        });
     }
     let secs = crate::index::parse_recent_filter(v)?;
     Some(now.saturating_sub(i64::try_from(secs).ok()?))
@@ -189,8 +196,11 @@ mod tests {
     #[test]
     fn unknown_keys_and_unparsable_values_stay_text() {
         let now = at(2026, 11, 12, 15);
-        let q = parse("https://github.com/x on:click is:weird after:soon", now);
-        assert_eq!(q.text, "https://github.com/x on:click is:weird after:soon");
+        let q = parse("https://github.com/x on:click is:weird after:soon file:///a file::open", now);
+        assert_eq!(
+            q.text,
+            "https://github.com/x on:click is:weird after:soon file:///a file::open"
+        );
         assert!(q.filters.is_empty());
     }
 
