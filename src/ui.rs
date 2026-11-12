@@ -25,6 +25,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
+    app.search_area = main_chunks[0];
+    // Panes not drawn this frame can't be clicked.
+    app.list_area = Rect::default();
+    app.preview_area = Rect::default();
+    app.timeline_cells.clear();
     draw_search_bar(frame, app, main_chunks[0]);
     draw_content(frame, app, main_chunks[1]);
     draw_status_bar(frame, app, main_chunks[2]);
@@ -206,6 +211,8 @@ fn draw_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    app.list_area = area;
+    app.list_rows.clear();
 
     if app.filtered_indices.is_empty() {
         let msg = empty_list_message(app);
@@ -253,6 +260,8 @@ fn draw_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
         Default::default()
     };
 
+    let mut owners: Vec<usize> = Vec::new();
+    let lines = {
     let app: &App = app;
     let max_width = inner.width as usize;
     let phrase = app.search_phrase();
@@ -274,6 +283,7 @@ fn draw_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
         if lines.len() >= height {
             break;
         }
+        let first_row = lines.len();
 
         let session = &app.sessions[real_idx];
         let is_selected = visual_idx == app.selected;
@@ -445,8 +455,17 @@ fn draw_session_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 lines.push(Line::from(""));
             }
         }
+        owners.extend(std::iter::repeat_n(visual_idx, lines.len() - first_row));
     }
+    lines
+    };
 
+    // Which session each screen row belongs to, for mouse clicks.
+    app.list_rows = owners
+        .into_iter()
+        .enumerate()
+        .map(|(i, visual)| (inner.y + i as u16, visual))
+        .collect();
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner);
 }
@@ -812,6 +831,7 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     };
 
     let viewport = sync_preview_geometry(app, area);
+    app.preview_area = area;
     let max_scroll = app.max_preview_scroll();
     // A resize can leave the old position past the new end.
     app.preview_scroll = app.preview_scroll.min(max_scroll);
@@ -1363,6 +1383,7 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &mut App) {
             &[
                 ("Esc", "back: clear search → list → quit"),
                 ("z", "zoom: one pane at a time, full width"),
+                ("mouse", "with --mouse: wheel, click, double-click resumes"),
                 ("q  Ctrl+C", "quit"),
             ],
         ),

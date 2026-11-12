@@ -18,6 +18,10 @@ pub struct Config {
     pub enter: String,
     /// "comfortable" (three lines per session) or "compact" (one line).
     pub density: String,
+    /// Mouse support: wheel scrolling, click to select, double-click to
+    /// resume. Off by default: capturing the mouse stops the terminal's own
+    /// text selection (most terminals still select with Shift or Option held).
+    pub mouse: bool,
 }
 
 impl Default for Config {
@@ -28,6 +32,7 @@ impl Default for Config {
             show_tool_activity: false,
             enter: "yolo".to_string(),
             density: "comfortable".to_string(),
+            mouse: false,
         }
     }
 }

@@ -218,6 +218,16 @@ pub struct App {
     pub timeline_start: Option<chrono::NaiveDate>,
     /// Where each timeline day was drawn, for mouse clicks: (x, y, day).
     pub timeline_cells: Vec<(u16, u16, chrono::NaiveDate)>,
+    /// Mouse support is on (config `mouse`, `--mouse`).
+    pub mouse: bool,
+    /// Where the panes were drawn last frame (empty when not shown), and
+    /// which session each list row belongs to: (y, visual index).
+    pub search_area: ratatui::layout::Rect,
+    pub list_area: ratatui::layout::Rect,
+    pub list_rows: Vec<(u16, usize)>,
+    pub preview_area: ratatui::layout::Rect,
+    /// The last click on a list row, to spot a double-click.
+    pub last_click: Option<(Instant, usize)>,
 }
 
 impl App {
@@ -286,6 +296,12 @@ impl App {
             timeline_day: None,
             timeline_start: None,
             timeline_cells: Vec::new(),
+            mouse: false,
+            search_area: Default::default(),
+            list_area: Default::default(),
+            list_rows: Vec::new(),
+            preview_area: Default::default(),
+            last_click: None,
         }
     }
 

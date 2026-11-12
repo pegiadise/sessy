@@ -2,9 +2,9 @@ use sessy::{app, bookmarks, config, index, live, preview, session, text_cache, t
 use app::{App, AppAction, Focus, Scope, ViewMode};
 use clap::Parser;
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use std::io;
 use std::path::{Path, PathBuf};
@@ -37,6 +37,11 @@ struct Cli {
     /// Delete all sessions smaller than 15 KB and older than 2 days
     #[arg(long)]
     purge: bool,
+
+    /// Mouse support: wheel scrolling, click to select, double-click to
+    /// resume (also config `mouse = true`)
+    #[arg(long)]
+    mouse: bool,
 }
 
 fn main() -> io::Result<()> {
@@ -107,6 +112,7 @@ fn main() -> io::Result<()> {
     app.live_dir = Some(live::sessions_dir());
     app.refresh_live();
     app.density = cfg.density();
+    app.mouse = cli.mouse || cfg.mouse;
     app.scope_root = std::env::current_dir().ok().map(|cwd| project_root(&cwd));
     // `--project` names the project explicitly; restricting it further to
     // the launch directory would usually leave nothing.
@@ -138,7 +144,13 @@ fn main() -> io::Result<()> {
         // is per-screen), pop before leaving it.
         let kbd_enhanced = push_keyboard_enhancement(&mut io::stdout());
         let _ = crossterm::execute!(io::stdout(), EnableBracketedPaste);
+        if app.mouse {
+            let _ = crossterm::execute!(io::stdout(), EnableMouseCapture);
+        }
         let result = run_event_loop(&mut terminal, &mut app);
+        if app.mouse {
+            let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
+        }
         let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste);
         pop_keyboard_enhancement(&mut io::stdout(), kbd_enhanced);
         ratatui::restore();
@@ -232,8 +244,14 @@ fn run_tui_on_stderr(app: &mut App) -> io::Result<()> {
     }
     let kbd_enhanced = push_keyboard_enhancement(&mut io::stderr());
     let _ = crossterm::execute!(io::stderr(), EnableBracketedPaste);
+    if app.mouse {
+        let _ = crossterm::execute!(io::stderr(), EnableMouseCapture);
+    }
     let result = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stderr()))
         .and_then(|mut terminal| run_event_loop(&mut terminal, app));
+    if app.mouse {
+        let _ = crossterm::execute!(io::stderr(), DisableMouseCapture);
+    }
     let _ = crossterm::execute!(io::stderr(), DisableBracketedPaste);
     pop_keyboard_enhancement(&mut io::stderr(), kbd_enhanced);
     let _ = crossterm::execute!(io::stderr(), LeaveAlternateScreen, Show);
@@ -419,6 +437,7 @@ fn run_event_loop<B: ratatui::backend::Backend<Error = io::Error>>(
                 match event::read()? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => handle_key(app, key),
                     Event::Paste(text) => handle_paste(app, &text),
+                    Event::Mouse(m) if app.mouse => handle_mouse(app, m),
                     _ => {}
                 }
                 dirty = true;
@@ -507,6 +526,121 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         Focus::List => handle_list_key(app, key),
     }
 }
+
+fn contains(area: ratatui::layout::Rect, column: u16, row: u16) -> bool {
+    area.contains(ratatui::layout::Position::new(column, row))
+}
+
+/// Mouse (when enabled): the wheel moves through the list or scrolls the
+/// pane under the pointer; a click selects a session, focuses a pane or
+/// picks a timeline day; a double-click resumes (or lists the day).
+fn handle_mouse(app: &mut App, m: MouseEvent) {
+    let (x, y) = (m.column, m.row);
+    let down = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
+    let wheel = match m.kind {
+        MouseEventKind::ScrollDown => Some(true),
+        MouseEventKind::ScrollUp => Some(false),
+        _ => None,
+    };
+    if !down && wheel.is_none() {
+        return;
+    }
+
+    // Open prompts: a click cancels, like any key but `y`.
+    if app.confirm_delete || app.confirm_resume.is_some() {
+        if down {
+            app.confirm_delete = false;
+            app.confirm_resume = None;
+        }
+        return;
+    }
+    if app.show_help {
+        match wheel {
+            Some(true) => app.help_scroll += 3,
+            Some(false) => app.help_scroll = app.help_scroll.saturating_sub(3),
+            None => app.show_help = false,
+        }
+        return;
+    }
+    if matches!(app.focus, Focus::Rename | Focus::PreviewSearch) {
+        return;
+    }
+    if app.search_dirty {
+        app.apply_search();
+        preview::request_preview(app);
+    }
+
+    if let Some(forward) = wheel {
+        if contains(app.preview_area, x, y) {
+            if forward {
+                app.scroll_preview_down();
+            } else {
+                app.scroll_preview_up();
+            }
+        } else if app.view_mode == ViewMode::Timeline {
+            app.timeline_move(if forward { 1 } else { -1 });
+        } else if contains(app.list_area, x, y) {
+            if forward {
+                app.move_down();
+            } else {
+                app.move_up();
+            }
+            preview::request_preview(app);
+        }
+        return;
+    }
+
+    // A left click.
+    if contains(app.search_area, x, y) {
+        app.view_mode = ViewMode::Normal;
+        app.focus = Focus::Search;
+        return;
+    }
+    if contains(app.preview_area, x, y) {
+        app.focus = Focus::Preview;
+        return;
+    }
+    if let Some(&(_, _, day)) = app
+        .timeline_cells
+        .iter()
+        .find(|&&(cx, cy, _)| cy == y && (cx == x || cx + 1 == x))
+    {
+        let again = app.timeline_day == Some(day)
+            && app.last_click.is_some_and(|(t, _)| t.elapsed() < DOUBLE_CLICK);
+        app.timeline_day = Some(day);
+        app.last_click = Some((Instant::now(), usize::MAX));
+        if again {
+            app.last_click = None;
+            app.pick_timeline_day();
+            preview::request_preview(app);
+        }
+        return;
+    }
+    if let Some(&(_, visual)) = app.list_rows.iter().find(|&&(ry, _)| ry == y) {
+        if !contains(app.list_area, x, y) {
+            return;
+        }
+        app.focus = Focus::List;
+        let again = app
+            .last_click
+            .is_some_and(|(t, v)| v == visual && t.elapsed() < DOUBLE_CLICK);
+        if visual != app.selected {
+            app.selected = visual;
+            app.preview_scroll = 0;
+            preview::request_preview(app);
+        }
+        if again {
+            app.last_click = None;
+            pick_selected(app, KeyCode::Enter);
+        } else {
+            app.last_click = Some((Instant::now(), visual));
+        }
+    } else if contains(app.list_area, x, y) {
+        app.focus = Focus::List;
+    }
+}
+
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 /// Ctrl+V, or ⌘V when the terminal forwards it as a key.
 fn is_paste_key(key: &KeyEvent) -> bool {
@@ -1052,6 +1186,80 @@ mod tests {
         press(&mut app, KeyCode::Enter); // next hit, not a resume
         assert_eq!(app.action, AppAction::None);
         assert_eq!(app.preview_search_current, 1);
+    }
+
+    fn drawn(ids: &[&str]) -> App {
+        let mut app = app_with(ids);
+        app.mouse = true;
+        let backend = ratatui::backend::TestBackend::new(140, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        app
+    }
+
+    fn mouse(app: &mut App, kind: MouseEventKind, x: u16, y: u16) {
+        handle_mouse(
+            app,
+            MouseEvent {
+                kind,
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+    }
+
+    fn click(app: &mut App, x: u16, y: u16) {
+        mouse(app, MouseEventKind::Down(MouseButton::Left), x, y);
+    }
+
+    #[test]
+    fn clicking_a_row_selects_it_and_a_double_click_resumes() {
+        let mut app = drawn(&["a", "b", "c"]);
+        // The second session's rows (4 per session, below the list border).
+        let row_of = |app: &App, visual: usize| {
+            app.list_rows.iter().find(|&&(_, v)| v == visual).unwrap().0
+        };
+        let y = row_of(&app, 1);
+        click(&mut app, 10, y + 1);
+        assert_eq!(app.selected, 1, "any row of a session selects it");
+        assert_eq!(app.action, AppAction::None);
+        click(&mut app, 10, y);
+        assert_eq!(app.action, AppAction::LaunchDangerously(1), "double-click = Enter");
+    }
+
+    #[test]
+    fn double_click_on_an_open_session_asks_first() {
+        let mut app = drawn(&["a"]);
+        app.live.insert("a".into(), sessy::live::LiveSession { pid: 1, busy: false });
+        let y = app.list_rows[0].0;
+        click(&mut app, 10, y);
+        click(&mut app, 10, y);
+        assert_eq!(app.action, AppAction::None);
+        assert!(app.confirm_resume.is_some());
+        click(&mut app, 10, y);
+        assert!(app.confirm_resume.is_none(), "a click cancels the prompt");
+    }
+
+    #[test]
+    fn wheel_moves_the_list_or_scrolls_the_preview_under_the_pointer() {
+        let mut app = drawn(&["a", "b", "c"]);
+        let list_y = app.list_rows[0].0;
+        mouse(&mut app, MouseEventKind::ScrollDown, 10, list_y);
+        assert_eq!(app.selected, 1);
+        mouse(&mut app, MouseEventKind::ScrollUp, 10, list_y);
+        assert_eq!(app.selected, 0);
+
+        app.preview_total_rows = 100;
+        let p = app.preview_area;
+        mouse(&mut app, MouseEventKind::ScrollDown, p.x + 5, p.y + 5);
+        assert_eq!(app.preview_scroll, 3);
+        assert_eq!(app.selected, 0, "the list didn't move");
+        click(&mut app, p.x + 5, p.y + 5);
+        assert_eq!(app.focus, Focus::Preview);
+        let s = app.search_area;
+        click(&mut app, s.x + 3, s.y + 1);
+        assert_eq!(app.focus, Focus::Search);
     }
 
     #[test]
